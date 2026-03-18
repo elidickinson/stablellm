@@ -1,4 +1,8 @@
 .env
+.env.example
 .git
 __pycache__
 .venv
+.venv-sandbox
+*.md
+Dockerfile
