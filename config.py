@@ -36,6 +36,7 @@ PORT = int(os.getenv("PORT", "8080"))
 API_KEY = os.getenv("API_KEY", "")
 COOLOFF_SECONDS = float(os.getenv("COOLOFF_SECONDS", "30"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "120"))
+CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "4"))
 
 if not ENDPOINTS:
     print("FATAL: No ENDPOINT_* variables found. See .env.example.", file=sys.stderr)

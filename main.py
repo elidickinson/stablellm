@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -8,7 +10,7 @@ import httpx
 from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from config import API_KEY, COOLOFF_SECONDS, ENDPOINTS, HOST, PORT, REQUEST_TIMEOUT, Endpoint
+from config import API_KEY, COOLOFF_SECONDS, CONNECT_TIMEOUT, ENDPOINTS, HOST, PORT, REQUEST_TIMEOUT, Endpoint
 
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO))
 log = logging.getLogger("stablellm")
@@ -24,7 +26,7 @@ RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global http_client
-    http_client = httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=10.0))
+    http_client = httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=CONNECT_TIMEOUT))
     log.info("stablellm started with %d endpoint(s)", len(ENDPOINTS))
     yield
     await http_client.aclose()
@@ -46,7 +48,7 @@ def _mark_down(idx: int, reason: str):
 def _check_auth(authorization: str | None) -> JSONResponse | None:
     if not API_KEY:
         return None
-    if not authorization or authorization != f"Bearer {API_KEY}":
+    if not authorization or not hmac.compare_digest(authorization, f"Bearer {API_KEY}"):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     return None
 
@@ -54,7 +56,6 @@ def _check_auth(authorization: str | None) -> JSONResponse | None:
 async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes):
     """Stream response from upstream. Returns (StreamingResponse, None) or (None, status_code)."""
     url = f"{ep.base_url}/{path}"
-    t0 = time.monotonic()
     req = http_client.build_request("POST", url, headers=headers, content=body)
     resp = await http_client.send(req, stream=True)
 
@@ -89,6 +90,8 @@ async def _proxy_buffered(ep: Endpoint, method: str, path: str, headers: dict, b
     if resp.status_code in RETRYABLE_STATUSES:
         return None, resp.status_code
 
+    data = resp.json()
+    elapsed = time.monotonic() - t0
     log.info("%s TTFB %.0fms", ep.base_url, elapsed * 1000)
 
     return JSONResponse(content=data, status_code=resp.status_code), None
