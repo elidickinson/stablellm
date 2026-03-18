@@ -31,7 +31,7 @@ def _parse_endpoints() -> list[Endpoint]:
 
 
 ENDPOINTS = _parse_endpoints()
-HOST = os.getenv("HOST", "0.0.0.0")
+HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8080"))
 API_KEY = os.getenv("API_KEY", "")
 COOLOFF_SECONDS = float(os.getenv("COOLOFF_SECONDS", "30"))

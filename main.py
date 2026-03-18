@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 
@@ -9,11 +10,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from config import API_KEY, COOLOFF_SECONDS, ENDPOINTS, HOST, PORT, REQUEST_TIMEOUT, Endpoint
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO))
 log = logging.getLogger("stablellm")
 
-# endpoint base_url -> timestamp when it becomes available again
-_cooloff_until: dict[str, float] = {}
+# endpoint index -> timestamp when it becomes available again
+_cooloff_until: dict[int, float] = {}
 
 http_client: httpx.AsyncClient
 
@@ -32,12 +33,13 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-def _is_available(ep: Endpoint) -> bool:
-    return time.monotonic() >= _cooloff_until.get(ep.base_url, 0)
+def _is_available(idx: int) -> bool:
+    return time.monotonic() >= _cooloff_until.get(idx, 0)
 
 
-def _mark_down(ep: Endpoint, reason: str):
-    _cooloff_until[ep.base_url] = time.monotonic() + COOLOFF_SECONDS
+def _mark_down(idx: int, reason: str):
+    _cooloff_until[idx] = time.monotonic() + COOLOFF_SECONDS
+    ep = ENDPOINTS[idx]
     log.warning("endpoint %s marked down for %ss: %s", ep.base_url, COOLOFF_SECONDS, reason)
 
 
@@ -61,27 +63,18 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes):
         return None, resp.status_code
 
     async def generate():
-        first_chunk = True
-        token_count = 0
-        t_first = t0
-        try:
-            async for chunk in resp.aiter_bytes():
-                if first_chunk:
-                    t_first = time.monotonic()
-                    log.info("%s TTFB %.0fms (stream)", ep.base_url, (t_first - t0) * 1000)
-                    first_chunk = False
-                # Count SSE data lines as approximate token count
-                token_count += chunk.count(b"\ndata: ")
-                yield chunk
-        finally:
-            elapsed = time.monotonic() - t_first
-            if elapsed > 0 and token_count > 0:
-                log.info("%s %d chunks in %.1fs (%.0f tok/s)", ep.base_url, token_count, elapsed, token_count / elapsed)
-            await resp.aclose()
+        async for chunk in resp.aiter_bytes():
+            yield chunk
+        await resp.aclose()
+
+    # Forward upstream headers, excluding hop-by-hop and encoding headers
+    excluded = {"transfer-encoding", "connection", "keep-alive", "content-encoding", "content-length"}
+    forward_headers = {k: v for k, v in resp.headers.items() if k.lower() not in excluded}
 
     return StreamingResponse(
         generate(),
         status_code=resp.status_code,
+        headers=forward_headers,
         media_type=resp.headers.get("content-type", "text/event-stream"),
     ), None
 
@@ -96,14 +89,7 @@ async def _proxy_buffered(ep: Endpoint, method: str, path: str, headers: dict, b
     if resp.status_code in RETRYABLE_STATUSES:
         return None, resp.status_code
 
-    data = resp.json()
-    ttfb_ms = elapsed * 1000
-    usage = data.get("usage", {})
-    completion_tokens = usage.get("completion_tokens")
-    if completion_tokens and elapsed > 0:
-        log.info("%s TTFB %.0fms, %d tokens in %.1fs (%.0f tok/s)", ep.base_url, ttfb_ms, completion_tokens, elapsed, completion_tokens / elapsed)
-    else:
-        log.info("%s TTFB %.0fms", ep.base_url, ttfb_ms)
+    log.info("%s TTFB %.0fms", ep.base_url, elapsed * 1000)
 
     return JSONResponse(content=data, status_code=resp.status_code), None
 
@@ -115,10 +101,41 @@ def _build_upstream_headers(ep: Endpoint) -> dict:
     }
 
 
+# Only pass these known-supported params to Cerebras
+SUPPORTED_PARAMS = {
+    "model",
+    "messages",
+    "stream",
+    "max_completion_tokens",
+    "temperature",
+    "top_p",
+    "stop",
+    "seed",
+    "logprobs",
+    "top_logprobs",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "response_format",
+    "prediction",
+    "user",
+    "reasoning_effort",
+    "clear_thinking",
+    "disable_reasoning",
+    "extra_body",  # pass through for non-standard params
+}
+
+
 def _rewrite_model(body: dict, ep: Endpoint) -> dict:
     if ep.model_override:
         body = {**body, "model": ep.model_override}
     return body
+
+
+def _strip_unsupported(body: dict, ep: Endpoint) -> dict:
+    """Keep only supported params and apply model override."""
+    base = {k: v for k, v in body.items() if k in SUPPORTED_PARAMS}
+    return _rewrite_model(base, ep)
 
 
 @app.get("/health")
@@ -146,13 +163,14 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         body_dict = None
 
     last_failure = None
-    for ep in ENDPOINTS:
-        if not _is_available(ep):
+    for idx, ep in enumerate(ENDPOINTS):
+        if not _is_available(idx):
             log.info("skipping %s (cooling off)", ep.base_url)
             continue
 
         if body_dict is not None:
-            send_body = json.dumps(_rewrite_model(body_dict, ep)).encode()
+            send_body = json.dumps(_strip_unsupported(body_dict, ep)).encode()
+            log.debug("-> %s body (keys): %s", ep.base_url, list(json.loads(send_body).keys()))
         else:
             send_body = raw_body
 
@@ -167,11 +185,11 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             if result is not None:
                 return result
 
-            _mark_down(ep, f"HTTP {status}")
+            _mark_down(idx, f"HTTP {status}")
             last_failure = f"HTTP {status}"
 
         except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
-            _mark_down(ep, str(exc))
+            _mark_down(idx, str(exc))
             last_failure = type(exc).__name__
 
     log.error("all endpoints exhausted for /v1/%s (last: %s)", path, last_failure)
