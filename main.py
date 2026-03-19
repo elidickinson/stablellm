@@ -64,9 +64,11 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes):
         return None, resp.status_code
 
     async def generate():
-        async for chunk in resp.aiter_bytes():
-            yield chunk
-        await resp.aclose()
+        try:
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+        finally:
+            await resp.aclose()
 
     # Forward upstream headers, excluding hop-by-hop and encoding headers
     excluded = {"transfer-encoding", "connection", "keep-alive", "content-encoding", "content-length"}
@@ -90,8 +92,11 @@ async def _proxy_buffered(ep: Endpoint, method: str, path: str, headers: dict, b
     if resp.status_code in RETRYABLE_STATUSES:
         return None, resp.status_code
 
-    data = resp.json()
-    elapsed = time.monotonic() - t0
+    try:
+        data = resp.json()
+    except Exception:
+        return JSONResponse({"error": "upstream returned invalid JSON"}, status_code=502)
+
     log.info("%s TTFB %.0fms", ep.base_url, elapsed * 1000)
 
     return JSONResponse(content=data, status_code=resp.status_code), None
@@ -125,7 +130,6 @@ SUPPORTED_PARAMS = {
     "reasoning_effort",
     "clear_thinking",
     "disable_reasoning",
-    "extra_body",  # pass through for non-standard params
 }
 
 
@@ -172,8 +176,9 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             continue
 
         if body_dict is not None:
-            send_body = json.dumps(_strip_unsupported(body_dict, ep)).encode()
-            log.debug("-> %s body (keys): %s", ep.base_url, list(json.loads(send_body).keys()))
+            stripped = _strip_unsupported(body_dict, ep)
+            send_body = json.dumps(stripped).encode()
+            log.debug("-> %s body (keys): %s", ep.base_url, list(stripped.keys()))
         else:
             send_body = raw_body
 
