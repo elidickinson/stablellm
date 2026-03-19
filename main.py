@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import time
+from collections import defaultdict
 from contextlib import asynccontextmanager
 
 import httpx
@@ -17,6 +18,13 @@ log = logging.getLogger("stablellm")
 
 # endpoint index -> timestamp when it becomes available again
 _cooloff_until: dict[int, float] = {}
+
+# endpoint index -> stats
+_stats = {
+    "requests": defaultdict(int),
+    "successes": defaultdict(int),
+    "failures": defaultdict(int),
+}
 
 http_client: httpx.AsyncClient
 
@@ -41,6 +49,7 @@ def _is_available(idx: int) -> bool:
 
 def _mark_down(idx: int, reason: str):
     _cooloff_until[idx] = time.monotonic() + COOLOFF_SECONDS
+    _stats["failures"][idx] += 1
     ep = ENDPOINTS[idx]
     log.warning("endpoint %s marked down for %ss: %s", ep.base_url, COOLOFF_SECONDS, reason)
 
@@ -150,6 +159,21 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/stats")
+async def stats():
+    result = {"endpoints": []}
+    for idx, ep in enumerate(ENDPOINTS):
+        result["endpoints"].append({
+            "index": idx,
+            "base_url": ep.base_url,
+            "model_override": ep.model_override or "(none)",
+            "requests": _stats["requests"].get(idx, 0),
+            "successes": _stats["successes"].get(idx, 0),
+            "failures": _stats["failures"].get(idx, 0),
+        })
+    return result
+
+
 @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
 async def proxy(request: Request, path: str, authorization: str | None = Header(None)):
     auth_err = _check_auth(authorization)
@@ -175,6 +199,8 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             log.info("skipping %s (cooling off)", ep.base_url)
             continue
 
+        _stats["requests"][idx] += 1
+
         if body_dict is not None:
             stripped = _strip_unsupported(body_dict, ep)
             send_body = json.dumps(stripped).encode()
@@ -191,6 +217,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
                 result, status = await _proxy_buffered(ep, request.method, path, headers, send_body)
 
             if result is not None:
+                _stats["successes"][idx] += 1
                 return result
 
             _mark_down(idx, f"HTTP {status}")
