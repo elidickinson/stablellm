@@ -174,7 +174,6 @@ async def stats():
     for idx, ep in enumerate(ENDPOINTS):
         result["endpoints"].append({
             "index": idx,
-            "base_url": ep.base_url,
             "model_override": ep.model_override or "(none)",
             "requests": _stats["requests"].get(idx, 0),
             "successes": _stats["successes"].get(idx, 0),
@@ -188,6 +187,9 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
     auth_err = _check_auth(authorization)
     if auth_err:
         return auth_err
+
+    if ".." in path:
+        return JSONResponse({"error": "invalid path"}, status_code=400)
 
     raw_body = await request.body()
     is_streaming = False

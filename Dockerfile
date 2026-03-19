@@ -7,7 +7,7 @@ WORKDIR /app
 RUN adduser --disabled-password --no-create-home app
 
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --no-cache-dir
 
 COPY --chown=app:app config.py main.py ./
 
