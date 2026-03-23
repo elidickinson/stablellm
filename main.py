@@ -36,8 +36,8 @@ RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 _EXCLUDED_HEADERS = {"transfer-encoding", "connection", "keep-alive", "content-encoding", "content-length"}
 
 # Fastest mode: race providers to find the fastest
-RACE_INTERVAL_SECS = 6 * 3600
-RACE_INTERVAL_REQUESTS = 15
+RACE_INTERVAL_SECS = int(os.environ.get("RACE_INTERVAL_SECS", 6 * 3600))
+RACE_INTERVAL_REQUESTS = int(os.environ.get("RACE_INTERVAL_REQUESTS", 25))
 _provider_groups: dict[tuple[str, str], list[int]] = {}  # (model, base_url) -> endpoint indices
 _preferred_providers: list[tuple[str, str]] = []
 _race_request_count = 0
@@ -186,9 +186,15 @@ def _rewrite_model(body: dict, ep: Endpoint) -> dict:
     return body
 
 
+def _strip_message_reasoning(messages: list) -> list:
+    return [{k: v for k, v in msg.items() if k != "reasoning"} for msg in messages]
+
+
 def _strip_unsupported(body: dict, ep: Endpoint) -> dict:
-    """Keep only supported params and apply model override."""
+    """Keep only supported params, strip reasoning from messages, apply model override."""
     base = {k: v for k, v in body.items() if k in SUPPORTED_PARAMS}
+    if not ep.keep_reasoning and "messages" in base:
+        base["messages"] = _strip_message_reasoning(base["messages"])
     return _rewrite_model(base, ep)
 
 

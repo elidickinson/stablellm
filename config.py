@@ -12,6 +12,7 @@ class Endpoint:
     base_url: str
     api_key: str
     model_override: str  # empty string means pass through client's model
+    keep_reasoning: bool = False  # if True, preserve reasoning fields in messages
 
 
 def _parse_endpoints() -> list[Endpoint]:
@@ -21,12 +22,16 @@ def _parse_endpoints() -> list[Endpoint]:
             continue
         parts = value.split("|")
         if len(parts) < 2:
-            print(f"WARNING: {key} malformed, expected 'base_url|api_key[|model_override]'", file=sys.stderr)
+            print(f"WARNING: {key} malformed, expected 'base_url|api_key[|model_override[|flags]]'", file=sys.stderr)
             continue
         base_url = parts[0].rstrip("/")
         api_key = parts[1]
         model_override = parts[2] if len(parts) > 2 else ""
-        endpoints.append(Endpoint(base_url=base_url, api_key=api_key, model_override=model_override))
+        flags = {f.strip() for f in parts[3].split(",")} if len(parts) > 3 else set()
+        endpoints.append(Endpoint(
+            base_url=base_url, api_key=api_key, model_override=model_override,
+            keep_reasoning="keep_reasoning" in flags,
+        ))
     return endpoints
 
 
