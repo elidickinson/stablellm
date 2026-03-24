@@ -20,8 +20,15 @@ from config import API_KEY, COOLOFF_SECONDS, CONNECT_TIMEOUT, ENDPOINTS, HOST, P
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO))
 log = logging.getLogger("stablellm")
 
+# Reduce noise from external libraries
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 # endpoint index -> timestamp when it becomes available again
 _cooloff_until: dict[int, float] = {}
+
+# Track last used endpoint for change detection
+_last_endpoint_idx: int | None = None
 
 # endpoint index -> stats
 _stats = {
@@ -285,11 +292,19 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool):
         return None
 
     win_pk, win_idx, win_resp = winner
-    log.info("race: first response from %s (%.0fms)", win_pk[1], (time.monotonic() - race_start) * 1000)
+    ep = ENDPOINTS[win_idx]
+    model_name = ep.model_override if ep.model_override else "(client model)"
+    log.info("race: first response from %s (model: %s) %.0fms", win_pk[1], model_name, (time.monotonic() - race_start) * 1000)
     _stats["requests"][win_idx] += 1
     _stats["successes"][win_idx] += 1
     _race_request_count = 0
     _last_race_time = time.monotonic()
+
+    # Track endpoint change for race mode
+    global _last_endpoint_idx
+    if _last_endpoint_idx != win_idx:
+        log.info("using endpoint: %s (model: %s)", ep.base_url, model_name)
+        _last_endpoint_idx = win_idx
 
     # Background: drain losers to measure total time
     async def _drain(pk, resp, idx=None):
@@ -452,6 +467,12 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
 
             if result is not None:
                 _stats["successes"][idx] += 1
+                # Log if endpoint changed
+                global _last_endpoint_idx
+                if _last_endpoint_idx != idx:
+                    model_name = ep.model_override if ep.model_override else "(client model)"
+                    log.info("using endpoint: %s (model: %s)", ep.base_url, model_name)
+                    _last_endpoint_idx = idx
                 return result
 
             _mark_down(idx, f"HTTP {status}")
