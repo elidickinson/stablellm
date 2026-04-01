@@ -15,8 +15,9 @@ class Endpoint:
     keep_reasoning: bool = False  # if True, preserve reasoning fields in messages
 
 
-def _parse_endpoints() -> list[Endpoint]:
+def _parse_endpoints() -> tuple[list[Endpoint], dict[str, int]]:
     endpoints = []
+    name_to_idx: dict[str, int] = {}
     for key, value in sorted(os.environ.items()):
         if not key.startswith("ENDPOINT_"):
             continue
@@ -28,14 +29,17 @@ def _parse_endpoints() -> list[Endpoint]:
         api_key = parts[1]
         model_override = parts[2] if len(parts) > 2 else ""
         flags = {f.strip() for f in parts[3].split(",")} if len(parts) > 3 else set()
+        name = key.removeprefix("ENDPOINT_").lower()
+        idx = len(endpoints)
+        name_to_idx[name] = idx
         endpoints.append(Endpoint(
             base_url=base_url, api_key=api_key, model_override=model_override,
             keep_reasoning="keep_reasoning" in flags,
         ))
-    return endpoints
+    return endpoints, name_to_idx
 
 
-ENDPOINTS = _parse_endpoints()
+ENDPOINTS, ENDPOINT_NAMES = _parse_endpoints()
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "4000"))
 API_KEY = os.getenv("API_KEY", "")
@@ -49,23 +53,11 @@ if not ENDPOINTS:
 
 
 def _parse_groups() -> dict[str, list[int]]:
-    """Parse GROUP_<name>=<comma-separated endpoint numbers> from env.
+    """Parse GROUP_<name>=<comma-separated endpoint names> from env.
 
-    Example: GROUP_CHEAP=1,3,5 maps model name "cheap" to ENDPOINT_1, ENDPOINT_3, ENDPOINT_5.
-    Endpoint numbers correspond to ENDPOINT_N suffixes (1-based), stored as 0-based indices.
+    Example: GROUP_CHEAP=cerebras1,openai maps model name "cheap" to
+    ENDPOINT_CEREBRAS1 and ENDPOINT_OPENAI (in that order).
     """
-    # Build mapping from ENDPOINT_N suffix -> 0-based index
-    endpoint_num_to_idx: dict[int, int] = {}
-    idx = 0
-    for key in sorted(os.environ.keys()):
-        if key.startswith("ENDPOINT_"):
-            try:
-                num = int(key.removeprefix("ENDPOINT_"))
-            except ValueError:
-                continue
-            endpoint_num_to_idx[num] = idx
-            idx += 1
-
     groups: dict[str, list[int]] = {}
     for key, value in sorted(os.environ.items()):
         if not key.startswith("GROUP_"):
@@ -73,20 +65,18 @@ def _parse_groups() -> dict[str, list[int]]:
         name = key.removeprefix("GROUP_").lower()
         indices = []
         for part in value.split(","):
-            part = part.strip()
-            if not part:
+            ep_name = part.strip().lower()
+            if not ep_name:
                 continue
-            try:
-                num = int(part)
-            except ValueError:
-                print(f"WARNING: {key} contains non-integer '{part}'", file=sys.stderr)
-                continue
-            if num not in endpoint_num_to_idx:
-                print(f"WARNING: {key} references ENDPOINT_{num} which does not exist", file=sys.stderr)
-                continue
-            ep_idx = endpoint_num_to_idx[num]
+            if ep_name not in ENDPOINT_NAMES:
+                print(f"FATAL: {key} references endpoint '{part.strip()}' which does not exist. "
+                      f"Available endpoints: {', '.join(n.upper() for n in sorted(ENDPOINT_NAMES))}",
+                      file=sys.stderr)
+                sys.exit(1)
+            ep_idx = ENDPOINT_NAMES[ep_name]
             if not ENDPOINTS[ep_idx].model_override:
-                print(f"WARNING: {key} includes ENDPOINT_{num} which has no model_override set", file=sys.stderr)
+                print(f"WARNING: {key} includes ENDPOINT_{ep_name.upper()} which has no model_override set",
+                      file=sys.stderr)
             indices.append(ep_idx)
         if indices:
             groups[name] = indices
