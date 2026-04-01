@@ -86,3 +86,7 @@ def _parse_groups() -> dict[str, list[int]]:
 
 
 GROUPS = _parse_groups()
+
+# If no GROUP_DEFAULT, create an implicit one with all endpoints in order
+if "default" not in GROUPS:
+    GROUPS["default"] = list(range(len(ENDPOINTS)))

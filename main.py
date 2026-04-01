@@ -45,13 +45,9 @@ _EXCLUDED_HEADERS = {"transfer-encoding", "connection", "keep-alive", "content-e
 # Fastest mode: race providers to find the fastest
 RACE_INTERVAL_SECS = int(os.environ.get("RACE_INTERVAL_SECS", 6 * 3600))
 RACE_INTERVAL_REQUESTS = int(os.environ.get("RACE_INTERVAL_REQUESTS", 25))
-_provider_groups: dict[tuple[str, str], list[int]] = {}  # (model, base_url) -> endpoint indices
-_preferred_providers: list[tuple[str, str]] = []
-_race_request_count = 0
-_last_race_time = 0.0
 _background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
 
-# Per-group fastest mode state
+# Per-group state (every request goes through a group; "default" is implicit)
 _group_provider_groups: dict[str, dict[tuple[str, str], list[int]]] = {}
 _group_preferred_providers: dict[str, list[tuple[str, str]]] = {}
 _group_race_request_count: dict[str, int] = defaultdict(int)
@@ -59,15 +55,7 @@ _group_last_race_time: dict[str, float] = defaultdict(float)
 
 
 def _build_provider_groups():
-    global _provider_groups, _preferred_providers, _group_provider_groups, _group_preferred_providers
-    groups: dict[tuple[str, str], list[int]] = {}
-    for idx, ep in enumerate(ENDPOINTS):
-        key = (ep.model_override or "default", ep.base_url)
-        groups.setdefault(key, []).append(idx)
-    _provider_groups = groups
-    _preferred_providers = list(groups.keys())
-
-    # Build provider groups scoped to each model group
+    global _group_provider_groups, _group_preferred_providers
     _group_provider_groups = {}
     _group_preferred_providers = {}
     for group_name, indices in GROUPS.items():
@@ -85,7 +73,8 @@ async def lifespan(_app: FastAPI):
     global http_client
     http_client = httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=CONNECT_TIMEOUT))
     _build_provider_groups()
-    log.info("stablellm started with %d endpoint(s), %d provider group(s), %d model group(s)", len(ENDPOINTS), len(_provider_groups), len(GROUPS))
+    group_names = [g for g in GROUPS if g != "default"]
+    log.info("stablellm started with %d endpoint(s), groups: default + %s", len(ENDPOINTS), group_names if group_names else "(none)")
     yield
     await http_client.aclose()
 
@@ -223,13 +212,9 @@ def _strip_unsupported(body: dict, ep: Endpoint) -> dict:
     return _rewrite_model(base, ep)
 
 
-def _should_race(group: str | None = None) -> bool:
-    if group:
-        last_time = _group_last_race_time[group]
-        count = _group_race_request_count[group]
-    else:
-        last_time = _last_race_time
-        count = _race_request_count
+def _should_race(group: str) -> bool:
+    last_time = _group_last_race_time[group]
+    count = _group_race_request_count[group]
     if last_time == 0.0:
         return True
     if count >= RACE_INTERVAL_REQUESTS:
@@ -239,29 +224,19 @@ def _should_race(group: str | None = None) -> bool:
     return False
 
 
-def _finish_race(race_times: dict[tuple[str, str], float], group: str | None = None):
-    global _preferred_providers
+def _finish_race(race_times: dict[tuple[str, str], float], group: str):
     sorted_keys = sorted(race_times, key=race_times.get)
     new_order = list(sorted_keys)
-    if group:
-        pg = _group_provider_groups[group]
-        for k in pg:
-            if k not in race_times:
-                new_order.append(k)
-        _group_preferred_providers[group] = new_order
-    else:
-        for k in _provider_groups:
-            if k not in race_times:
-                new_order.append(k)
-        _preferred_providers = new_order
-    log.info("race complete%s: %s", f" (group={group})" if group else "", [(k[1], f"{v:.1f}s") for k, v in sorted(race_times.items(), key=lambda x: x[1])])
+    for k in _group_provider_groups[group]:
+        if k not in race_times:
+            new_order.append(k)
+    _group_preferred_providers[group] = new_order
+    log.info("race complete (group=%s): %s", group, [(k[1], f"{v:.1f}s") for k, v in sorted(race_times.items(), key=lambda x: x[1])])
 
 
-async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: str | None = None):
+async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: str = "default"):
     """Race one endpoint per provider group with real request. Returns response or None."""
-    global _race_request_count, _last_race_time
-
-    pg = _group_provider_groups[group] if group else _provider_groups
+    pg = _group_provider_groups[group]
 
     # One available endpoint per provider group
     candidates: list[tuple[tuple[str, str], int]] = []
@@ -330,12 +305,8 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
     log.info("race: first response from %s (model: %s) %.0fms", win_pk[1], model_name, (time.monotonic() - race_start) * 1000)
     _stats["requests"][win_idx] += 1
     _stats["successes"][win_idx] += 1
-    if group:
-        _group_race_request_count[group] = 0
-        _group_last_race_time[group] = time.monotonic()
-    else:
-        _race_request_count = 0
-        _last_race_time = time.monotonic()
+    _group_race_request_count[group] = 0
+    _group_last_race_time[group] = time.monotonic()
 
     # Track endpoint change for race mode
     global _last_endpoint_idx
@@ -422,18 +393,13 @@ async def stats():
             "successes": _stats["successes"].get(idx, 0),
             "failures": _stats["failures"].get(idx, 0),
         })
-    result["fastest_mode"] = {
-        "preferred_providers": [{"model": m, "base_url": u} for m, u in _preferred_providers],
-        "requests_since_last_race": _race_request_count,
-    }
-    if GROUPS:
-        result["groups"] = {}
-        for name, indices in GROUPS.items():
-            result["groups"][name] = {
-                "endpoints": indices,
-                "preferred_providers": [{"model": m, "base_url": u} for m, u in _group_preferred_providers.get(name, [])],
-                "requests_since_last_race": _group_race_request_count.get(name, 0),
-            }
+    result["groups"] = {}
+    for name, indices in GROUPS.items():
+        result["groups"][name] = {
+            "endpoints": indices,
+            "preferred_providers": [{"model": m, "base_url": u} for m, u in _group_preferred_providers.get(name, [])],
+            "requests_since_last_race": _group_race_request_count.get(name, 0),
+        }
     return result
 
 
@@ -467,40 +433,30 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             model = model.removesuffix(":fastest")
             body_dict = {**body_dict, "model": model}
 
-        # Detect model group (e.g. model="cheap" matches GROUP_CHEAP)
-        group_name = model.lower() if model.lower() in GROUPS else None
+        # Resolve group: named group or "default"
+        group_name = model.lower() if model.lower() in GROUPS else "default"
     else:
         body_dict = None
-        group_name = None
+        group_name = "default"
 
     # Fastest mode: race or use preferred provider order
     if fastest_mode:
-        if group_name:
-            _group_race_request_count[group_name] += 1
-        else:
-            global _race_request_count
-            _race_request_count += 1
+        _group_race_request_count[group_name] += 1
 
         if _should_race(group_name):
             result = await _race_request(path, body_dict, is_streaming, group_name)
             if result is not None:
                 return result
-            log.warning("race failed%s, falling back to sequential", f" (group={group_name})" if group_name else "")
+            log.warning("race failed (group=%s), falling back to sequential", group_name)
 
         # Use preferred provider order
-        if group_name:
-            pref = _group_preferred_providers[group_name]
-            pg = _group_provider_groups[group_name]
-        else:
-            pref = _preferred_providers
-            pg = _provider_groups
+        pref = _group_preferred_providers[group_name]
+        pg = _group_provider_groups[group_name]
         endpoint_order = []
         for pk in pref:
             endpoint_order.extend(pg[pk])
-    elif group_name:
-        endpoint_order = GROUPS[group_name]
     else:
-        endpoint_order = list(range(len(ENDPOINTS)))
+        endpoint_order = GROUPS[group_name]
 
     last_failure = None
     for idx in endpoint_order:
