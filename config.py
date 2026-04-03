@@ -1,7 +1,9 @@
 import os
+import re
 import sys
 from dataclasses import dataclass
 
+import yaml
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -15,78 +17,105 @@ class Endpoint:
     keep_reasoning: bool = False  # if True, preserve reasoning fields in messages
 
 
-def _parse_endpoints() -> tuple[list[Endpoint], dict[str, int]]:
-    endpoints = []
+def _env_substitute(value: str) -> str:
+    """Replace ${VAR} or $VAR references with environment variable values."""
+    def _replace(match: re.Match) -> str:
+        var_name = match.group(1) or match.group(2)
+        result = os.environ.get(var_name)
+        if result is None:
+            print(f"FATAL: environment variable '{var_name}' is not set", file=sys.stderr)
+            sys.exit(1)
+        return result
+    return re.sub(r"\$\{(\w+)\}|\$(\w+)", _replace, value)
+
+
+def _load_config() -> tuple[list[Endpoint], dict[str, int], dict[str, list[int]]]:
+    config_path = os.getenv("CONFIG_FILE", "config.yaml")
+    try:
+        with open(config_path) as f:
+            raw = yaml.safe_load(f)
+    except FileNotFoundError:
+        print(f"FATAL: config file '{config_path}' not found. Set CONFIG_FILE env var or create config.yaml.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if not isinstance(raw, dict) or "endpoints" not in raw:
+        print(f"FATAL: config file must have an 'endpoints' mapping", file=sys.stderr)
+        sys.exit(1)
+
+    # Parse endpoints
+    endpoints: list[Endpoint] = []
     name_to_idx: dict[str, int] = {}
-    for key, value in sorted(os.environ.items()):
-        if not key.startswith("ENDPOINT_"):
-            continue
-        parts = value.split("|")
-        if len(parts) < 2:
-            print(f"WARNING: {key} malformed, expected 'base_url|api_key[|model_override[|flags]]'", file=sys.stderr)
-            continue
-        base_url = parts[0].rstrip("/")
-        api_key = parts[1]
-        model_override = parts[2] if len(parts) > 2 else ""
-        flags = {f.strip() for f in parts[3].split(",")} if len(parts) > 3 else set()
-        name = key.removeprefix("ENDPOINT_").lower()
+    raw_endpoints = raw["endpoints"]
+    if not isinstance(raw_endpoints, dict) or not raw_endpoints:
+        print("FATAL: 'endpoints' must be a non-empty mapping", file=sys.stderr)
+        sys.exit(1)
+
+    for name, ep_conf in raw_endpoints.items():
+        name_lower = str(name).lower()
+        if not isinstance(ep_conf, dict):
+            print(f"FATAL: endpoint '{name}' must be a mapping", file=sys.stderr)
+            sys.exit(1)
+        if "base_url" not in ep_conf or "api_key" not in ep_conf:
+            print(f"FATAL: endpoint '{name}' requires 'base_url' and 'api_key'", file=sys.stderr)
+            sys.exit(1)
+
+        base_url = str(ep_conf["base_url"]).rstrip("/")
+        api_key = _env_substitute(str(ep_conf["api_key"]))
+        model_override = str(ep_conf.get("model", ""))
+        flags = ep_conf.get("flags", [])
+        if isinstance(flags, str):
+            flags = [f.strip() for f in flags.split(",")]
+
         idx = len(endpoints)
-        name_to_idx[name] = idx
+        name_to_idx[name_lower] = idx
         endpoints.append(Endpoint(
-            base_url=base_url, api_key=api_key, model_override=model_override,
+            base_url=base_url,
+            api_key=api_key,
+            model_override=model_override,
             keep_reasoning="keep_reasoning" in flags,
         ))
-    return endpoints, name_to_idx
+
+    # Parse groups
+    groups: dict[str, list[int]] = {}
+    raw_groups = raw.get("groups", {})
+    if raw_groups:
+        if not isinstance(raw_groups, dict):
+            print("FATAL: 'groups' must be a mapping", file=sys.stderr)
+            sys.exit(1)
+
+        for group_name, members in raw_groups.items():
+            group_lower = str(group_name).lower()
+            if not isinstance(members, list) or not members:
+                print(f"FATAL: group '{group_name}' must be a non-empty list", file=sys.stderr)
+                sys.exit(1)
+
+            indices = []
+            for member in members:
+                ep_name = str(member).strip().lower()
+                if ep_name not in name_to_idx:
+                    print(f"FATAL: group '{group_name}' references endpoint '{member}' which does not exist. "
+                          f"Available: {', '.join(sorted(name_to_idx))}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                ep_idx = name_to_idx[ep_name]
+                if group_lower != "default" and not endpoints[ep_idx].model_override:
+                    print(f"WARNING: group '{group_name}' includes endpoint '{member}' which has no model set",
+                          file=sys.stderr)
+                indices.append(ep_idx)
+            groups[group_lower] = indices
+
+    # Implicit default group if not defined
+    if "default" not in groups:
+        groups["default"] = list(range(len(endpoints)))
+
+    return endpoints, name_to_idx, groups
 
 
-ENDPOINTS, ENDPOINT_NAMES = _parse_endpoints()
+ENDPOINTS, ENDPOINT_NAMES, GROUPS = _load_config()
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "4000"))
 API_KEY = os.getenv("API_KEY", "")
 COOLOFF_SECONDS = float(os.getenv("COOLOFF_SECONDS", "30"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "120"))
 CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "4"))
-
-if not ENDPOINTS:
-    print("FATAL: No ENDPOINT_* variables found. See .env.example.", file=sys.stderr)
-    sys.exit(1)
-
-
-def _parse_groups() -> dict[str, list[int]]:
-    """Parse GROUP_<name>=<comma-separated endpoint names> from env.
-
-    Example: GROUP_CHEAP=cerebras1,openai maps model name "cheap" to
-    ENDPOINT_CEREBRAS1 and ENDPOINT_OPENAI (in that order).
-    """
-    groups: dict[str, list[int]] = {}
-    for key, value in sorted(os.environ.items()):
-        if not key.startswith("GROUP_"):
-            continue
-        name = key.removeprefix("GROUP_").lower()
-        indices = []
-        for part in value.split(","):
-            ep_name = part.strip().lower()
-            if not ep_name:
-                continue
-            if ep_name not in ENDPOINT_NAMES:
-                print(f"FATAL: {key} references endpoint '{part.strip()}' which does not exist. "
-                      f"Available endpoints: {', '.join(n.upper() for n in sorted(ENDPOINT_NAMES))}",
-                      file=sys.stderr)
-                sys.exit(1)
-            ep_idx = ENDPOINT_NAMES[ep_name]
-            if not ENDPOINTS[ep_idx].model_override:
-                print(f"WARNING: {key} includes ENDPOINT_{ep_name.upper()} which has no model_override set",
-                      file=sys.stderr)
-            indices.append(ep_idx)
-        if indices:
-            groups[name] = indices
-        else:
-            print(f"WARNING: {key} resolved to no valid endpoints", file=sys.stderr)
-    return groups
-
-
-GROUPS = _parse_groups()
-
-# If no GROUP_DEFAULT, create an implicit one with all endpoints in order
-if "default" not in GROUPS:
-    GROUPS["default"] = list(range(len(ENDPOINTS)))

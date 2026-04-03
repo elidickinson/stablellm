@@ -1,0 +1,27 @@
+endpoints:
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY}
+
+  openai_backup:
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_BACKUP_KEY}
+
+  cerebras:
+    base_url: https://api.cerebras.ai/v1
+    api_key: ${CEREBRAS_API_KEY}
+    model: llama-3.1-70b
+    flags: [keep_reasoning]
+
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    api_key: ${OPENROUTER_API_KEY}
+    model: openai/gpt-4o
+
+groups:
+  # "default" is used when the model name doesn't match any group.
+  # If omitted, all endpoints are used in the order defined above.
+  default: [openai, openai_backup, openrouter]
+
+  # Request model "cheap" or "cheap:fastest" to use these endpoints.
+  cheap: [cerebras, openrouter]
