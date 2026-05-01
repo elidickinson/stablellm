@@ -11,7 +11,7 @@ load_dotenv()
 class Endpoint:
     base_url: str
     api_key: str
-    model_override: str  # empty string means pass through client's model
+    model: str  # empty: defaults to group name when invoked via a named group, else passes through client's model
     keep_reasoning: bool = False  # if True, preserve reasoning fields in messages
 
 
@@ -23,17 +23,17 @@ def _parse_endpoints() -> tuple[list[Endpoint], dict[str, int]]:
             continue
         parts = value.split("|")
         if len(parts) < 2:
-            print(f"WARNING: {key} malformed, expected 'base_url|api_key[|model_override[|flags]]'", file=sys.stderr)
+            print(f"WARNING: {key} malformed, expected 'base_url|api_key[|model[|flags]]'", file=sys.stderr)
             continue
         base_url = parts[0].rstrip("/")
         api_key = parts[1]
-        model_override = parts[2] if len(parts) > 2 else ""
+        model = parts[2] if len(parts) > 2 else ""
         flags = {f.strip() for f in parts[3].split(",")} if len(parts) > 3 else set()
         name = key.removeprefix("ENDPOINT_").lower()
         idx = len(endpoints)
         name_to_idx[name] = idx
         endpoints.append(Endpoint(
-            base_url=base_url, api_key=api_key, model_override=model_override,
+            base_url=base_url, api_key=api_key, model=model,
             keep_reasoning="keep_reasoning" in flags,
         ))
     return endpoints, name_to_idx
@@ -52,6 +52,15 @@ if not ENDPOINTS:
     sys.exit(1)
 
 
+def normalize_group_name(name: str) -> str:
+    """Group lookup is case-insensitive and treats - . _ as equivalent.
+
+    Lets ENDPOINT/GROUP env-var names (which can't contain dashes or dots) match
+    request model IDs that commonly do (e.g. GROUP_GPT_4_1 ↔ "gpt-4.1").
+    """
+    return name.lower().replace("-", "_").replace(".", "_")
+
+
 def _parse_groups() -> dict[str, list[int]]:
     """Parse GROUP_<name>=<comma-separated endpoint names> from env.
 
@@ -62,7 +71,7 @@ def _parse_groups() -> dict[str, list[int]]:
     for key, value in sorted(os.environ.items()):
         if not key.startswith("GROUP_"):
             continue
-        name = key.removeprefix("GROUP_").lower()
+        name = normalize_group_name(key.removeprefix("GROUP_"))
         indices = []
         for part in value.split(","):
             ep_name = part.strip().lower()
@@ -73,11 +82,7 @@ def _parse_groups() -> dict[str, list[int]]:
                       f"Available endpoints: {', '.join(n.upper() for n in sorted(ENDPOINT_NAMES))}",
                       file=sys.stderr)
                 sys.exit(1)
-            ep_idx = ENDPOINT_NAMES[ep_name]
-            if not ENDPOINTS[ep_idx].model_override:
-                print(f"WARNING: {key} includes ENDPOINT_{ep_name.upper()} which has no model_override set",
-                      file=sys.stderr)
-            indices.append(ep_idx)
+            indices.append(ENDPOINT_NAMES[ep_name])
         if indices:
             groups[name] = indices
         else:

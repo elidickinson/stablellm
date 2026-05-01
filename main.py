@@ -15,7 +15,7 @@ from fastapi import FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from config import API_KEY, COOLOFF_SECONDS, CONNECT_TIMEOUT, ENDPOINTS, GROUPS, HOST, PORT, REQUEST_TIMEOUT, Endpoint
+from config import API_KEY, COOLOFF_SECONDS, CONNECT_TIMEOUT, ENDPOINTS, GROUPS, HOST, PORT, REQUEST_TIMEOUT, Endpoint, normalize_group_name
 
 logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO))
 log = logging.getLogger("stablellm")
@@ -62,10 +62,21 @@ def _build_provider_groups():
         g: dict[tuple[str, str], list[int]] = {}
         for idx in indices:
             ep = ENDPOINTS[idx]
-            key = (ep.model_override or "default", ep.base_url)
+            # For grouping/preferred-order purposes, an empty ep.model behaves
+            # the same across all requests within a group, so use ep.model directly.
+            key = (ep.model or "default", ep.base_url)
             g.setdefault(key, []).append(idx)
         _group_provider_groups[group_name] = g
         _group_preferred_providers[group_name] = list(g.keys())
+
+
+def _effective_model(ep: Endpoint, client_model: str, group_name: str) -> str:
+    """The model name actually sent upstream. Empty string means pass through client's model."""
+    if ep.model:
+        return ep.model
+    if group_name != "default":
+        return client_model
+    return ""
 
 
 @asynccontextmanager
@@ -194,9 +205,10 @@ SUPPORTED_PARAMS = {
 }
 
 
-def _rewrite_model(body: dict, ep: Endpoint) -> dict:
-    if ep.model_override:
-        body = {**body, "model": ep.model_override}
+def _rewrite_model(body: dict, ep: Endpoint, group_name: str) -> dict:
+    effective = _effective_model(ep, body.get("model", ""), group_name)
+    if effective:
+        body = {**body, "model": effective}
     return body
 
 
@@ -204,12 +216,12 @@ def _strip_message_reasoning(messages: list) -> list:
     return [{k: v for k, v in msg.items() if k != "reasoning"} for msg in messages]
 
 
-def _strip_unsupported(body: dict, ep: Endpoint) -> dict:
-    """Keep only supported params, strip reasoning from messages, apply model override."""
+def _strip_unsupported(body: dict, ep: Endpoint, group_name: str) -> dict:
+    """Keep only supported params, strip reasoning from messages, apply model name."""
     base = {k: v for k, v in body.items() if k in SUPPORTED_PARAMS}
     if not ep.keep_reasoning and "messages" in base:
         base["messages"] = _strip_message_reasoning(base["messages"])
-    return _rewrite_model(base, ep)
+    return _rewrite_model(base, ep, group_name)
 
 
 def _should_race(group: str) -> bool:
@@ -263,7 +275,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
     async def _send(pk: tuple, idx: int):
         ep = ENDPOINTS[idx]
         headers = _build_upstream_headers(ep)
-        stripped = _strip_unsupported(body_dict, ep)
+        stripped = _strip_unsupported(body_dict, ep, group)
         send_body = json.dumps(stripped).encode()
         url = f"{ep.base_url}/{path}"
         req = http_client.build_request("POST", url, headers=headers, content=send_body)
@@ -301,7 +313,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
 
     win_pk, win_idx, win_resp = winner
     ep = ENDPOINTS[win_idx]
-    model_name = ep.model_override if ep.model_override else "(client model)"
+    model_name = _effective_model(ep, body_dict.get("model", ""), group) or "(client model)"
     log.info("race: first response from %s (model: %s) %.0fms", win_pk[1], model_name, (time.monotonic() - race_start) * 1000)
     _stats["requests"][win_idx] += 1
     _stats["successes"][win_idx] += 1
@@ -388,7 +400,7 @@ async def stats():
     for idx, ep in enumerate(ENDPOINTS):
         result["endpoints"].append({
             "index": idx,
-            "model_override": ep.model_override or "(none)",
+            "model": ep.model or "(none)",
             "requests": _stats["requests"].get(idx, 0),
             "successes": _stats["successes"].get(idx, 0),
             "failures": _stats["failures"].get(idx, 0),
@@ -434,7 +446,8 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             body_dict = {**body_dict, "model": model}
 
         # Resolve group: named group or "default"
-        group_name = model.lower() if model.lower() in GROUPS else "default"
+        normalized = normalize_group_name(model)
+        group_name = normalized if normalized in GROUPS else "default"
     else:
         body_dict = None
         group_name = "default"
@@ -468,7 +481,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         _stats["requests"][idx] += 1
 
         if body_dict is not None:
-            stripped = _strip_unsupported(body_dict, ep)
+            stripped = _strip_unsupported(body_dict, ep, group_name)
             send_body = json.dumps(stripped).encode()
             log.debug("-> %s body (keys): %s", ep.base_url, list(stripped.keys()))
         else:
@@ -487,7 +500,8 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
                 # Log if endpoint changed
                 global _last_endpoint_idx
                 if _last_endpoint_idx != idx:
-                    model_name = ep.model_override if ep.model_override else "(client model)"
+                    client_model = body_dict.get("model", "") if body_dict else ""
+                    model_name = _effective_model(ep, client_model, group_name) or "(client model)"
                     log.info("using endpoint: %s (model: %s)", ep.base_url, model_name)
                     _last_endpoint_idx = idx
                 return result
