@@ -9,9 +9,10 @@ from contextlib import asynccontextmanager
 from urllib.parse import unquote
 
 import httpx
+import yaml
 from fastapi import FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 import config
 from config import API_KEY, CONNECT_TIMEOUT, HOST, PORT, REQUEST_TIMEOUT, Endpoint, normalize_group_name
@@ -402,6 +403,178 @@ async def stats():
             "requests_since_last_race": _group_race_request_count.get(name, 0),
         }
     return result
+
+
+CONFIG_EDITOR_HTML = """<!DOCTYPE html>
+<html>
+<head>
+<title>stablellm config</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/material-darker.min.css">
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; background: #1e1e1e; color: #ccc; margin: 0; padding: 20px; }
+  h1 { font-size: 1.1em; margin: 0 0 12px; font-weight: 500; }
+  .bar { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
+  input[type=password] { background: #2d2d2d; color: #ccc; border: 1px solid #444; padding: 6px 10px; font-family: monospace; border-radius: 3px; }
+  input[type=password]:focus { outline: none; border-color: #0e639c; }
+  button { background: #0e639c; color: white; border: none; padding: 6px 14px; cursor: pointer; font-size: 13px; border-radius: 3px; }
+  button:hover:not(:disabled) { background: #1177bb; }
+  button:disabled { background: #555; cursor: not-allowed; }
+  .CodeMirror { height: 72vh; border: 1px solid #444; font-size: 13px; border-radius: 3px; }
+  #status { margin-top: 10px; padding: 8px 12px; border-radius: 3px; min-height: 1.2em; font-family: monospace; font-size: 12px; white-space: pre-wrap; }
+  #status.ok { background: #1e4620; color: #a7d9a8; }
+  #status.err { background: #5a1d1d; color: #f5a5a5; }
+  #status.info { background: #2d2d2d; color: #8ab4f8; }
+  .spacer { flex: 1; }
+  .hint { color: #666; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>stablellm config editor</h1>
+<div class="bar">
+  <input type="password" id="pw" placeholder="password" autofocus>
+  <button id="load">Load</button>
+  <button id="save" disabled>Save &amp; Reload</button>
+  <div class="spacer"></div>
+  <span class="hint">Ctrl/Cmd+S to save</span>
+</div>
+<textarea id="editor"></textarea>
+<div id="status" class="info">Enter password and click Load</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/yaml/yaml.min.js"></script>
+<script>
+const cm = CodeMirror.fromTextArea(document.getElementById('editor'), {
+  mode: 'yaml',
+  theme: 'material-darker',
+  lineNumbers: true,
+  indentUnit: 2,
+  tabSize: 2,
+  lineWrapping: false,
+  extraKeys: { 'Ctrl-S': saveConfig, 'Cmd-S': saveConfig },
+});
+
+const pw = document.getElementById('pw');
+const loadBtn = document.getElementById('load');
+const saveBtn = document.getElementById('save');
+const status = document.getElementById('status');
+
+function setStatus(msg, kind) {
+  status.textContent = msg;
+  status.className = kind;
+}
+
+async function loadConfig() {
+  if (!pw.value) { setStatus('enter password', 'err'); return; }
+  setStatus('loading...', 'info');
+  try {
+    const r = await fetch('api/content', { headers: { 'X-Config-Password': pw.value } });
+    const text = await r.text();
+    if (!r.ok) { setStatus(text || ('HTTP ' + r.status), 'err'); return; }
+    cm.setValue(text);
+    saveBtn.disabled = false;
+    setStatus('loaded', 'ok');
+  } catch (e) { setStatus(String(e), 'err'); }
+}
+
+async function saveConfig() {
+  if (saveBtn.disabled) return;
+  setStatus('saving...', 'info');
+  try {
+    const r = await fetch('api/save', {
+      method: 'POST',
+      headers: { 'X-Config-Password': pw.value, 'Content-Type': 'text/plain' },
+      body: cm.getValue(),
+    });
+    const text = await r.text();
+    setStatus(text, r.ok ? 'ok' : 'err');
+  } catch (e) { setStatus(String(e), 'err'); }
+}
+
+loadBtn.addEventListener('click', loadConfig);
+saveBtn.addEventListener('click', saveConfig);
+pw.addEventListener('keydown', e => { if (e.key === 'Enter') loadConfig(); });
+</script>
+</body>
+</html>
+"""
+
+
+def _reset_runtime_state():
+    """Clear stats/cooloff/race state. Endpoint indices may have shifted after reload."""
+    _cooloff_until.clear()
+    _stats["requests"].clear()
+    _stats["successes"].clear()
+    _stats["failures"].clear()
+    _group_race_request_count.clear()
+    _group_last_race_time.clear()
+    global _last_endpoint_idx
+    _last_endpoint_idx = None
+
+
+def _editor_auth(password: str | None) -> PlainTextResponse | None:
+    if not config.CONFIG_EDITOR_PASSWORD:
+        return PlainTextResponse("not found", status_code=404)
+    if not password or not hmac.compare_digest(password, config.CONFIG_EDITOR_PASSWORD):
+        return PlainTextResponse("unauthorized", status_code=401)
+    return None
+
+
+@app.get("/config/editor")
+async def config_editor_page():
+    if not config.CONFIG_EDITOR_PASSWORD:
+        return PlainTextResponse("not found", status_code=404)
+    return HTMLResponse(CONFIG_EDITOR_HTML)
+
+
+@app.get("/config/api/content")
+async def config_get_content(x_config_password: str | None = Header(None)):
+    err = _editor_auth(x_config_password)
+    if err:
+        return err
+    try:
+        with open(config.CONFIG_FILE) as f:
+            return PlainTextResponse(f.read())
+    except OSError as exc:
+        return PlainTextResponse(f"read failed: {exc}", status_code=500)
+
+
+@app.post("/config/api/save")
+async def config_save(request: Request, x_config_password: str | None = Header(None)):
+    err = _editor_auth(x_config_password)
+    if err:
+        return err
+
+    new_content = (await request.body()).decode("utf-8", errors="replace")
+
+    # Validate before touching disk
+    try:
+        raw = yaml.safe_load(new_content)
+    except yaml.YAMLError as exc:
+        return PlainTextResponse(f"YAML error: {exc}", status_code=400)
+    try:
+        config.parse_config(raw)
+    except config.ConfigError as exc:
+        return PlainTextResponse(f"validation failed: {exc}", status_code=400)
+
+    try:
+        with open(config.CONFIG_FILE, "w") as f:
+            f.write(new_content)
+    except OSError as exc:
+        return PlainTextResponse(f"write failed: {exc}", status_code=500)
+
+    config.reload()
+    _build_provider_groups()
+    _reset_runtime_state()
+    logging.getLogger().setLevel(getattr(logging, config.SETTINGS.log_level, logging.INFO))
+
+    group_names = [g for g in config.GROUPS if g != "default"]
+    log.info("config reloaded via editor: %d endpoint(s), groups: default + %s",
+             len(config.ENDPOINTS), group_names if group_names else "(none)")
+    return PlainTextResponse(
+        f"saved and reloaded: {len(config.ENDPOINTS)} endpoint(s), "
+        f"groups: default + {group_names if group_names else '(none)'}"
+    )
 
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST"])

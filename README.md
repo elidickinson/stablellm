@@ -69,3 +69,9 @@ Group names share a namespace with model names. Don't name a group after a real 
 ## Inspect
 
 `GET /stats` — per-endpoint request/success/failure counts and per-group preferred provider order.
+
+## Web config editor
+
+Set `CONFIG_EDITOR_PASSWORD` in `.env` to enable a YAML editor at `/config/editor`. If unset, all `/config/*` routes 404.
+
+The editor validates YAML and runs the full config parser before writing — invalid input is rejected without touching disk. On successful save, the new config is hot-reloaded in place. Stats and cooloff state are reset (endpoint indices may have shifted). Bind-time settings (`HOST`, `PORT`, timeouts) are not editable here — they live in `.env` and require a restart.
