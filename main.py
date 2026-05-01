@@ -1,9 +1,7 @@
 import asyncio
-import hashlib
 import hmac
 import json
 import logging
-import os
 import posixpath
 import time
 from collections import defaultdict
@@ -15,9 +13,10 @@ from fastapi import FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from config import API_KEY, COOLOFF_SECONDS, CONNECT_TIMEOUT, ENDPOINTS, GROUPS, HOST, PORT, REQUEST_TIMEOUT, Endpoint, normalize_group_name
+import config
+from config import API_KEY, CONNECT_TIMEOUT, HOST, PORT, REQUEST_TIMEOUT, Endpoint, normalize_group_name
 
-logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO))
+logging.basicConfig(level=getattr(logging, config.SETTINGS.log_level, logging.INFO))
 log = logging.getLogger("stablellm")
 
 # Reduce noise from external libraries
@@ -42,9 +41,6 @@ http_client: httpx.AsyncClient
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 _EXCLUDED_HEADERS = {"transfer-encoding", "connection", "keep-alive", "content-encoding", "content-length"}
 
-# Fastest mode: race providers to find the fastest
-RACE_INTERVAL_SECS = int(os.environ.get("RACE_INTERVAL_SECS", 6 * 3600))
-RACE_INTERVAL_REQUESTS = int(os.environ.get("RACE_INTERVAL_REQUESTS", 25))
 _background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
 
 # Per-group state (every request goes through a group; "default" is implicit)
@@ -55,15 +51,14 @@ _group_last_race_time: dict[str, float] = defaultdict(float)
 
 
 def _build_provider_groups():
+    """(Re)build the per-group provider partitioning from current config.GROUPS."""
     global _group_provider_groups, _group_preferred_providers
     _group_provider_groups = {}
     _group_preferred_providers = {}
-    for group_name, indices in GROUPS.items():
+    for group_name, indices in config.GROUPS.items():
         g: dict[tuple[str, str], list[int]] = {}
         for idx in indices:
-            ep = ENDPOINTS[idx]
-            # For grouping/preferred-order purposes, an empty ep.model behaves
-            # the same across all requests within a group, so use ep.model directly.
+            ep = config.ENDPOINTS[idx]
             key = (ep.model or "default", ep.base_url)
             g.setdefault(key, []).append(idx)
         _group_provider_groups[group_name] = g
@@ -84,8 +79,8 @@ async def lifespan(_app: FastAPI):
     global http_client
     http_client = httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=CONNECT_TIMEOUT))
     _build_provider_groups()
-    group_names = [g for g in GROUPS if g != "default"]
-    log.info("stablellm started with %d endpoint(s), groups: default + %s", len(ENDPOINTS), group_names if group_names else "(none)")
+    group_names = [g for g in config.GROUPS if g != "default"]
+    log.info("stablellm started with %d endpoint(s), groups: default + %s", len(config.ENDPOINTS), group_names if group_names else "(none)")
     yield
     await http_client.aclose()
 
@@ -106,10 +101,11 @@ def _is_available(idx: int) -> bool:
 
 
 def _mark_down(idx: int, reason: str):
-    _cooloff_until[idx] = time.monotonic() + COOLOFF_SECONDS
+    cooloff = config.SETTINGS.cooloff_seconds
+    _cooloff_until[idx] = time.monotonic() + cooloff
     _stats["failures"][idx] += 1
-    ep = ENDPOINTS[idx]
-    log.warning("endpoint %s marked down for %ss: %s", ep.base_url, COOLOFF_SECONDS, reason)
+    ep = config.ENDPOINTS[idx]
+    log.warning("endpoint %s marked down for %ss: %s", ep.base_url, cooloff, reason)
 
 
 def _check_auth(authorization: str | None) -> JSONResponse | None:
@@ -181,7 +177,7 @@ def _streaming_response(resp: httpx.Response, generator) -> StreamingResponse:
     )
 
 
-# Only pass these known-supported params to Cerebras
+# Only pass these known-supported params to upstream
 SUPPORTED_PARAMS = {
     "model",
     "messages",
@@ -229,9 +225,9 @@ def _should_race(group: str) -> bool:
     count = _group_race_request_count[group]
     if last_time == 0.0:
         return True
-    if count >= RACE_INTERVAL_REQUESTS:
+    if count >= config.SETTINGS.race_interval_requests:
         return True
-    if time.monotonic() - last_time >= RACE_INTERVAL_SECS:
+    if time.monotonic() - last_time >= config.SETTINGS.race_interval_secs:
         return True
     return False
 
@@ -250,7 +246,6 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
     """Race one endpoint per provider group with real request. Returns response or None."""
     pg = _group_provider_groups[group]
 
-    # One available endpoint per provider group
     candidates: list[tuple[tuple[str, str], int]] = []
     for key, indices in pg.items():
         for idx in indices:
@@ -271,9 +266,8 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         if len(race_times) + race_state["failures"] >= len(candidates):
             _finish_race(race_times, group)
 
-    # All racers use streaming internally so we can detect first non-error response
     async def _send(pk: tuple, idx: int):
-        ep = ENDPOINTS[idx]
+        ep = config.ENDPOINTS[idx]
         headers = _build_upstream_headers(ep)
         stripped = _strip_unsupported(body_dict, ep, group)
         send_body = json.dumps(stripped).encode()
@@ -287,7 +281,6 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
 
     tasks = {asyncio.create_task(_send(pk, idx)): (pk, idx) for pk, idx in candidates}
 
-    # Find first non-error response
     winner = None
     losers_to_drain: list[tuple[tuple[str, str], httpx.Response]] = []
     pending = set(tasks.keys())
@@ -312,7 +305,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         return None
 
     win_pk, win_idx, win_resp = winner
-    ep = ENDPOINTS[win_idx]
+    ep = config.ENDPOINTS[win_idx]
     model_name = _effective_model(ep, body_dict.get("model", ""), group) or "(client model)"
     log.info("race: first response from %s (model: %s) %.0fms", win_pk[1], model_name, (time.monotonic() - race_start) * 1000)
     _stats["requests"][win_idx] += 1
@@ -320,13 +313,11 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
     _group_race_request_count[group] = 0
     _group_last_race_time[group] = time.monotonic()
 
-    # Track endpoint change for race mode
     global _last_endpoint_idx
     if _last_endpoint_idx != win_idx:
         log.info("using endpoint: %s (model: %s)", ep.base_url, model_name)
         _last_endpoint_idx = win_idx
 
-    # Background: drain losers to measure total time
     async def _drain(pk, resp, idx=None):
         try:
             async for _ in resp.aiter_bytes():
@@ -360,7 +351,6 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         pk, idx = tasks[task]
         _bg(_await_and_drain(task, pk, idx))
 
-    # Stream winner to client
     if is_streaming:
         async def generate():
             try:
@@ -373,7 +363,6 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
 
         return _streaming_response(win_resp, generate())
     else:
-        # Non-streaming: accumulate winner's response
         chunks = []
         try:
             async for chunk in win_resp.aiter_bytes():
@@ -397,7 +386,7 @@ async def health():
 @app.get("/stats")
 async def stats():
     result = {"endpoints": []}
-    for idx, ep in enumerate(ENDPOINTS):
+    for idx, ep in enumerate(config.ENDPOINTS):
         result["endpoints"].append({
             "index": idx,
             "model": ep.model or "(none)",
@@ -406,7 +395,7 @@ async def stats():
             "failures": _stats["failures"].get(idx, 0),
         })
     result["groups"] = {}
-    for name, indices in GROUPS.items():
+    for name, indices in config.GROUPS.items():
         result["groups"][name] = {
             "endpoints": indices,
             "preferred_providers": [{"model": m, "base_url": u} for m, u in _group_preferred_providers.get(name, [])],
@@ -430,7 +419,6 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
     is_streaming = False
     fastest_mode = False
 
-    # Parse body for POST to detect streaming and rewrite model
     if request.method == "POST" and raw_body:
         try:
             body_dict = json.loads(raw_body)
@@ -438,21 +426,18 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             return JSONResponse({"error": "invalid JSON body"}, status_code=400)
         is_streaming = body_dict.get("stream", False)
 
-        # Detect :fastest mode from model name
         model = body_dict.get("model", "")
         if model.endswith(":fastest"):
             fastest_mode = True
             model = model.removesuffix(":fastest")
             body_dict = {**body_dict, "model": model}
 
-        # Resolve group: named group or "default"
-        normalized = normalize_group_name(model)
-        group_name = normalized if normalized in GROUPS else "default"
+        normalized_model = normalize_group_name(model)
+        group_name = normalized_model if normalized_model in config.GROUPS else "default"
     else:
         body_dict = None
         group_name = "default"
 
-    # Fastest mode: race or use preferred provider order
     if fastest_mode:
         _group_race_request_count[group_name] += 1
 
@@ -462,18 +447,17 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
                 return result
             log.warning("race failed (group=%s), falling back to sequential", group_name)
 
-        # Use preferred provider order
         pref = _group_preferred_providers[group_name]
         pg = _group_provider_groups[group_name]
         endpoint_order = []
         for pk in pref:
             endpoint_order.extend(pg[pk])
     else:
-        endpoint_order = GROUPS[group_name]
+        endpoint_order = config.GROUPS[group_name]
 
     last_failure = None
     for idx in endpoint_order:
-        ep = ENDPOINTS[idx]
+        ep = config.ENDPOINTS[idx]
         if not _is_available(idx):
             log.info("skipping %s (cooling off)", ep.base_url)
             continue
@@ -497,7 +481,6 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
 
             if result is not None:
                 _stats["successes"][idx] += 1
-                # Log if endpoint changed
                 global _last_endpoint_idx
                 if _last_endpoint_idx != idx:
                     client_model = body_dict.get("model", "") if body_dict else ""

@@ -11,6 +11,9 @@ RUN uv sync --frozen --no-dev --no-cache-dir
 
 COPY --chown=app:app config.py main.py ./
 
+# config.yaml is expected to be bind-mounted at /app/config.yaml
+# e.g. docker run -v ./config.yaml:/app/config.yaml ...
+
 USER app
 
 EXPOSE 4000

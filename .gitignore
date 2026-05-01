@@ -1,6 +1,9 @@
 # Environment variables with secrets
 .env
 
+# Per-deployment model config (may reference secrets via ${VAR})
+config.yaml
+
 # Python
 __pycache__/
 *.py[cod]

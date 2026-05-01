@@ -1,0 +1,41 @@
+# Reloadable proxy config. Copy to config.yaml and edit.
+# Bind-time settings (HOST, PORT, REQUEST_TIMEOUT, CONNECT_TIMEOUT, API_KEY) live in .env —
+# changing them requires a server restart.
+
+settings:
+  cooloff_seconds: 30
+  race_interval_secs: 21600  # 6h
+  race_interval_requests: 25
+  log_level: INFO
+
+endpoints:
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY}
+
+  openai_backup:
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_BACKUP_KEY}
+
+  cerebras:
+    base_url: https://api.cerebras.ai/v1
+    api_key: ${CEREBRAS_API_KEY}
+    model: llama-3.3-70b
+    flags: [keep_reasoning]
+
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    api_key: ${OPENROUTER_API_KEY}
+    model: openai/gpt-4o
+
+groups:
+  # "default" is used when the request model doesn't match any group.
+  # If omitted, all endpoints are used in declaration order.
+  default: [openai, openai_backup, openrouter]
+
+  # Request model "cheap" (or "cheap:fastest" to race) → these endpoints in order.
+  cheap: [cerebras, openrouter]
+
+  # Group names match request models case-insensitively, with - . _ treated as
+  # equivalent. So this matches "gpt-4o", "GPT-4o", or "gpt_4o".
+  gpt_4o: [openai, openai_backup]

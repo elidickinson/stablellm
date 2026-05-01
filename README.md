@@ -4,13 +4,40 @@ OpenAI-compatible proxy that fans requests across multiple upstream endpoints wi
 
 ## Configure
 
-Copy `.env.example` to `.env` and set:
+Two files. Bind-time settings live in `.env` (changing them requires a restart). Everything else lives in `config.yaml` and is reloadable.
 
-- `ENDPOINT_<NAME>=<base_url>|<api_key>|<model>|<flags>` — one per upstream. `model` and `flags` are optional. If `model` is empty, requests via a named group send the group name as the model; requests via the default group pass the client's model through. Flags: `keep_reasoning`.
-- `GROUP_<NAME>=<ep1>,<ep2>,...` — optional. Maps a virtual model name to an ordered subset of endpoints.
-- `GROUP_DEFAULT` — optional. Endpoints (and order) used when the request model doesn't match any group. Defaults to all endpoints in declaration order.
+**`.env`** — copy from `.env.example`:
 
-Other knobs: `HOST`, `PORT`, `API_KEY` (proxy auth), `COOLOFF_SECONDS`, `REQUEST_TIMEOUT`, `CONNECT_TIMEOUT`, `RACE_INTERVAL_SECS`, `RACE_INTERVAL_REQUESTS`, `LOG_LEVEL`.
+- `HOST`, `PORT`, `REQUEST_TIMEOUT`, `CONNECT_TIMEOUT` — server bind + outbound HTTP client.
+- `API_KEY` — optional. If set, clients must send `Authorization: Bearer <API_KEY>`.
+- `CONFIG_FILE` — path to the YAML config (default `config.yaml`).
+- API key vars referenced from YAML via `${VAR}` interpolation (e.g. `OPENAI_API_KEY`).
+
+**`config.yaml`** — copy from `config.example.yaml`:
+
+```yaml
+settings:
+  cooloff_seconds: 30
+  race_interval_secs: 21600
+  race_interval_requests: 25
+  log_level: INFO
+
+endpoints:
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY}
+  cerebras:
+    base_url: https://api.cerebras.ai/v1
+    api_key: ${CEREBRAS_API_KEY}
+    model: llama-3.3-70b
+    flags: [keep_reasoning]
+
+groups:
+  default: [openai]
+  cheap: [cerebras]
+```
+
+Per-endpoint `model` is optional. If empty, requests via a named group send the client's requested model; requests via the `default` group also pass through.
 
 ## Run
 
@@ -18,24 +45,26 @@ Other knobs: `HOST`, `PORT`, `API_KEY` (proxy auth), `COOLOFF_SECONDS`, `REQUEST
 uv run uvicorn main:app --host $HOST --port $PORT
 ```
 
-POST to `/v1/chat/completions` (or any path) exactly like the OpenAI API.
+POST to `/v1/chat/completions` (or any path) like the OpenAI API.
 
 ## Routing
 
 Every request resolves to a group:
 
-1. If `model` (lowercased) matches a `GROUP_<NAME>`, that group is used.
-2. Otherwise the `default` group is used.
+1. If the request `model` matches a group, that group is used.
+2. Otherwise the `default` group is used (all endpoints in declaration order, unless overridden).
 
-Within a group, endpoints are tried in order. A failing endpoint cools off for `COOLOFF_SECONDS` before it's retried.
+Within a group, endpoints are tried in order. A failing endpoint cools off for `cooloff_seconds` before being retried.
+
+Group lookup is case-insensitive and treats `-`, `.`, `_` as equivalent — so YAML key `gpt_4_1` matches request model `gpt-4.1`.
 
 ### Fastest mode
 
-Append `:fastest` to the model (e.g. `model: "cheap:fastest"`) to race one endpoint per provider group on the first request, then reuse the winner for `RACE_INTERVAL_REQUESTS` requests or `RACE_INTERVAL_SECS` seconds.
+Append `:fastest` to the model (e.g. `cheap:fastest`) to race one endpoint per provider on the first request, then reuse the winner for `race_interval_requests` requests or `race_interval_secs` seconds.
 
 ### Group naming
 
-Group names share a namespace with model names. A request's `model` either matches a group or passes through to `default`. **Do not name a group after a real model ID** — you'll permanently reroute that model with no opt-out. Use virtual names like `cheap`, `fast`, `smart`.
+Group names share a namespace with model names. Don't name a group after a real model ID unless you want every request for that model permanently routed there — there's no opt-out.
 
 ## Inspect
 
