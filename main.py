@@ -512,10 +512,17 @@ def _reset_runtime_state():
     _last_endpoint_idx = None
 
 
-def _editor_auth(password: str | None) -> PlainTextResponse | None:
+EDITOR_AUTH_DELAY_SECS = 0.5
+
+
+async def _editor_auth(password: str | None) -> PlainTextResponse | None:
     if not config.CONFIG_EDITOR_PASSWORD:
         return PlainTextResponse("not found", status_code=404)
-    if not password or not hmac.compare_digest(password, config.CONFIG_EDITOR_PASSWORD):
+    # Constant delay applied to both success and failure to slow brute-force
+    # and avoid leaking timing info about which side of the compare differed.
+    ok = bool(password) and hmac.compare_digest(password, config.CONFIG_EDITOR_PASSWORD)
+    await asyncio.sleep(EDITOR_AUTH_DELAY_SECS)
+    if not ok:
         return PlainTextResponse("unauthorized", status_code=401)
     return None
 
@@ -529,7 +536,7 @@ async def config_editor_page():
 
 @app.get("/config/api/content")
 async def config_get_content(x_config_password: str | None = Header(None)):
-    err = _editor_auth(x_config_password)
+    err = await _editor_auth(x_config_password)
     if err:
         return err
     try:
@@ -541,7 +548,7 @@ async def config_get_content(x_config_password: str | None = Header(None)):
 
 @app.post("/config/api/save")
 async def config_save(request: Request, x_config_password: str | None = Header(None)):
-    err = _editor_auth(x_config_password)
+    err = await _editor_auth(x_config_password)
     if err:
         return err
 

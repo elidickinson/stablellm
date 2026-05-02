@@ -24,6 +24,8 @@ def app_factory(monkeypatch, tmp_path):
         import main
         main.http_client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})))
         main._build_provider_groups()
+        # Skip the brute-force-mitigation delay in tests
+        main.EDITOR_AUTH_DELAY_SECS = 0
         return main.app, cfg
 
     return build
@@ -52,6 +54,28 @@ async def test_editor_unauthorized_without_password_header(app_factory):
     app, _ = app_factory(password="secret")
     resp = await _get(app, "/config/api/content")
     assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_editor_auth_applies_constant_delay(app_factory):
+    import time
+    app, _ = app_factory(password="secret")
+    import main
+    main.EDITOR_AUTH_DELAY_SECS = 0.1
+
+    t0 = time.monotonic()
+    bad = await _get(app, "/config/api/content", headers={"X-Config-Password": "wrong"})
+    bad_elapsed = time.monotonic() - t0
+
+    t0 = time.monotonic()
+    good = await _get(app, "/config/api/content", headers={"X-Config-Password": "secret"})
+    good_elapsed = time.monotonic() - t0
+
+    assert bad.status_code == 401 and good.status_code == 200
+    # Both paths sleep at least the delay; difference should be small (<50ms slack)
+    assert bad_elapsed >= 0.1
+    assert good_elapsed >= 0.1
+    assert abs(bad_elapsed - good_elapsed) < 0.05
 
 
 @pytest.mark.asyncio
