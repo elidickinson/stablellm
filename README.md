@@ -11,6 +11,7 @@ Two files. Bind-time settings live in `.env` (changing them requires a restart).
 - `HOST`, `PORT`, `REQUEST_TIMEOUT`, `CONNECT_TIMEOUT` — server bind + outbound HTTP client.
 - `API_KEY` — optional. If set, clients must send `Authorization: Bearer <API_KEY>`.
 - `CONFIG_FILE` — path to the YAML config (default `config.yaml`).
+- `MAX_BODY_BYTES` — max inbound request body size (default 50MB).
 - API key vars referenced from YAML via `${VAR}` interpolation (e.g. `OPENAI_API_KEY`).
 
 **`config.yaml`** — copy from `config.example.yaml`:

@@ -38,6 +38,7 @@ CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "4"))
 API_KEY = os.getenv("API_KEY", "")
 CONFIG_FILE = os.getenv("CONFIG_FILE", "config.yaml")
 CONFIG_EDITOR_PASSWORD = os.getenv("CONFIG_EDITOR_PASSWORD", "")
+MAX_BODY_BYTES = int(os.getenv("MAX_BODY_BYTES", str(50 * 1024 * 1024)))
 
 # --- Reloadable state (sourced from CONFIG_FILE) ---
 ENDPOINTS: list[Endpoint] = []
@@ -170,9 +171,10 @@ def reload() -> None:
     ENDPOINTS, ENDPOINT_NAMES, GROUPS, SETTINGS = load_from_file()
 
 
-# Initial load — fatal on failure
-try:
-    reload()
-except ConfigError as exc:
-    print(f"FATAL: {exc}", file=sys.stderr)
-    sys.exit(1)
+def load_or_exit() -> None:
+    """Initial load with hard exit on failure. Call from app entrypoint, not at import."""
+    try:
+        reload()
+    except ConfigError as exc:
+        print(f"FATAL: {exc}", file=sys.stderr)
+        sys.exit(1)

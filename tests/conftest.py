@@ -44,7 +44,9 @@ def fresh_config(monkeypatch, tmp_path: Path, content: str | dict):
     for mod in ("config", "main"):
         sys.modules.pop(mod, None)
     import config
-    return importlib.reload(config)
+    cfg = importlib.reload(config)
+    cfg.reload()
+    return cfg
 
 
 @pytest.fixture

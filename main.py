@@ -17,7 +17,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Str
 import config
 from config import API_KEY, CONNECT_TIMEOUT, HOST, PORT, REQUEST_TIMEOUT, Endpoint, normalize_group_name
 
-logging.basicConfig(level=getattr(logging, config.SETTINGS.log_level, logging.INFO))
+config.load_or_exit()
+
+logging.basicConfig(
+    level=getattr(logging, config.SETTINGS.log_level, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    force=True,
+)
 log = logging.getLogger("stablellm")
 
 # Reduce noise from external libraries
@@ -49,6 +55,7 @@ _group_provider_groups: dict[str, dict[tuple[str, str], list[int]]] = {}
 _group_preferred_providers: dict[str, list[tuple[str, str]]] = {}
 _group_race_request_count: dict[str, int] = defaultdict(int)
 _group_last_race_time: dict[str, float] = defaultdict(float)
+_group_race_generation: dict[str, int] = defaultdict(int)
 
 
 def _build_provider_groups():
@@ -91,10 +98,23 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _limit_body_size(request: Request, call_next):
+    cl = request.headers.get("content-length")
+    if cl is not None:
+        try:
+            n = int(cl)
+        except ValueError:
+            return JSONResponse({"error": "invalid content-length"}, status_code=400)
+        if n > config.MAX_BODY_BYTES:
+            return JSONResponse({"error": "request body too large"}, status_code=413)
+    return await call_next(request)
 
 
 def _is_available(idx: int) -> bool:
@@ -118,19 +138,25 @@ def _check_auth(authorization: str | None) -> JSONResponse | None:
 
 
 async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes):
-    """Stream response from upstream. Returns (StreamingResponse, None) or (None, status_code)."""
+    """Stream response from upstream. Returns (StreamingResponse, None) or (None, reason)."""
     url = f"{ep.base_url}/{path}"
+    t0 = time.monotonic()
     req = http_client.build_request("POST", url, headers=headers, content=body)
     resp = await http_client.send(req, stream=True)
+    ttfb = time.monotonic() - t0
 
     try:
         if resp.status_code in RETRYABLE_STATUSES:
             await resp.aclose()
-            return None, resp.status_code
+            return None, f"HTTP {resp.status_code}"
 
         async def generate():
+            first = True
             try:
                 async for chunk in resp.aiter_bytes():
+                    if first:
+                        log.info("%s TTFT %.0fms (TTFB %.0fms)", ep.base_url, (time.monotonic() - t0) * 1000, ttfb * 1000)
+                        first = False
                     yield chunk
             finally:
                 await resp.aclose()
@@ -142,19 +168,19 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes):
 
 
 async def _proxy_buffered(ep: Endpoint, method: str, path: str, headers: dict, body: bytes):
-    """Non-streaming: send request, return full response or (None, status_code)."""
+    """Non-streaming: send request, return full response or (None, reason)."""
     url = f"{ep.base_url}/{path}"
     t0 = time.monotonic()
     resp = await http_client.request(method, url, headers=headers, content=body)
     elapsed = time.monotonic() - t0
 
     if resp.status_code in RETRYABLE_STATUSES:
-        return None, resp.status_code
+        return None, f"HTTP {resp.status_code}"
 
     try:
         data = resp.json()
     except Exception:
-        return JSONResponse({"error": "upstream returned invalid JSON"}, status_code=502)
+        return None, "invalid JSON"
 
     log.info("%s TTFB %.0fms", ep.base_url, elapsed * 1000)
 
@@ -183,23 +209,41 @@ SUPPORTED_PARAMS = {
     "model",
     "messages",
     "stream",
+    "stream_options",
+    "max_tokens",
     "max_completion_tokens",
+    "n",
     "temperature",
     "top_p",
+    "top_k",
     "stop",
     "seed",
+    "frequency_penalty",
+    "presence_penalty",
+    "logit_bias",
     "logprobs",
     "top_logprobs",
     "tools",
     "tool_choice",
     "parallel_tool_calls",
+    "functions",
+    "function_call",
     "response_format",
     "prediction",
+    "service_tier",
+    "store",
+    "metadata",
+    "audio",
+    "modalities",
+    "web_search_options",
     "user",
     "reasoning_effort",
+    "thinking",
     "clear_thinking",
     "disable_reasoning",
 }
+
+_REASONING_KEYS = frozenset({"reasoning", "reasoning_content", "thinking"})
 
 
 def _rewrite_model(body: dict, ep: Endpoint, group_name: str) -> dict:
@@ -210,7 +254,7 @@ def _rewrite_model(body: dict, ep: Endpoint, group_name: str) -> dict:
 
 
 def _strip_message_reasoning(messages: list) -> list:
-    return [{k: v for k, v in msg.items() if k != "reasoning"} for msg in messages]
+    return [{k: v for k, v in msg.items() if k not in _REASONING_KEYS} for msg in messages]
 
 
 def _strip_unsupported(body: dict, ep: Endpoint, group_name: str) -> dict:
@@ -257,6 +301,13 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
     if len(candidates) <= 1:
         return None
 
+    # Reset race-cadence state on attempt so a failed race doesn't cause every
+    # following request to retry the race against still-cooling-off endpoints.
+    _group_race_request_count[group] = 0
+    _group_last_race_time[group] = time.monotonic()
+    _group_race_generation[group] += 1
+    gen = _group_race_generation[group]
+
     log.info("race: starting with %d providers: %s", len(candidates), [pk[1] for pk, _ in candidates])
 
     race_times: dict[tuple[str, str], float] = {}
@@ -264,6 +315,10 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
     race_state = {"failures": 0}
 
     def _maybe_finalize():
+        # Skip if a newer race for this group has already started; otherwise late
+        # background drains from this race could clobber the newer race's order.
+        if _group_race_generation[group] != gen:
+            return
         if len(race_times) + race_state["failures"] >= len(candidates):
             _finish_race(race_times, group)
 
@@ -311,8 +366,6 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
     log.info("race: first response from %s (model: %s) %.0fms", win_pk[1], model_name, (time.monotonic() - race_start) * 1000)
     _stats["requests"][win_idx] += 1
     _stats["successes"][win_idx] += 1
-    _group_race_request_count[group] = 0
-    _group_last_race_time[group] = time.monotonic()
 
     global _last_endpoint_idx
     if _last_endpoint_idx != win_idx:
@@ -552,7 +605,10 @@ async def config_save(request: Request, x_config_password: str | None = Header(N
     if err:
         return err
 
-    new_content = (await request.body()).decode("utf-8", errors="replace")
+    try:
+        new_content = (await request.body()).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return PlainTextResponse(f"invalid UTF-8: {exc}", status_code=400)
 
     # Validate before touching disk
     try:
@@ -655,9 +711,9 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
 
         try:
             if is_streaming:
-                result, status = await _proxy_stream(ep, path, headers, send_body)
+                result, reason = await _proxy_stream(ep, path, headers, send_body)
             else:
-                result, status = await _proxy_buffered(ep, request.method, path, headers, send_body)
+                result, reason = await _proxy_buffered(ep, request.method, path, headers, send_body)
 
             if result is not None:
                 _stats["successes"][idx] += 1
@@ -669,8 +725,8 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
                     _last_endpoint_idx = idx
                 return result
 
-            _mark_down(idx, f"HTTP {status}")
-            last_failure = f"HTTP {status}"
+            _mark_down(idx, reason)
+            last_failure = reason
 
         except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
             _mark_down(idx, str(exc))
