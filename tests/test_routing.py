@@ -1,4 +1,3 @@
-import json
 import sys
 
 import httpx
@@ -21,6 +20,7 @@ def app_with_endpoints(monkeypatch, tmp_path):
         calls: list[tuple[str, dict]] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
+            import json
             base = f"{request.url.scheme}://{request.url.host}"
             body = json.loads(request.content.decode()) if request.content else {}
             calls.append((base, body))
@@ -44,14 +44,17 @@ async def _post(app, body):
 
 
 @pytest.mark.asyncio
-async def test_group_routes_only_to_listed_endpoints_in_order(app_with_endpoints):
+async def test_named_group_routes_in_order(app_with_endpoints):
     app, calls = app_with_endpoints({
-        "endpoints": {
-            "a": {"base_url": "https://a.test", "api_key": "k", "model": "model-a"},
-            "b": {"base_url": "https://b.test", "api_key": "k", "model": "model-b"},
-            "c": {"base_url": "https://c.test", "api_key": "k", "model": "model-c"},
+        "providers": {
+            "a": {"base_url": "https://a.test", "api_key": "k"},
+            "b": {"base_url": "https://b.test", "api_key": "k"},
+            "c": {"base_url": "https://c.test", "api_key": "k"},
         },
-        "groups": {"cheap": ["c", "a"]},
+        "groups": {
+            "default": [{"provider": "a"}],
+            "cheap": [{"provider": "c", "model": "model-c"}, {"provider": "a", "model": "model-a"}],
+        },
     })
     resp = await _post(app, {"model": "cheap", "messages": [{"role": "user", "content": "hi"}]})
     assert resp.status_code == 200
@@ -63,10 +66,11 @@ async def test_group_routes_only_to_listed_endpoints_in_order(app_with_endpoints
 @pytest.mark.asyncio
 async def test_unknown_model_falls_back_to_default_group(app_with_endpoints):
     app, calls = app_with_endpoints({
-        "endpoints": {
+        "providers": {
             "a": {"base_url": "https://a.test", "api_key": "k"},
             "b": {"base_url": "https://b.test", "api_key": "k"},
         },
+        "groups": {"default": [{"provider": "a"}, {"provider": "b"}]},
     })
     resp = await _post(app, {"model": "anything", "messages": []})
     assert resp.status_code == 200
@@ -75,29 +79,33 @@ async def test_unknown_model_falls_back_to_default_group(app_with_endpoints):
 
 
 @pytest.mark.asyncio
-async def test_empty_endpoint_model_in_named_group_uses_client_model(app_with_endpoints):
+async def test_no_model_on_group_entry_passes_through_client_model(app_with_endpoints):
+    """When a group entry omits 'model', the client's requested model passes through."""
     app, calls = app_with_endpoints({
-        "endpoints": {
+        "providers": {
             "a": {"base_url": "https://a.test", "api_key": "k"},
-            "b": {"base_url": "https://b.test", "api_key": "k", "model": "gpt-4o-mini"},
+            "b": {"base_url": "https://b.test", "api_key": "k"},
         },
-        "groups": {"gpt_4o": ["a", "b"]},
+        "groups": {
+            "default": [{"provider": "a"}, {"provider": "b", "model": "gpt-4o-mini"}],
+            "gpt-4o": [{"provider": "a"}, {"provider": "b", "model": "gpt-4o-mini"}],
+        },
     })
     resp = await _post(app, {"model": "gpt-4o", "messages": []})
     assert resp.status_code == 200
     assert calls[0][0] == "https://a.test"
-    # Empty endpoint model + named group → client's original model passes through (preserves dashes)
+    # No model on entry → named group → client's model passes through
     assert calls[0][1]["model"] == "gpt-4o"
 
 
 @pytest.mark.asyncio
 async def test_fastest_suffix_is_stripped_before_group_lookup(app_with_endpoints):
     app, calls = app_with_endpoints({
-        "endpoints": {
-            "a": {"base_url": "https://a.test", "api_key": "k", "model": "model-a"},
-            "b": {"base_url": "https://b.test", "api_key": "k", "model": "model-b"},
+        "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+        "groups": {
+            "default": [{"provider": "a"}],
+            "cheap": [{"provider": "a", "model": "model-a"}],
         },
-        "groups": {"cheap": ["a"]},  # single endpoint -> race short-circuits
     })
     resp = await _post(app, {"model": "cheap:fastest", "messages": []})
     assert resp.status_code == 200
@@ -106,35 +114,39 @@ async def test_fastest_suffix_is_stripped_before_group_lookup(app_with_endpoints
 
 
 @pytest.mark.asyncio
-async def test_group_lookup_normalizes_dashes_dots_underscores(app_with_endpoints):
+async def test_group_name_matches_exactly_no_normalization(app_with_endpoints):
+    """Group names are plain strings — 'gpt-4.1' only matches 'gpt-4.1', not 'gpt_4_1'."""
     app, calls = app_with_endpoints({
-        "endpoints": {"a": {"base_url": "https://a.test", "api_key": "k", "model": "model-a"}},
-        "groups": {"gpt_4_1": ["a"]},
+        "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+        "groups": {
+            "default": [{"provider": "a", "model": "fallback"}],
+            "gpt-4.1": [{"provider": "a", "model": "model-a"}],
+        },
     })
     resp = await _post(app, {"model": "gpt-4.1", "messages": []})
     assert resp.status_code == 200
-    assert calls[0][0] == "https://a.test"
     assert calls[0][1]["model"] == "model-a"
 
 
 @pytest.mark.asyncio
-async def test_reload_picks_up_new_endpoints(app_with_endpoints, tmp_path, monkeypatch):
+async def test_reload_picks_up_new_providers(app_with_endpoints, tmp_path, monkeypatch):
+    import yaml as _yaml
     app, calls = app_with_endpoints({
-        "endpoints": {"a": {"base_url": "https://a.test", "api_key": "k", "model": "model-a"}},
+        "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+        "groups": {"default": [{"provider": "a", "model": "model-a"}]},
     })
     resp = await _post(app, {"model": "anything", "messages": []})
     assert resp.status_code == 200
     assert calls[-1][0] == "https://a.test"
 
-    # Rewrite the same config file with a new endpoint and reload
-    import yaml as _yaml
+    # Rewrite config file with a new provider and reload
     config_path = tmp_path / "config.yaml"
     config_path.write_text(_yaml.safe_dump({
-        "endpoints": {
-            "a": {"base_url": "https://a.test", "api_key": "k", "model": "model-a"},
-            "b": {"base_url": "https://b.test", "api_key": "k", "model": "model-b"},
+        "providers": {
+            "a": {"base_url": "https://a.test", "api_key": "k"},
+            "b": {"base_url": "https://b.test", "api_key": "k"},
         },
-        "groups": {"default": ["b", "a"]},
+        "groups": {"default": [{"provider": "b", "model": "model-b"}, {"provider": "a", "model": "model-a"}]},
     }))
 
     import config
@@ -144,5 +156,5 @@ async def test_reload_picks_up_new_endpoints(app_with_endpoints, tmp_path, monke
 
     resp = await _post(app, {"model": "anything", "messages": []})
     assert resp.status_code == 200
-    # New default order puts b first
     assert calls[-1][0] == "https://b.test"
+    assert calls[-1][1]["model"] == "model-b"

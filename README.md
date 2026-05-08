@@ -1,6 +1,6 @@
 # stablellm
 
-OpenAI-compatible proxy that fans requests across multiple upstream endpoints with failover and optional latency racing.
+OpenAI-compatible proxy that fans requests across multiple upstream providers with failover and optional latency racing.
 
 ## Configure
 
@@ -25,32 +25,45 @@ API keys for upstream providers are set as individual vars here and referenced f
 
 ```yaml
 settings:
-  cooloff_seconds: 30           # how long a failing endpoint is skipped
-  race_interval_secs: 21600     # 6h — time between races (per group)
-  race_interval_requests: 25    # request count between races (per group)
+  cooloff_seconds: 30          # how long a failing endpoint is skipped
+  race_interval_secs: 21600    # 6h — time between races (per group)
+  race_interval_requests: 25   # request count between races (per group)
   log_level: INFO
 
-endpoints:
-  openai:
-    base_url: https://api.openai.com/v1
-    api_key: ${OPENAI_API_KEY}
+providers:
   cerebras:
     base_url: https://api.cerebras.ai/v1
     api_key: ${CEREBRAS_API_KEY}
-    model: llama-3.3-70b        # overrides the client-requested model
-    flags: [keep_reasoning]
+
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY}
 
 groups:
-  default: [openai]
-  cheap: [cerebras]
+  default:
+    - provider: openai
+    - provider: cerebras
+      model: zai-glm-4.7
+      flags: [keep_reasoning]
+
+  glm-4.7:
+    - provider: cerebras
+      model: zai-glm-4.7
+      flags: [keep_reasoning]
+    - provider: openai
 ```
 
-**Per-endpoint `model`** is optional. If empty, the client's requested model passes through unchanged.
+**`providers`** — a registry of upstream API endpoints. Each has a `base_url` and `api_key`. No model info here.
 
-**Per-endpoint `flags`:**
-- `keep_reasoning` — preserve `reasoning`/`reasoning_content`/`thinking` fields in messages (otherwise stripped).
+**`groups`** — maps a request model name to an ordered list of upstream entries. Each entry references a provider and can supply:
 
-**Unknown request parameters** (not in the supported set) are silently stripped per-endpoint before forwarding. This lets endpoints with different capabilities share the same request body.
+- `provider` — name from the providers section (required)
+- `model` — model name to send upstream. If omitted, the client's requested model passes through unchanged.
+- `flags` — per-endpoint flags: `keep_reasoning` preserves `reasoning`/`reasoning_content`/`thinking` fields in messages (otherwise stripped).
+
+**Group names are plain strings** — `glm-4.7` matches exactly `model: glm-4.7` from the client. No normalization or case folding.
+
+**`default` group** is the fallback when no other group matches the request model. If omitted, it's created implicitly with one entry per unique provider (no model override, passthrough).
 
 ## Run
 
@@ -64,22 +77,18 @@ POST to `/v1/chat/completions` (or any path) like the OpenAI API.
 
 Every request resolves to a group:
 
-1. If the request `model` matches a group name, that group's endpoint list is used.
-2. Otherwise the `default` group is used (all endpoints in declaration order, unless overridden).
+1. If the request `model` matches a group name, that group's provider list is used.
+2. Otherwise the `default` group is used.
 
-Within a group, endpoints are tried in order. A failing endpoint cools off for `cooloff_seconds` before being retried. If all endpoints fail, the request returns a 502.
+Within a group, providers are tried in order. A failing endpoint cools off for `cooloff_seconds` before being retried. If all endpoints fail, the request returns a 502.
 
-Group lookup is case-insensitive and treats `-`, `.`, `_` as equivalent — YAML key `gpt_4_1` matches request model `gpt-4.1`.
+**Unknown request parameters** (not in the supported set) are silently stripped per-endpoint before forwarding. This lets providers with different capabilities share the same request body.
 
 ### Fastest mode
 
-Append `:fastest` to the model (e.g. `cheap:fastest`) to race one endpoint per provider. On the first request, each provider gets a concurrent request; the fastest response wins and becomes the preferred provider for subsequent requests. A re-race triggers when either `race_interval_requests` requests have passed or `race_interval_secs` seconds have elapsed since the last race.
+Append `:fastest` to the model (e.g. `glm-4.7:fastest`) to race one endpoint per provider. On the first request, each provider gets a concurrent request; the fastest response wins and becomes the preferred provider for subsequent requests. A re-race triggers when either `race_interval_requests` requests have passed or `race_interval_secs` seconds have elapsed since the last race.
 
 Defaults: every **25 requests** or **6 hours**, whichever comes first.
-
-### Group naming
-
-Group names share a namespace with model names. If you name a group `gpt-4o`, every request with `model: gpt-4o` will be routed there instead of passing through to an upstream. The `:fastest` suffix can still be appended (`gpt-4o:fastest`) to enable racing within that group.
 
 ## Inspect
 

@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 import config
-from config import API_KEY, CONNECT_TIMEOUT, HOST, PORT, REQUEST_TIMEOUT, Endpoint, normalize_group_name
+from config import API_KEY, CONNECT_TIMEOUT, HOST, PORT, REQUEST_TIMEOUT, Endpoint
 
 config.load_or_exit()
 
@@ -74,7 +74,6 @@ def _build_provider_groups():
 
 
 def _effective_model(ep: Endpoint, client_model: str, group_name: str) -> str:
-    """The model name actually sent upstream. Empty string means pass through client's model."""
     if ep.model:
         return ep.model
     if group_name != "default":
@@ -668,8 +667,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             model = model.removesuffix(":fastest")
             body_dict = {**body_dict, "model": model}
 
-        normalized_model = normalize_group_name(model)
-        group_name = normalized_model if normalized_model in config.GROUPS else "default"
+        group_name = model if model in config.GROUPS else "default"
     else:
         body_dict = None
         group_name = "default"

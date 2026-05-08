@@ -10,16 +10,23 @@ load_dotenv()
 
 
 @dataclass(frozen=True)
-class Endpoint:
+class Provider:
+    """A raw upstream provider: base_url + api_key. No model information."""
     base_url: str
     api_key: str
-    model: str = ""  # empty: defaults to client's requested model
+
+
+@dataclass(frozen=True)
+class Endpoint:
+    """A concrete (provider + model) tuple. Indexed for routing."""
+    base_url: str
+    api_key: str
+    model: str = ""  # empty → pass through client's model
     keep_reasoning: bool = False
 
 
 @dataclass(frozen=True)
 class Settings:
-    """Reloadable runtime tunables loaded from config.yaml."""
     cooloff_seconds: float = 30.0
     race_interval_secs: int = 6 * 3600
     race_interval_requests: int = 25
@@ -30,7 +37,7 @@ class ConfigError(Exception):
     pass
 
 
-# --- Bind-time settings (env-only, require restart) ---
+# --- Bind-time settings ---
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "4000"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "120"))
@@ -40,21 +47,10 @@ CONFIG_FILE = os.getenv("CONFIG_FILE", "config.yaml")
 CONFIG_EDITOR_PASSWORD = os.getenv("CONFIG_EDITOR_PASSWORD", "")
 MAX_BODY_BYTES = int(os.getenv("MAX_BODY_BYTES", str(50 * 1024 * 1024)))
 
-# --- Reloadable state (sourced from CONFIG_FILE) ---
+# --- Reloadable state (updated atomically by apply_config) ---
 ENDPOINTS: list[Endpoint] = []
-ENDPOINT_NAMES: dict[str, int] = {}
 GROUPS: dict[str, list[int]] = {}
 SETTINGS: Settings = Settings()
-
-
-def normalize_group_name(name: str) -> str:
-    """Group lookup is case-insensitive and treats - . _ as equivalent.
-
-    Lets YAML group keys (which usually use underscores) match request model
-    IDs that commonly contain dashes or dots (e.g. "gpt-4.1" → "gpt_4_1").
-    """
-    return name.lower().replace("-", "_").replace(".", "_")
-
 
 _ENV_VAR_RE = re.compile(r"\$\{(\w+)\}|\$(\w+)")
 
@@ -66,65 +62,106 @@ def _env_substitute(value: str) -> str:
         if result is None:
             raise ConfigError(f"environment variable '{var}' is not set")
         return result
+
     return _ENV_VAR_RE.sub(_replace, value)
 
 
-def _parse_endpoints(raw: dict) -> tuple[list[Endpoint], dict[str, int]]:
+def _parse_providers(raw: object) -> dict[str, Provider]:
+    """Parse top-level 'providers' mapping. Returns {name_lower: Provider}."""
     if not isinstance(raw, dict) or not raw:
-        raise ConfigError("'endpoints' must be a non-empty mapping")
+        raise ConfigError("'providers' must be a non-empty mapping")
 
-    endpoints: list[Endpoint] = []
-    name_to_idx: dict[str, int] = {}
-    for name, ep in raw.items():
-        if not isinstance(ep, dict):
-            raise ConfigError(f"endpoint '{name}' must be a mapping")
-        if "base_url" not in ep or "api_key" not in ep:
-            raise ConfigError(f"endpoint '{name}' requires 'base_url' and 'api_key'")
+    providers: dict[str, Provider] = {}
+    for name, entry in raw.items():
+        if not isinstance(entry, dict):
+            raise ConfigError(f"provider '{name}' must be a mapping")
+        if "base_url" not in entry or "api_key" not in entry:
+            raise ConfigError(f"provider '{name}' requires 'base_url' and 'api_key'")
 
         name_lower = str(name).lower()
-        if name_lower in name_to_idx:
-            raise ConfigError(f"duplicate endpoint name '{name}'")
+        if name_lower in providers:
+            raise ConfigError(f"duplicate provider name '{name}'")
 
-        flags = ep.get("flags", [])
-        if isinstance(flags, str):
-            flags = [f.strip() for f in flags.split(",")]
-
-        name_to_idx[name_lower] = len(endpoints)
-        endpoints.append(Endpoint(
-            base_url=str(ep["base_url"]).rstrip("/"),
-            api_key=_env_substitute(str(ep["api_key"])),
-            model=str(ep.get("model", "")),
-            keep_reasoning="keep_reasoning" in flags,
-        ))
-    return endpoints, name_to_idx
+        providers[name_lower] = Provider(
+            base_url=str(entry["base_url"]).rstrip("/"),
+            api_key=_env_substitute(str(entry["api_key"])),
+        )
+    return providers
 
 
-def _parse_groups(raw: dict | None, name_to_idx: dict[str, int], n_endpoints: int) -> dict[str, list[int]]:
+def _parse_groups(raw: object, providers: dict[str, Provider]) -> tuple[dict[str, list[int]], list[Endpoint]]:
+    """Parse 'groups' mapping. Returns (groups, endpoints).
+
+    Each group name is used as-is (no normalization) and matched directly
+    against the request model. Endpoints are built flat and indexed.
+    """
     raw = raw or {}
     if not isinstance(raw, dict):
         raise ConfigError("'groups' must be a mapping")
 
     groups: dict[str, list[int]] = {}
+    endpoints: list[Endpoint] = []
+
     for group_name, members in raw.items():
         if not isinstance(members, list) or not members:
             raise ConfigError(f"group '{group_name}' must be a non-empty list")
-        indices = []
-        for member in members:
-            ep_name = str(member).strip().lower()
-            if ep_name not in name_to_idx:
+
+        indices: list[int] = []
+        for i, entry in enumerate(members):
+            if not isinstance(entry, dict):
+                raise ConfigError(f"entry {i} in group '{group_name}' must be a mapping")
+
+            prov_name = entry.get("provider", "")
+            if not prov_name:
+                raise ConfigError(f"entry {i} in group '{group_name}' is missing 'provider'")
+
+            prov_lower = str(prov_name).lower()
+            if prov_lower not in providers:
                 raise ConfigError(
-                    f"group '{group_name}' references endpoint '{member}' which does not exist. "
-                    f"Available: {', '.join(sorted(name_to_idx))}"
+                    f"group '{group_name}' references unknown provider '{prov_name}'. "
+                    f"Available: {', '.join(sorted(providers))}"
                 )
-            indices.append(name_to_idx[ep_name])
-        groups[normalize_group_name(str(group_name))] = indices
 
+            prov = providers[prov_lower]
+            flags = entry.get("flags", [])
+            if not isinstance(flags, list):
+                raise ConfigError(f"entry {i} in group '{group_name}': 'flags' must be a list")
+
+            endpoints.append(Endpoint(
+                base_url=prov.base_url,
+                api_key=prov.api_key,
+                model=str(entry.get("model", "")),
+                keep_reasoning="keep_reasoning" in flags,
+            ))
+            indices.append(len(endpoints) - 1)
+
+        groups[str(group_name)] = indices
+
+    if not groups:
+        raise ConfigError("at least one group is required")
+
+    # Implicit default: if no explicit default group, create one with one entry
+    # per unique provider in order of first appearance, no model override.
     if "default" not in groups:
-        groups["default"] = list(range(n_endpoints))
-    return groups
+        seen: set[tuple[str, str]] = set()
+        default_indices: list[int] = []
+        for ep in endpoints:
+            key = (ep.base_url, ep.api_key)
+            if key not in seen:
+                seen.add(key)
+                endpoints.append(Endpoint(
+                    base_url=ep.base_url,
+                    api_key=ep.api_key,
+                    model="",
+                    keep_reasoning=False,
+                ))
+                default_indices.append(len(endpoints) - 1)
+        groups["default"] = default_indices
+
+    return groups, endpoints
 
 
-def _parse_settings(raw: dict | None) -> Settings:
+def _parse_settings(raw: object) -> Settings:
     raw = raw or {}
     if not isinstance(raw, dict):
         raise ConfigError("'settings' must be a mapping")
@@ -141,19 +178,28 @@ def _parse_settings(raw: dict | None) -> Settings:
     )
 
 
-def parse_config(raw: object) -> tuple[list[Endpoint], dict[str, int], dict[str, list[int]], Settings]:
-    """Validate and parse a yaml dict. Raises ConfigError."""
+def parse_config(raw: object) -> tuple[list[Endpoint], dict[str, list[int]], Settings]:
+    """Validate and parse a yaml dict. Returns (endpoints, groups, settings).
+    Raises ConfigError on invalid input. Does NOT mutate module state."""
     if not isinstance(raw, dict):
         raise ConfigError("config must be a mapping")
-    if "endpoints" not in raw:
-        raise ConfigError("config must define 'endpoints'")
-    endpoints, name_to_idx = _parse_endpoints(raw["endpoints"])
-    groups = _parse_groups(raw.get("groups"), name_to_idx, len(endpoints))
+
+    providers = _parse_providers(raw.get("providers", {}))
+    groups, endpoints = _parse_groups(raw.get("groups"), providers)
     settings = _parse_settings(raw.get("settings"))
-    return endpoints, name_to_idx, groups, settings
+    return endpoints, groups, settings
 
 
-def load_from_file(path: str | None = None) -> tuple[list[Endpoint], dict[str, int], dict[str, list[int]], Settings]:
+def apply_config(endpoints: list[Endpoint], groups: dict[str, list[int]], settings: Settings) -> None:
+    """Atomically swap in new config state."""
+    global ENDPOINTS, GROUPS, SETTINGS
+    ENDPOINTS = endpoints
+    GROUPS = groups
+    SETTINGS = settings
+
+
+def load_from_file(path: str | None = None) -> None:
+    """Load config from disk and apply it. Raises ConfigError."""
     path = path or CONFIG_FILE
     try:
         with open(path) as f:
@@ -162,17 +208,17 @@ def load_from_file(path: str | None = None) -> tuple[list[Endpoint], dict[str, i
         raise ConfigError(f"config file '{path}' not found")
     except yaml.YAMLError as exc:
         raise ConfigError(f"invalid YAML: {exc}")
-    return parse_config(raw)
+    endpoints, groups, settings = parse_config(raw)
+    apply_config(endpoints, groups, settings)
 
 
 def reload() -> None:
-    """Reload config from disk into module state. Raises ConfigError on bad input."""
-    global ENDPOINTS, ENDPOINT_NAMES, GROUPS, SETTINGS
-    ENDPOINTS, ENDPOINT_NAMES, GROUPS, SETTINGS = load_from_file()
+    """Reload config from disk. Raises ConfigError on bad input."""
+    load_from_file()
 
 
 def load_or_exit() -> None:
-    """Initial load with hard exit on failure. Call from app entrypoint, not at import."""
+    """Initial load with hard exit on failure."""
     try:
         reload()
     except ConfigError as exc:
