@@ -26,6 +26,14 @@ providers:
     base_url: https://openrouter.ai/api/v1
     api_key: ${OPENROUTER_API_KEY}
 
+  crofai:
+    base_url: https://crof.ai/v1
+    api_key: ${CROFAI_API_KEY}
+
+  synthetic:
+    base_url: https://api.synthetic.new/v1
+    api_key: ${SYNTHETIC_API_KEY}
+
 # Groups map request model names to an ordered list of (provider, model_override).
 # "default" is the fallback when no other group matches.
 groups:
