@@ -53,12 +53,12 @@ groups:
     - provider: openai
 ```
 
-**`providers`** — a registry of upstream API endpoints. Each has a `base_url` and `api_key`. No model info here.
+**`providers`** — a registry of upstream API endpoints. Each has a `base_url` and `api_key`. Optionally set `model` here as a provider-wide default — used when a group entry omits `model`.
 
 **`groups`** — maps a request model name to an ordered list of upstream entries. Each entry references a provider and can supply:
 
 - `provider` — name from the providers section (required)
-- `model` — model name to send upstream. If omitted, the client's requested model passes through unchanged.
+- `model` — model name to send upstream. If omitted, falls back to the provider's `model` (if set), otherwise the client's requested model passes through unchanged.
 - `flags` — per-endpoint flags: `keep_reasoning` preserves `reasoning`/`reasoning_content`/`thinking` fields in messages (otherwise stripped).
 
 **Group names are plain strings** — `glm-4.7` matches exactly `model: glm-4.7` from the client. No normalization or case folding.

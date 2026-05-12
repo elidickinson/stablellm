@@ -11,9 +11,10 @@ load_dotenv()
 
 @dataclass(frozen=True)
 class Provider:
-    """A raw upstream provider: base_url + api_key. No model information."""
+    """A raw upstream provider: base_url + api_key + optional default model."""
     base_url: str
     api_key: str
+    model: str = ""  # default model when group entry omits it
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,7 @@ def _parse_providers(raw: object) -> dict[str, Provider]:
         providers[name_lower] = Provider(
             base_url=str(entry["base_url"]).rstrip("/"),
             api_key=_env_substitute(str(entry["api_key"])),
+            model=str(entry.get("model", "")),
         )
     return providers
 
@@ -130,7 +132,7 @@ def _parse_groups(raw: object, providers: dict[str, Provider]) -> tuple[dict[str
             endpoints.append(Endpoint(
                 base_url=prov.base_url,
                 api_key=prov.api_key,
-                model=str(entry.get("model", "")),
+                model=str(entry.get("model", prov.model)),
                 keep_reasoning="keep_reasoning" in flags,
             ))
             indices.append(len(endpoints) - 1)

@@ -122,6 +122,22 @@ def test_flags_on_group_entry(make_config):
     assert cfg.ENDPOINTS[0].keep_reasoning is True
 
 
+def test_provider_default_model_used_when_group_entry_omits_model(make_config):
+    cfg = make_config({
+        "providers": {"a": {"base_url": "https://a", "api_key": "k", "model": "provider-default"}},
+        "groups": {"default": [{"provider": "a"}]},
+    })
+    assert cfg.ENDPOINTS[0].model == "provider-default"
+
+
+def test_group_entry_model_overrides_provider_default(make_config):
+    cfg = make_config({
+        "providers": {"a": {"base_url": "https://a", "api_key": "k", "model": "provider-default"}},
+        "groups": {"default": [{"provider": "a", "model": "group-override"}]},
+    })
+    assert cfg.ENDPOINTS[0].model == "group-override"
+
+
 def test_same_provider_in_multiple_groups_creates_separate_endpoints(make_config):
     cfg = make_config({
         "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
