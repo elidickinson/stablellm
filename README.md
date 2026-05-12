@@ -63,7 +63,7 @@ groups:
 
 **Group names are plain strings** — `glm-4.7` matches exactly `model: glm-4.7` from the client. No normalization or case folding.
 
-**`default` group** is the fallback when no other group matches the request model. If omitted, it's created implicitly with one entry per unique provider (no model override, passthrough).
+**`default` group** is the fallback when no other group matches the request model. It is optional — if omitted, requests with an unknown model will receive a 400 error.
 
 ## Run
 

@@ -67,18 +67,13 @@ def test_missing_provider_key_is_config_error():
         parse_config(make_minimal(groups={"default": [{"model": "x"}]}))
 
 
-def test_implicit_default_group_created_when_missing(make_config):
+def test_missing_default_group_ok_without_implicit_creation(make_config):
     cfg = make_config({
         "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
         "groups": {"other": [{"provider": "a", "model": "m1"}]},
     })
-    assert "default" in cfg.GROUPS
+    assert "default" not in cfg.GROUPS
     assert "other" in cfg.GROUPS
-    # Implicit default gets a passthrough entry (no model) for each unique provider
-    default_idx = cfg.GROUPS["default"]
-    assert len(default_idx) == 1
-    assert cfg.ENDPOINTS[default_idx[0]].model == ""
-    assert cfg.ENDPOINTS[default_idx[0]].base_url == "https://a"
 
 
 def test_env_var_interpolation(make_config, monkeypatch):

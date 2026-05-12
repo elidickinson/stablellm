@@ -140,24 +140,6 @@ def _parse_groups(raw: object, providers: dict[str, Provider]) -> tuple[dict[str
     if not groups:
         raise ConfigError("at least one group is required")
 
-    # Implicit default: if no explicit default group, create one with one entry
-    # per unique provider in order of first appearance, no model override.
-    if "default" not in groups:
-        seen: set[tuple[str, str]] = set()
-        default_indices: list[int] = []
-        for ep in endpoints:
-            key = (ep.base_url, ep.api_key)
-            if key not in seen:
-                seen.add(key)
-                endpoints.append(Endpoint(
-                    base_url=ep.base_url,
-                    api_key=ep.api_key,
-                    model="",
-                    keep_reasoning=False,
-                ))
-                default_indices.append(len(endpoints) - 1)
-        groups["default"] = default_indices
-
     return groups, endpoints
 
 

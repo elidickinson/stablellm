@@ -672,6 +672,12 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         body_dict = None
         group_name = "default"
 
+    if group_name not in config.GROUPS:
+        return JSONResponse(
+            {"error": f"model '{model}' does not match any group and no default group is configured"},
+            status_code=400,
+        )
+
     if fastest_mode:
         _group_race_request_count[group_name] += 1
 
