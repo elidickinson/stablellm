@@ -94,6 +94,23 @@ Defaults: every **25 requests** or **6 hours**, whichever comes first.
 
 `GET /stats` — per-endpoint request/success/failure counts and per-group preferred provider order (which provider won the last race).
 
+## Deploy on Dokploy
+
+The Docker image expects `config.yaml` to be mounted at `/app/config.yaml`. In Dokploy this file must be persisted outside the container so it survives redeployments.
+
+1. **Create the application** — point Dokploy at this repo and let it build from the Dockerfile.
+
+2. **Environment variables** — add `.env` vars (API keys, `CONFIG_EDITOR_PASSWORD`, etc.) in the Dokploy Environment tab.
+
+3. **Persist `config.yaml`** — go to Advanced → Volumes/Mounts → **File Mount**:
+   - **Content**: paste the contents of `config.example.yaml` (or your own config)
+   - **File Path**: `config.yaml`
+   - **Mount Path**: `/app/config.yaml`
+
+   Dokploy stores file mounts in a host-side `files/` directory that persists across deploys. Since it's a bind mount, changes made via the web config editor (`/config/editor`) also persist.
+
+4. **Redeploy** after adding the mount.
+
 ## Web config editor
 
 Navigate to `/config/editor` and enter the password set in `CONFIG_EDITOR_PASSWORD`. The editor validates YAML and runs the full config parser before writing — invalid input is rejected without touching disk. On successful save, the new config is hot-reloaded in place; stats and cooloff state are reset since endpoint indices may have shifted.
