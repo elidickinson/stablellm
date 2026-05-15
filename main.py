@@ -436,6 +436,21 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/v1/models")
+async def list_models(authorization: str | None = Header(None)):
+    auth_err = _check_auth(authorization)
+    if auth_err:
+        return auth_err
+    return {
+        "object": "list",
+        "data": [
+            {"id": name, "object": "model", "created": 0, "owned_by": "stablellm"}
+            for name in config.GROUPS
+            if name != "default"
+        ],
+    }
+
+
 @app.get("/stats")
 async def stats():
     result = {"endpoints": []}

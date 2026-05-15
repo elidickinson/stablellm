@@ -44,6 +44,28 @@ async def _post(app, body):
 
 
 @pytest.mark.asyncio
+async def test_models_lists_non_default_groups(app_with_endpoints):
+    app, _calls = app_with_endpoints({
+        "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+        "groups": {
+            "default": [{"provider": "a"}],
+            "cheap": [{"provider": "a", "model": "m-cheap"}],
+            "fast": [{"provider": "a", "model": "m-fast"}],
+        },
+    })
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/v1/models")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["object"] == "list"
+    ids = [m["id"] for m in data["data"]]
+    assert "cheap" in ids
+    assert "fast" in ids
+    assert "default" not in ids
+
+
+@pytest.mark.asyncio
 async def test_named_group_routes_in_order(app_with_endpoints):
     app, calls = app_with_endpoints({
         "providers": {
