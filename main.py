@@ -727,6 +727,11 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             send_body = raw_body
 
         headers = _build_upstream_headers(ep)
+        log.debug(
+            "-> %s headers: %s",
+            ep.base_url,
+            {k: v for k, v in headers.items() if k.lower() != "authorization"},
+        )
 
         try:
             if is_streaming:
