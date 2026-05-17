@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 import config
+import requestlog
 from config import API_KEY, CONNECT_TIMEOUT, HOST, PORT, REQUEST_TIMEOUT, Endpoint
 
 config.load_or_exit()
@@ -84,6 +85,7 @@ def _effective_model(ep: Endpoint, client_model: str, group_name: str) -> str:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global http_client
+    requestlog.init()
     http_client = httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=CONNECT_TIMEOUT))
     _build_provider_groups()
     group_names = [g for g in config.GROUPS if g != "default"]
@@ -136,7 +138,29 @@ def _check_auth(authorization: str | None) -> JSONResponse | None:
     return None
 
 
-async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes):
+def _extract_usage_from_sse(buffer: bytearray, chunk: bytes) -> int | None:
+    buffer.extend(chunk)
+    while b"\n\n" in buffer:
+        event, _, rest = buffer.partition(b"\n\n")
+        buffer[:] = rest
+        for line in event.split(b"\n"):
+            if line.startswith(b"data:"):
+                data = line[5:].strip()
+                if data == b"[DONE]":
+                    continue
+                try:
+                    obj = json.loads(data)
+                    usage = obj.get("usage")
+                    if usage:
+                        ct = usage.get("completion_tokens")
+                        if ct is not None:
+                            return ct
+                except json.JSONDecodeError:
+                    pass
+    return None
+
+
+async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, metrics):
     """Stream response from upstream. Returns (StreamingResponse, None) or (None, reason)."""
     url = f"{ep.base_url}/{path}"
     t0 = time.monotonic()
@@ -151,14 +175,25 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes):
 
         async def generate():
             first = True
+            t_first = None
+            completion_tokens = None
+            sse_buf = bytearray()
             try:
                 async for chunk in resp.aiter_bytes():
                     if first:
-                        log.info("%s TTFT %.0fms (TTFB %.0fms)", ep.base_url, (time.monotonic() - t0) * 1000, ttfb * 1000)
+                        t_first = time.monotonic()
+                        metrics.ttft_ms = (t_first - t0) * 1000
+                        log.info("%s TTFT %.0fms (TTFB %.0fms)", ep.base_url, metrics.ttft_ms, ttfb * 1000)
                         first = False
+                    ct = _extract_usage_from_sse(sse_buf, chunk)
+                    if ct is not None:
+                        completion_tokens = ct
                     yield chunk
+                if metrics.ttft_ms is not None and completion_tokens is not None:
+                    metrics.tokens_per_sec = completion_tokens / (time.monotonic() - t_first)
             finally:
                 await resp.aclose()
+                await asyncio.to_thread(requestlog.log_request, metrics)
 
         return _streaming_response(resp, generate()), None
     except BaseException:
@@ -166,7 +201,7 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes):
         raise
 
 
-async def _proxy_buffered(ep: Endpoint, method: str, path: str, headers: dict, body: bytes):
+async def _proxy_buffered(ep: Endpoint, method: str, path: str, headers: dict, body: bytes, metrics):
     """Non-streaming: send request, return full response or (None, reason)."""
     url = f"{ep.base_url}/{path}"
     t0 = time.monotonic()
@@ -181,8 +216,16 @@ async def _proxy_buffered(ep: Endpoint, method: str, path: str, headers: dict, b
     except Exception:
         return None, "invalid JSON"
 
+    metrics.ttft_ms = elapsed * 1000
+    usage = data.get("usage")
+    if usage:
+        ct = usage.get("completion_tokens")
+        if ct is not None:
+            metrics.tokens_per_sec = ct / elapsed
+
     log.info("%s TTFB %.0fms", ep.base_url, elapsed * 1000)
 
+    await asyncio.to_thread(requestlog.log_request, metrics)
     return JSONResponse(content=data, status_code=resp.status_code), None
 
 
@@ -371,6 +414,12 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         log.info("using endpoint: %s (model: %s)", ep.base_url, model_name)
         _last_endpoint_idx = win_idx
 
+    race_metrics = requestlog.RequestMetrics(
+        model_requested=body_dict.get("model", "") if body_dict else "",
+        provider_served=win_pk[1],
+        model_served=model_name,
+    )
+
     async def _drain(pk, resp, idx=None):
         try:
             async for _ in resp.aiter_bytes():
@@ -405,14 +454,29 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         _bg(_await_and_drain(task, pk, idx))
 
     if is_streaming:
+        t0_race = time.monotonic()
         async def generate():
+            first = True
+            t_first = None
+            completion_tokens = None
+            sse_buf = bytearray()
             try:
                 async for chunk in win_resp.aiter_bytes():
+                    if first:
+                        t_first = time.monotonic()
+                        race_metrics.ttft_ms = (t_first - t0_race) * 1000
+                        first = False
+                    ct = _extract_usage_from_sse(sse_buf, chunk)
+                    if ct is not None:
+                        completion_tokens = ct
                     yield chunk
+                if race_metrics.ttft_ms is not None and completion_tokens is not None:
+                    race_metrics.tokens_per_sec = completion_tokens / (time.monotonic() - t_first)
             finally:
                 await win_resp.aclose()
                 race_times[win_pk] = time.monotonic() - race_start
                 _maybe_finalize()
+                await asyncio.to_thread(requestlog.log_request, race_metrics)
 
         return _streaming_response(win_resp, generate())
     else:
@@ -428,6 +492,14 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
             data = json.loads(b"".join(chunks))
         except Exception:
             return JSONResponse({"error": "upstream returned invalid JSON"}, status_code=502)
+        elapsed = time.monotonic() - race_start
+        race_metrics.ttft_ms = elapsed * 1000
+        usage = data.get("usage")
+        if usage:
+            ct = usage.get("completion_tokens")
+            if ct is not None:
+                race_metrics.tokens_per_sec = ct / elapsed
+        await asyncio.to_thread(requestlog.log_request, race_metrics)
         return JSONResponse(content=data, status_code=win_resp.status_code)
 
 
@@ -733,18 +805,24 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             {k: v for k, v in headers.items() if k.lower() != "authorization"},
         )
 
+        client_model = body_dict.get("model", "") if body_dict else ""
+        model_name = _effective_model(ep, client_model, group_name) or "(client model)"
+        metrics = requestlog.RequestMetrics(
+            model_requested=client_model,
+            provider_served=ep.base_url,
+            model_served=model_name,
+        )
+
         try:
             if is_streaming:
-                result, reason = await _proxy_stream(ep, path, headers, send_body)
+                result, reason = await _proxy_stream(ep, path, headers, send_body, metrics)
             else:
-                result, reason = await _proxy_buffered(ep, request.method, path, headers, send_body)
+                result, reason = await _proxy_buffered(ep, request.method, path, headers, send_body, metrics)
 
             if result is not None:
                 _stats["successes"][idx] += 1
                 global _last_endpoint_idx
                 if _last_endpoint_idx != idx:
-                    client_model = body_dict.get("model", "") if body_dict else ""
-                    model_name = _effective_model(ep, client_model, group_name) or "(client model)"
                     log.info("using endpoint: %s (model: %s)", ep.base_url, model_name)
                     _last_endpoint_idx = idx
                 return result

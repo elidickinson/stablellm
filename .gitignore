@@ -31,3 +31,6 @@ Thumbs.db
 
 # App stuff
 plans/
+
+# SQLite request log DB
+data/
