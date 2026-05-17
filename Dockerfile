@@ -5,11 +5,12 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 WORKDIR /app
 
 RUN adduser --disabled-password --no-create-home app
+RUN chown app:app /app
 
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-cache-dir
 
-COPY --chown=app:app config.py main.py ./
+COPY --chown=app:app config.py main.py requestlog.py ./
 
 # config.yaml must be mounted at /app/config.yaml (not baked into image).
 # Dokploy: use a File Mount (see README). Docker: -v ./config.yaml:/app/config.yaml
