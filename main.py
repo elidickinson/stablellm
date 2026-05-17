@@ -454,7 +454,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         _bg(_await_and_drain(task, pk, idx))
 
     if is_streaming:
-        t0_race = time.monotonic()
+        t0_race = race_start
         async def generate():
             first = True
             t_first = None

@@ -9,7 +9,7 @@ DB_PATH = Path("data/requests.db")
 
 def init():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS requests (
@@ -37,20 +37,7 @@ class RequestMetrics:
 
 
 def log_request(m: RequestMetrics):
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp REAL NOT NULL,
-            api_key_id TEXT,
-            model_requested TEXT,
-            provider_served TEXT,
-            model_served TEXT,
-            ttft_ms REAL,
-            tokens_per_sec REAL
-        )
-    """)
     conn.execute(
         "INSERT INTO requests (timestamp, api_key_id, model_requested, provider_served, model_served, ttft_ms, tokens_per_sec) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
