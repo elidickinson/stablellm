@@ -46,7 +46,6 @@ _stats = {
 
 http_client: httpx.AsyncClient
 
-RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 _EXCLUDED_HEADERS = {"transfer-encoding", "connection", "keep-alive", "content-encoding", "content-length"}
 
 _background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
@@ -169,7 +168,7 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
     ttfb = time.monotonic() - t0
 
     try:
-        if resp.status_code in RETRYABLE_STATUSES:
+        if resp.status_code != 200:
             await resp.aclose()
             return None, f"HTTP {resp.status_code}"
 
@@ -208,7 +207,7 @@ async def _proxy_buffered(ep: Endpoint, method: str, path: str, headers: dict, b
     resp = await http_client.request(method, url, headers=headers, content=body)
     elapsed = time.monotonic() - t0
 
-    if resp.status_code in RETRYABLE_STATUSES:
+    if resp.status_code != 200:
         return None, f"HTTP {resp.status_code}"
 
     try:
@@ -372,7 +371,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         url = f"{ep.base_url}/{path}"
         req = http_client.build_request("POST", url, headers=headers, content=send_body)
         resp = await http_client.send(req, stream=True)
-        if resp.status_code in RETRYABLE_STATUSES:
+        if resp.status_code != 200:
             await resp.aclose()
             raise Exception(f"HTTP {resp.status_code}")
         return pk, idx, resp
