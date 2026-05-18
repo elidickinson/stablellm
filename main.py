@@ -133,6 +133,7 @@ def _check_auth(authorization: str | None) -> JSONResponse | None:
     if not API_KEY:
         return None
     if not authorization or not hmac.compare_digest(authorization, f"Bearer {API_KEY}"):
+        log.warning("auth failed: %s", "missing header" if not authorization else "invalid token")
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     return None
 
@@ -759,9 +760,10 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         group_name = "default"
 
     if group_name not in config.GROUPS:
+        log.warning("invalid model requested: '%s'", model)
         return JSONResponse(
             {"error": f"model '{model}' does not match any group and no default group is configured"},
-            status_code=400,
+            status_code=404,
         )
 
     if fastest_mode:
