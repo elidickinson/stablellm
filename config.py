@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import sys
@@ -7,6 +8,8 @@ import yaml
 from dotenv import load_dotenv
 
 load_dotenv()
+
+log = logging.getLogger("stablellm.config")
 
 
 @dataclass(frozen=True)
@@ -61,7 +64,8 @@ def _env_substitute(value: str) -> str:
         var = m.group(1) or m.group(2)
         result = os.environ.get(var)
         if result is None:
-            raise ConfigError(f"environment variable '{var}' is not set")
+            log.warning("environment variable '%s' is not set", var)
+            return m.group(0)
         return result
 
     return _ENV_VAR_RE.sub(_replace, value)
