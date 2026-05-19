@@ -20,16 +20,34 @@ from config import API_KEY, CONNECT_TIMEOUT, HOST, PORT, REQUEST_TIMEOUT, Endpoi
 
 config.load_or_exit()
 
+class _DokployFormatter(logging.Formatter):
+    """Embed a keyword Dokploy's content-based log classifier recognises so
+    WARN/ERROR lines tag correctly instead of falling into 'success'.
+    Ref: https://deepwiki.com/Dokploy/dokploy/11-monitoring-and-logging
+    """
+    _PREFIX_BY_LEVEL = {
+        logging.WARNING: " [warning]",
+        logging.ERROR: " [failed]",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        record.dokploy = self._PREFIX_BY_LEVEL.get(record.levelno, "")
+        return super().format(record)
+
+
+_LOG_HANDLER = logging.StreamHandler()
+_LOG_HANDLER.setFormatter(_DokployFormatter("%(asctime)s %(levelname)s%(dokploy)s %(name)s: %(message)s"))
 logging.basicConfig(
     level=getattr(logging, config.SETTINGS.log_level, logging.INFO),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[_LOG_HANDLER],
     force=True,
 )
 log = logging.getLogger("stablellm")
 
-# Reduce noise from external libraries
-logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
+# Reduce noise from external libraries — these spew at DEBUG (httpcore is the
+# lower layer under httpx and is especially chatty).
+for noisy in ("uvicorn.access", "httpx", "httpcore", "asyncio"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
 # endpoint index -> timestamp when it becomes available again
 _cooloff_until: dict[int, float] = {}
@@ -867,7 +885,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             _mark_down(idx, str(exc))
             last_failure = type(exc).__name__
 
-    log.error("all endpoints exhausted for /v1/%s (last: %s)", path, last_failure)
+    log.error("all endpoints failed (exhausted) for /v1/%s (last: %s)", path, last_failure)
     return JSONResponse(
         {"error": f"all endpoints exhausted (last: {last_failure})"},
         status_code=502,
