@@ -48,9 +48,9 @@ async def test_models_lists_non_default_groups(app_with_endpoints):
     app, _calls = app_with_endpoints({
         "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
         "groups": {
-            "default": [{"provider": "a"}],
-            "cheap": [{"provider": "a", "model": "m-cheap"}],
-            "fast": [{"provider": "a", "model": "m-fast"}],
+            "default": {"endpoints": [{"provider": "a"}]},
+            "cheap": {"endpoints": [{"provider": "a", "model": "m-cheap"}]},
+            "fast": {"endpoints": [{"provider": "a", "model": "m-fast"}]},
         },
     })
     transport = httpx.ASGITransport(app=app)
@@ -74,8 +74,8 @@ async def test_named_group_routes_in_order(app_with_endpoints):
             "c": {"base_url": "https://c.test", "api_key": "k"},
         },
         "groups": {
-            "default": [{"provider": "a"}],
-            "cheap": [{"provider": "c", "model": "model-c"}, {"provider": "a", "model": "model-a"}],
+            "default": {"endpoints": [{"provider": "a"}]},
+            "cheap": {"endpoints": [{"provider": "c", "model": "model-c"}, {"provider": "a", "model": "model-a"}]},
         },
     })
     resp = await _post(app, {"model": "cheap", "messages": [{"role": "user", "content": "hi"}]})
@@ -92,7 +92,7 @@ async def test_unknown_model_falls_back_to_default_group(app_with_endpoints):
             "a": {"base_url": "https://a.test", "api_key": "k"},
             "b": {"base_url": "https://b.test", "api_key": "k"},
         },
-        "groups": {"default": [{"provider": "a"}, {"provider": "b"}]},
+        "groups": {"default": {"endpoints": [{"provider": "a"}, {"provider": "b"}]}},
     })
     resp = await _post(app, {"model": "anything", "messages": []})
     assert resp.status_code == 200
@@ -109,8 +109,8 @@ async def test_no_model_on_group_entry_passes_through_client_model(app_with_endp
             "b": {"base_url": "https://b.test", "api_key": "k"},
         },
         "groups": {
-            "default": [{"provider": "a"}, {"provider": "b", "model": "gpt-4o-mini"}],
-            "gpt-4o": [{"provider": "a"}, {"provider": "b", "model": "gpt-4o-mini"}],
+            "default": {"endpoints": [{"provider": "a"}, {"provider": "b", "model": "gpt-4o-mini"}]},
+            "gpt-4o": {"endpoints": [{"provider": "a"}, {"provider": "b", "model": "gpt-4o-mini"}]},
         },
     })
     resp = await _post(app, {"model": "gpt-4o", "messages": []})
@@ -121,15 +121,15 @@ async def test_no_model_on_group_entry_passes_through_client_model(app_with_endp
 
 
 @pytest.mark.asyncio
-async def test_fastest_suffix_is_stripped_before_group_lookup(app_with_endpoints):
+async def test_mode_suffix_is_stripped_before_group_lookup(app_with_endpoints):
     app, calls = app_with_endpoints({
         "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
         "groups": {
-            "default": [{"provider": "a"}],
-            "cheap": [{"provider": "a", "model": "model-a"}],
+            "default": {"endpoints": [{"provider": "a"}]},
+            "cheap": {"endpoints": [{"provider": "a", "model": "model-a"}]},
         },
     })
-    resp = await _post(app, {"model": "cheap:fastest", "messages": []})
+    resp = await _post(app, {"model": "cheap:race", "messages": []})
     assert resp.status_code == 200
     assert calls[0][0] == "https://a.test"
     assert calls[0][1]["model"] == "model-a"
@@ -141,8 +141,8 @@ async def test_group_name_matches_exactly_no_normalization(app_with_endpoints):
     app, calls = app_with_endpoints({
         "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
         "groups": {
-            "default": [{"provider": "a", "model": "fallback"}],
-            "gpt-4.1": [{"provider": "a", "model": "model-a"}],
+            "default": {"endpoints": [{"provider": "a", "model": "fallback"}]},
+            "gpt-4.1": {"endpoints": [{"provider": "a", "model": "model-a"}]},
         },
     })
     resp = await _post(app, {"model": "gpt-4.1", "messages": []})
@@ -155,7 +155,7 @@ async def test_reload_picks_up_new_providers(app_with_endpoints, tmp_path, monke
     import yaml as _yaml
     app, calls = app_with_endpoints({
         "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
-        "groups": {"default": [{"provider": "a", "model": "model-a"}]},
+        "groups": {"default": {"endpoints": [{"provider": "a", "model": "model-a"}]}},
     })
     resp = await _post(app, {"model": "anything", "messages": []})
     assert resp.status_code == 200
@@ -168,7 +168,7 @@ async def test_reload_picks_up_new_providers(app_with_endpoints, tmp_path, monke
             "a": {"base_url": "https://a.test", "api_key": "k"},
             "b": {"base_url": "https://b.test", "api_key": "k"},
         },
-        "groups": {"default": [{"provider": "b", "model": "model-b"}, {"provider": "a", "model": "model-a"}]},
+        "groups": {"default": {"endpoints": [{"provider": "b", "model": "model-b"}, {"provider": "a", "model": "model-a"}]}},
     }))
 
     import config

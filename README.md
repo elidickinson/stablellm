@@ -42,25 +42,30 @@ providers:
 
 groups:
   default:
-    - provider: openai
-    - provider: cerebras
-      model: zai-glm-4.7
-      flags: [keep_reasoning]
+    endpoints:
+      - provider: openai
+      - provider: cerebras
+        model: zai-glm-4.7
+        flags: [keep_reasoning]
 
   glm-4.7:
-    - provider: cerebras
-      model: zai-glm-4.7
-      flags: [keep_reasoning]
-    - provider: openai
+    mode: race
+    endpoints:
+      - provider: cerebras
+        model: zai-glm-4.7
+        flags: [keep_reasoning]
+      - provider: openai
 ```
 
 **`providers`** — a registry of upstream API endpoints. Each has a `base_url` and `api_key`. Optionally set `model` here as a provider-wide default — used when a group entry omits `model`.
 
-**`groups`** — maps a request model name to an ordered list of upstream entries. Each entry references a provider and can supply:
+**`groups`** — maps a request model name to a routing mode and an ordered list of upstream entries. Each group has:
 
-- `provider` — name from the providers section (required)
-- `model` — model name to send upstream. If omitted, falls back to the provider's `model` (if set), otherwise the client's requested model passes through unchanged.
-- `flags` — per-endpoint flags: `keep_reasoning` preserves `reasoning`/`reasoning_content`/`thinking` fields in messages (otherwise stripped).
+- `mode` — `seq` (try in order, default) or `race` (send to all, first response wins). Can be overridden per-request with `:race`/`:seq` suffix on the model name.
+- `endpoints` — ordered list of entries, each with:
+  - `provider` — name from the providers section (required)
+  - `model` — model name to send upstream. If omitted, falls back to the provider's `model` (if set), otherwise the client's requested model passes through unchanged.
+  - `flags` — per-endpoint flags: `keep_reasoning` preserves `reasoning`/`reasoning_content`/`thinking` fields in messages (otherwise stripped).
 
 **Group names are plain strings** — `glm-4.7` matches exactly `model: glm-4.7` from the client. No normalization or case folding.
 
@@ -81,15 +86,14 @@ Every request resolves to a group:
 1. If the request `model` matches a group name, that group's provider list is used.
 2. Otherwise the `default` group is used.
 
-Within a group, providers are tried in order. A failing endpoint cools off for `cooloff_seconds` before being retried. If all endpoints fail, the request returns a 502.
+Within a group, the routing mode determines how endpoints are dispatched:
+
+- **`seq`** (default) — try endpoints in order. A failing endpoint cools off for `cooloff_seconds` before being retried. If all endpoints fail, the request returns a 502.
+- **`race`** — send the request to one endpoint per provider concurrently; the fastest response wins and becomes the preferred provider for subsequent requests. A re-race triggers when either `race_interval_requests` requests have passed or `race_interval_secs` seconds have elapsed since the last race (defaults: **25 requests** or **6 hours**). If the race fails, the proxy falls back to sequential.
+
+The client can override a group's mode with a `:race` or `:seq` suffix on the model name (e.g. `glm-4.7:race`).
 
 **Unknown request parameters** (not in the supported set) are silently stripped per-endpoint before forwarding. This lets providers with different capabilities share the same request body.
-
-### Fastest mode
-
-Append `:fastest` to the model (e.g. `glm-4.7:fastest`) to race one endpoint per provider. On the first request, each provider gets a concurrent request; the fastest response wins and becomes the preferred provider for subsequent requests. A re-race triggers when either `race_interval_requests` requests have passed or `race_interval_secs` seconds have elapsed since the last race.
-
-Defaults: every **25 requests** or **6 hours**, whichever comes first.
 
 ## Inspect
 

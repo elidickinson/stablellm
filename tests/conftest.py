@@ -17,7 +17,7 @@ def pytest_configure(config):
     placeholder = Path(tempfile.gettempdir()) / "stablellm_test_placeholder.yaml"
     placeholder.write_text(yaml.safe_dump({
         "providers": {"placeholder": {"base_url": "https://placeholder", "api_key": "k"}},
-        "groups": {"default": [{"provider": "placeholder"}]},
+        "groups": {"default": {"endpoints": [{"provider": "placeholder"}]}},
     }))
     os.environ["CONFIG_FILE"] = str(placeholder)
 

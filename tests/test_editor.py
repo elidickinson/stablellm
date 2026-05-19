@@ -8,7 +8,7 @@ from conftest import fresh_config
 
 MINIMAL_CONFIG = {
     "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
-    "groups": {"default": [{"provider": "a"}]},
+    "groups": {"default": {"endpoints": [{"provider": "a"}]}},
 }
 
 
@@ -102,7 +102,7 @@ async def test_save_rejects_invalid_config(app_factory):
     app, _ = app_factory(password="secret")
     bad = _yaml.safe_dump({
         "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
-        "groups": {"default": [{"provider": "nope"}]},
+        "groups": {"default": {"endpoints": [{"provider": "nope"}]}},
     })
     resp = await _post(app, "/config/api/save", bad.encode(), headers={"X-Config-Password": "secret"})
     assert resp.status_code == 400
@@ -121,7 +121,7 @@ async def test_save_writes_disk_and_hot_reloads(app_factory, tmp_path):
             "a": {"base_url": "https://a.test", "api_key": "k"},
             "b": {"base_url": "https://b.test", "api_key": "k"},
         },
-        "groups": {"default": [{"provider": "a"}, {"provider": "b", "model": "m2"}]},
+        "groups": {"default": {"endpoints": [{"provider": "a"}, {"provider": "b", "model": "m2"}]}},
     })
     resp = await _post(app, "/config/api/save", new_yaml.encode(), headers={"X-Config-Password": "secret"})
     assert resp.status_code == 200

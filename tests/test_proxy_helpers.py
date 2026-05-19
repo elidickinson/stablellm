@@ -14,7 +14,7 @@ def main_module(monkeypatch, tmp_path):
     """A freshly-loaded main module with a minimal config."""
     fresh_config(monkeypatch, tmp_path, {
         "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
-        "groups": {"default": [{"provider": "a"}]},
+        "groups": {"default": {"endpoints": [{"provider": "a"}]}},
     })
     sys.modules.pop("main", None)
     import main
@@ -51,6 +51,41 @@ def test_sse_ignores_events_without_usage(main_module):
 def test_sse_tolerates_malformed_json(main_module):
     buf = bytearray()
     assert main_module._extract_usage_from_sse(buf, b"data: {not json\n\n") is None
+
+
+# --- _parse_model_suffix ---
+
+def test_parse_model_suffix_no_suffix(main_module):
+    assert main_module._parse_model_suffix("gpt-4o") == ("gpt-4o", None)
+
+
+def test_parse_model_suffix_race(main_module):
+    assert main_module._parse_model_suffix("cheap:race") == ("cheap", "race")
+
+
+def test_parse_model_suffix_seq(main_module):
+    assert main_module._parse_model_suffix("cheap:seq") == ("cheap", "seq")
+
+
+def test_parse_model_suffix_fastest_aliases_race(main_module):
+    assert main_module._parse_model_suffix("cheap:fastest") == ("cheap", "race")
+
+
+def test_parse_model_suffix_normal_aliases_seq(main_module):
+    assert main_module._parse_model_suffix("cheap:normal") == ("cheap", "seq")
+
+
+def test_parse_model_suffix_double_suffix_raises(main_module):
+    import pytest
+    with pytest.raises(ValueError):
+        main_module._parse_model_suffix("cheap:race:seq")
+    with pytest.raises(ValueError):
+        main_module._parse_model_suffix("cheap:fastest:normal")
+
+
+def test_parse_model_suffix_colon_in_name_not_a_suffix(main_module):
+    """A model name like 'hf:foo/bar' must not be treated as a suffixed name."""
+    assert main_module._parse_model_suffix("hf:foo/bar") == ("hf:foo/bar", None)
 
 
 # --- _effective_model ---

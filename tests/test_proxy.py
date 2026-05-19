@@ -79,7 +79,7 @@ async def test_5xx_marks_endpoint_down_and_tries_next(proxy_app):
                 "a": {"base_url": "https://a.test", "api_key": "k"},
                 "b": {"base_url": "https://b.test", "api_key": "k"},
             },
-            "groups": {"default": [{"provider": "a"}, {"provider": "b"}]},
+            "groups": {"default": {"endpoints": [{"provider": "a"}, {"provider": "b"}]}},
         },
         handler,
     )
@@ -104,7 +104,7 @@ async def test_4xx_also_triggers_failover(proxy_app):
                 "a": {"base_url": "https://a.test", "api_key": "k"},
                 "b": {"base_url": "https://b.test", "api_key": "k"},
             },
-            "groups": {"default": [{"provider": "a"}, {"provider": "b"}]},
+            "groups": {"default": {"endpoints": [{"provider": "a"}, {"provider": "b"}]}},
         },
         handler,
     )
@@ -124,7 +124,7 @@ async def test_all_endpoints_failing_returns_502(proxy_app):
                 "a": {"base_url": "https://a.test", "api_key": "k"},
                 "b": {"base_url": "https://b.test", "api_key": "k"},
             },
-            "groups": {"default": [{"provider": "a"}, {"provider": "b"}]},
+            "groups": {"default": {"endpoints": [{"provider": "a"}, {"provider": "b"}]}},
         },
         handler,
     )
@@ -146,7 +146,7 @@ async def test_connection_error_marks_down_and_tries_next(proxy_app):
                 "a": {"base_url": "https://a.test", "api_key": "k"},
                 "b": {"base_url": "https://b.test", "api_key": "k"},
             },
-            "groups": {"default": [{"provider": "a"}, {"provider": "b"}]},
+            "groups": {"default": {"endpoints": [{"provider": "a"}, {"provider": "b"}]}},
         },
         handler,
     )
@@ -175,7 +175,7 @@ async def test_cooled_off_endpoint_is_skipped_on_next_request(proxy_app):
                 "a": {"base_url": "https://a.test", "api_key": "k"},
                 "b": {"base_url": "https://b.test", "api_key": "k"},
             },
-            "groups": {"default": [{"provider": "a"}, {"provider": "b"}]},
+            "groups": {"default": {"endpoints": [{"provider": "a"}, {"provider": "b"}]}},
         },
         handler,
     )
@@ -206,7 +206,7 @@ async def test_streaming_response_passes_through_chunks(proxy_app):
     app, _calls, _ = proxy_app(
         {
             "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
-            "groups": {"default": [{"provider": "a"}]},
+            "groups": {"default": {"endpoints": [{"provider": "a"}]}},
         },
         handler,
     )
@@ -228,7 +228,7 @@ async def test_stats_reflects_request_counts(proxy_app):
     app, _calls, _ = proxy_app(
         {
             "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
-            "groups": {"default": [{"provider": "a"}]},
+            "groups": {"default": {"endpoints": [{"provider": "a"}]}},
         },
         handler,
     )
@@ -256,7 +256,7 @@ async def test_oversized_body_is_rejected(proxy_app, monkeypatch):
     app, _calls, _ = proxy_app(
         {
             "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
-            "groups": {"default": [{"provider": "a"}]},
+            "groups": {"default": {"endpoints": [{"provider": "a"}]}},
         },
         lambda r: _ok_response(),
     )
@@ -275,7 +275,7 @@ async def test_api_key_required_when_configured(proxy_app, monkeypatch):
     app, _calls, _ = proxy_app(
         {
             "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
-            "groups": {"default": [{"provider": "a"}]},
+            "groups": {"default": {"endpoints": [{"provider": "a"}]}},
         },
         lambda r: _ok_response(),
     )
@@ -297,7 +297,7 @@ async def test_path_traversal_rejected(proxy_app):
     app, _calls, _ = proxy_app(
         {
             "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
-            "groups": {"default": [{"provider": "a"}]},
+            "groups": {"default": {"endpoints": [{"provider": "a"}]}},
         },
         lambda r: _ok_response(),
     )
@@ -310,7 +310,7 @@ async def test_unknown_model_returns_404_when_no_default_group(proxy_app):
     app, _calls, _ = proxy_app(
         {
             "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
-            "groups": {"only-this-model": [{"provider": "a", "model": "m"}]},
+            "groups": {"only-this-model": {"endpoints": [{"provider": "a", "model": "m"}]}},
         },
         lambda r: _ok_response(),
     )
@@ -318,43 +318,116 @@ async def test_unknown_model_returns_404_when_no_default_group(proxy_app):
     assert resp.status_code == 404
 
 
-# --- :fastest race path ---
+# --- race mode (via :race suffix and group default) ---
+
+async def _race_winner_handler(req):
+    """a is slow, b is fast — b wins the race."""
+    if req.url.host == "a.test":
+        await asyncio.sleep(0.05)
+        return _ok_response({"who": "a"})
+    return _ok_response({"who": "b"})
+
+
+_TWO_PROVIDER_RACE_CFG = {
+    "providers": {
+        "a": {"base_url": "https://a.test", "api_key": "k"},
+        "b": {"base_url": "https://b.test", "api_key": "k"},
+    },
+    "groups": {"fast": {"endpoints": [
+        {"provider": "a", "model": "ma"},
+        {"provider": "b", "model": "mb"},
+    ]}},
+}
+
 
 @pytest.mark.asyncio
-async def test_fastest_race_winner_routes_response(proxy_app):
-    """Race picks the first responder. b is faster → its response is what the client gets."""
-    async def handler(req):
-        if req.url.host == "a.test":
-            await asyncio.sleep(0.05)
-            return _ok_response({"who": "a"})
-        return _ok_response({"who": "b"})
-
-    app, calls, _ = proxy_app(
-        {
-            "providers": {
-                "a": {"base_url": "https://a.test", "api_key": "k"},
-                "b": {"base_url": "https://b.test", "api_key": "k"},
-            },
-            "groups": {"fast": [{"provider": "a", "model": "ma"}, {"provider": "b", "model": "mb"}]},
-        },
-        handler,
-    )
-    resp = await _post(app, {"model": "fast:fastest", "messages": []})
+async def test_race_suffix_routes_to_winner(proxy_app):
+    app, calls, _ = proxy_app(_TWO_PROVIDER_RACE_CFG, _race_winner_handler)
+    resp = await _post(app, {"model": "fast:race", "messages": []})
     assert resp.status_code == 200
     assert resp.json()["who"] == "b"
-    # Both endpoints were called (race)
     assert {c[0] for c in calls} == {"https://a.test", "https://b.test"}
 
 
 @pytest.mark.asyncio
-async def test_fastest_falls_back_to_sequential_when_race_fails(proxy_app):
-    """When all race candidates fail, the proxy retries them sequentially (cooloff=0 here so they stay eligible)."""
-    state = {"race_done": False}
+async def test_fastest_is_an_alias_for_race(proxy_app):
+    app, calls, _ = proxy_app(_TWO_PROVIDER_RACE_CFG, _race_winner_handler)
+    resp = await _post(app, {"model": "fast:fastest", "messages": []})
+    assert resp.status_code == 200
+    assert resp.json()["who"] == "b"
+    assert {c[0] for c in calls} == {"https://a.test", "https://b.test"}
 
+
+@pytest.mark.asyncio
+async def test_group_mode_race_triggers_race_without_suffix(proxy_app):
+    """When the group itself declares mode: race, requests race by default."""
+    cfg = {
+        "providers": {
+            "a": {"base_url": "https://a.test", "api_key": "k"},
+            "b": {"base_url": "https://b.test", "api_key": "k"},
+        },
+        "groups": {"fast": {"mode": "race", "endpoints": [
+            {"provider": "a", "model": "ma"},
+            {"provider": "b", "model": "mb"},
+        ]}},
+    }
+    app, calls, _ = proxy_app(cfg, _race_winner_handler)
+    resp = await _post(app, {"model": "fast", "messages": []})
+    assert resp.status_code == 200
+    assert {c[0] for c in calls} == {"https://a.test", "https://b.test"}
+
+
+@pytest.mark.asyncio
+async def test_seq_suffix_overrides_group_race_default(proxy_app):
+    """A group with mode: race can be forced sequential via :seq suffix."""
+    cfg = {
+        "providers": {
+            "a": {"base_url": "https://a.test", "api_key": "k"},
+            "b": {"base_url": "https://b.test", "api_key": "k"},
+        },
+        "groups": {"fast": {"mode": "race", "endpoints": [
+            {"provider": "a", "model": "ma"},
+            {"provider": "b", "model": "mb"},
+        ]}},
+    }
+    app, calls, _ = proxy_app(cfg, lambda r: _ok_response())
+    resp = await _post(app, {"model": "fast:seq", "messages": []})
+    assert resp.status_code == 200
+    # Sequential → only the first endpoint is hit
+    assert len(calls) == 1
+    assert calls[0][0] == "https://a.test"
+
+
+@pytest.mark.asyncio
+async def test_normal_is_an_alias_for_seq(proxy_app):
+    cfg = {
+        "providers": {
+            "a": {"base_url": "https://a.test", "api_key": "k"},
+            "b": {"base_url": "https://b.test", "api_key": "k"},
+        },
+        "groups": {"fast": {"mode": "race", "endpoints": [
+            {"provider": "a", "model": "ma"},
+            {"provider": "b", "model": "mb"},
+        ]}},
+    }
+    app, calls, _ = proxy_app(cfg, lambda r: _ok_response())
+    resp = await _post(app, {"model": "fast:normal", "messages": []})
+    assert resp.status_code == 200
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_double_suffix_returns_400(proxy_app):
+    app, _calls, _ = proxy_app(_TWO_PROVIDER_RACE_CFG, lambda r: _ok_response())
+    resp = await _post(app, {"model": "fast:race:seq", "messages": []})
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_race_falls_back_to_sequential_when_race_fails(proxy_app):
+    """When all race candidates fail, the proxy retries them sequentially (cooloff=0 here so they stay eligible)."""
     def handler(req):
-        if not state["race_done"]:
-            return httpx.Response(503)
-        return _ok_response()
+        return httpx.Response(503)
 
     app, calls, _ = proxy_app(
         {
@@ -363,34 +436,30 @@ async def test_fastest_falls_back_to_sequential_when_race_fails(proxy_app):
                 "a": {"base_url": "https://a.test", "api_key": "k"},
                 "b": {"base_url": "https://b.test", "api_key": "k"},
             },
-            "groups": {"fast": [{"provider": "a", "model": "ma"}, {"provider": "b", "model": "mb"}]},
+            "groups": {"fast": {"endpoints": [
+                {"provider": "a", "model": "ma"},
+                {"provider": "b", "model": "mb"},
+            ]}},
         },
         handler,
     )
-    # All upstreams 503 → both race and sequential fall through → 502
-    resp = await _post(app, {"model": "fast:fastest", "messages": []})
+    resp = await _post(app, {"model": "fast:race", "messages": []})
     assert resp.status_code == 502
-    # Both endpoints were tried at least once during the race AND again during sequential
-    # fallback (cooloff=0 means they're not skipped on the second pass).
+    # Race tried both, sequential then tried both again (cooloff=0 ⇒ not skipped)
     assert len(calls) >= 4
 
 
 @pytest.mark.asyncio
-async def test_fastest_with_single_candidate_skips_race(proxy_app):
-    """With only one (model, base_url) key, there's no one to race against — route directly."""
-    def handler(req):
-        return _ok_response()
-
+async def test_race_with_single_candidate_skips_race(proxy_app):
+    """With only one (model, base_url) key there's no one to race against — route directly."""
     app, calls, _ = proxy_app(
         {
-            "providers": {
-                "a": {"base_url": "https://a.test", "api_key": "k"},
-            },
-            "groups": {"only": [{"provider": "a", "model": "ma"}]},
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"only": {"endpoints": [{"provider": "a", "model": "ma"}]}},
         },
-        handler,
+        lambda r: _ok_response(),
     )
-    resp = await _post(app, {"model": "only:fastest", "messages": []})
+    resp = await _post(app, {"model": "only:race", "messages": []})
     assert resp.status_code == 200
     assert len(calls) == 1
 
@@ -405,7 +474,7 @@ async def test_reasoning_stripped_from_messages_by_default(proxy_app):
     app, calls, _ = proxy_app(
         {
             "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
-            "groups": {"default": [{"provider": "a", "model": "m"}]},
+            "groups": {"default": {"endpoints": [{"provider": "a", "model": "m"}]}},
         },
         handler,
     )
@@ -422,7 +491,7 @@ async def test_invalid_json_body_returns_400(proxy_app):
     app, _calls, _ = proxy_app(
         {
             "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
-            "groups": {"default": [{"provider": "a"}]},
+            "groups": {"default": {"endpoints": [{"provider": "a"}]}},
         },
         lambda r: _ok_response(),
     )
@@ -442,8 +511,8 @@ async def test_models_endpoint_requires_auth_when_api_key_set(proxy_app, monkeyp
         {
             "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
             "groups": {
-                "default": [{"provider": "a"}],
-                "fast": [{"provider": "a", "model": "m"}],
+                "default": {"endpoints": [{"provider": "a"}]},
+                "fast": {"endpoints": [{"provider": "a", "model": "m"}]},
             },
         },
         lambda r: _ok_response(),
@@ -463,7 +532,7 @@ async def test_reasoning_kept_with_flag(proxy_app):
     app, calls, _ = proxy_app(
         {
             "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
-            "groups": {"default": [{"provider": "a", "model": "m", "flags": ["keep_reasoning"]}]},
+            "groups": {"default": {"endpoints": [{"provider": "a", "model": "m", "flags": ["keep_reasoning"]}]}},
         },
         handler,
     )

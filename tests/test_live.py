@@ -49,7 +49,7 @@ async def live_app(monkeypatch, tmp_path):
     fresh_config(monkeypatch, tmp_path, {
         "settings": {"cooloff_seconds": 5, "race_interval_requests": 1},
         "providers": {"live": {"base_url": LIVE_BASE_URL, "api_key": LIVE_API_KEY}},
-        "groups": {"live": [{"provider": "live", "model": LIVE_MODEL}]},
+        "groups": {"live": {"endpoints": [{"provider": "live", "model": LIVE_MODEL}]}},
     })
     sys.modules.pop("main", None)
     import main

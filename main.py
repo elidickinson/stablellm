@@ -63,14 +63,38 @@ def _build_provider_groups():
     global _group_provider_groups, _group_preferred_providers
     _group_provider_groups = {}
     _group_preferred_providers = {}
-    for group_name, indices in config.GROUPS.items():
+    for group_name, group in config.GROUPS.items():
         g: dict[tuple[str, str], list[int]] = {}
-        for idx in indices:
+        for idx in group.endpoints:
             ep = config.ENDPOINTS[idx]
             key = (ep.model or "default", ep.base_url)
             g.setdefault(key, []).append(idx)
         _group_provider_groups[group_name] = g
         _group_preferred_providers[group_name] = list(g.keys())
+
+
+# Canonical names are :race / :seq. :fastest and :normal are aliases.
+_SUFFIX_MODES: dict[str, str] = {
+    f":{config.MODE_RACE}": config.MODE_RACE,
+    ":fastest": config.MODE_RACE,
+    f":{config.MODE_SEQ}": config.MODE_SEQ,
+    ":normal": config.MODE_SEQ,
+}
+
+
+def _parse_model_suffix(model: str) -> tuple[str, str | None]:
+    """Strip a single mode suffix. Returns (stripped, override_mode).
+
+    Recognized suffixes: :race / :fastest (race), :seq / :normal (seq).
+    Raises ValueError if more than one suffix is present.
+    """
+    for suffix, mode in _SUFFIX_MODES.items():
+        if model.endswith(suffix):
+            stem = model.removesuffix(suffix)
+            if any(stem.endswith(s) for s in _SUFFIX_MODES):
+                raise ValueError(f"multiple mode suffixes on model '{model}'")
+            return stem, mode
+    return model, None
 
 
 def _effective_model(ep: Endpoint, client_model: str, group_name: str) -> str:
@@ -535,9 +559,10 @@ async def stats():
             "failures": _stats["failures"].get(idx, 0),
         })
     result["groups"] = {}
-    for name, indices in config.GROUPS.items():
+    for name, group in config.GROUPS.items():
         result["groups"][name] = {
-            "endpoints": indices,
+            "endpoints": group.endpoints,
+            "mode": group.mode,
             "preferred_providers": [{"model": m, "base_url": u} for m, u in _group_preferred_providers.get(name, [])],
             "requests_since_last_race": _group_race_request_count.get(name, 0),
         }
@@ -739,7 +764,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
 
     raw_body = await request.body()
     is_streaming = False
-    fastest_mode = False
+    mode_override: str | None = None
 
     if request.method == "POST" and raw_body:
         try:
@@ -749,15 +774,18 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         is_streaming = body_dict.get("stream", False)
 
         model = body_dict.get("model", "")
-        if model.endswith(":fastest"):
-            fastest_mode = True
-            model = model.removesuffix(":fastest")
+        try:
+            model, mode_override = _parse_model_suffix(model)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        if mode_override is not None:
             body_dict = {**body_dict, "model": model}
 
         group_name = model if model in config.GROUPS else "default"
     else:
         body_dict = None
         group_name = "default"
+        model = ""
 
     if group_name not in config.GROUPS:
         log.warning("invalid model requested: '%s'", model)
@@ -766,7 +794,9 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             status_code=404,
         )
 
-    if fastest_mode:
+    mode = mode_override or config.GROUPS[group_name].mode
+
+    if mode == config.MODE_RACE:
         _group_race_request_count[group_name] += 1
 
         if _should_race(group_name):
@@ -781,7 +811,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         for pk in pref:
             endpoint_order.extend(pg[pk])
     else:
-        endpoint_order = config.GROUPS[group_name]
+        endpoint_order = config.GROUPS[group_name].endpoints
 
     last_failure = None
     for idx in endpoint_order:

@@ -29,6 +29,18 @@ class Endpoint:
     keep_reasoning: bool = False
 
 
+MODE_SEQ = "seq"
+MODE_RACE = "race"
+VALID_MODES = frozenset({MODE_SEQ, MODE_RACE})
+
+
+@dataclass(frozen=True)
+class Group:
+    """An ordered set of endpoint indices and the routing mode used to dispatch them."""
+    endpoints: list[int]
+    mode: str = MODE_SEQ
+
+
 @dataclass(frozen=True)
 class Settings:
     cooloff_seconds: float = 30.0
@@ -54,7 +66,7 @@ REQUEST_LOG_DB = os.getenv("REQUEST_LOG_DB", "")
 
 # --- Reloadable state (updated atomically by apply_config) ---
 ENDPOINTS: list[Endpoint] = []
-GROUPS: dict[str, list[int]] = {}
+GROUPS: dict[str, Group] = {}
 SETTINGS: Settings = Settings()
 
 _ENV_VAR_RE = re.compile(r"\$\{(\w+)\}|\$(\w+)")
@@ -96,22 +108,32 @@ def _parse_providers(raw: object) -> dict[str, Provider]:
     return providers
 
 
-def _parse_groups(raw: object, providers: dict[str, Provider]) -> tuple[dict[str, list[int]], list[Endpoint]]:
+def _parse_groups(raw: object, providers: dict[str, Provider]) -> tuple[dict[str, Group], list[Endpoint]]:
     """Parse 'groups' mapping. Returns (groups, endpoints).
 
-    Each group name is used as-is (no normalization) and matched directly
-    against the request model. Endpoints are built flat and indexed.
+    Each group is a mapping with required 'endpoints' (a non-empty list) and
+    optional 'mode' (defaults to MODE_SEQ). Group names match request models exactly.
     """
     raw = raw or {}
     if not isinstance(raw, dict):
         raise ConfigError("'groups' must be a mapping")
 
-    groups: dict[str, list[int]] = {}
+    groups: dict[str, Group] = {}
     endpoints: list[Endpoint] = []
 
-    for group_name, members in raw.items():
+    for group_name, spec in raw.items():
+        if not isinstance(spec, dict):
+            raise ConfigError(f"group '{group_name}' must be a mapping with 'endpoints' (and optional 'mode')")
+
+        members = spec.get("endpoints")
         if not isinstance(members, list) or not members:
-            raise ConfigError(f"group '{group_name}' must be a non-empty list")
+            raise ConfigError(f"group '{group_name}': 'endpoints' must be a non-empty list")
+
+        mode = str(spec.get("mode", MODE_SEQ))
+        if mode not in VALID_MODES:
+            raise ConfigError(
+                f"group '{group_name}': unknown mode '{mode}'. Valid: {', '.join(sorted(VALID_MODES))}"
+            )
 
         indices: list[int] = []
         for i, entry in enumerate(members):
@@ -142,7 +164,7 @@ def _parse_groups(raw: object, providers: dict[str, Provider]) -> tuple[dict[str
             ))
             indices.append(len(endpoints) - 1)
 
-        groups[str(group_name)] = indices
+        groups[str(group_name)] = Group(endpoints=indices, mode=mode)
 
     if not groups:
         raise ConfigError("at least one group is required")
@@ -167,7 +189,7 @@ def _parse_settings(raw: object) -> Settings:
     )
 
 
-def parse_config(raw: object) -> tuple[list[Endpoint], dict[str, list[int]], Settings]:
+def parse_config(raw: object) -> tuple[list[Endpoint], dict[str, Group], Settings]:
     """Validate and parse a yaml dict. Returns (endpoints, groups, settings).
     Raises ConfigError on invalid input. Does NOT mutate module state."""
     if not isinstance(raw, dict):
@@ -179,7 +201,7 @@ def parse_config(raw: object) -> tuple[list[Endpoint], dict[str, list[int]], Set
     return endpoints, groups, settings
 
 
-def apply_config(endpoints: list[Endpoint], groups: dict[str, list[int]], settings: Settings) -> None:
+def apply_config(endpoints: list[Endpoint], groups: dict[str, Group], settings: Settings) -> None:
     """Atomically swap in new config state."""
     global ENDPOINTS, GROUPS, SETTINGS
     ENDPOINTS = endpoints

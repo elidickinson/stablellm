@@ -34,21 +34,28 @@ providers:
     base_url: https://api.synthetic.new/v1
     api_key: ${SYNTHETIC_API_KEY}
 
-# Groups map request model names to an ordered list of (provider, model_override).
-# "default" is the fallback when no other group matches.
+# Groups map a request model name to a routing mode and an ordered list of
+# (provider, model_override) endpoints. "default" is the fallback when no other
+# group matches. mode is "seq" (try in order, default) or "race" (send to all,
+# first response wins). The client can override with a :race or :seq suffix
+# on the model name (e.g., "cheap:race").
 groups:
   default:
-    - provider: openai
-      model: gpt-4o
+    endpoints:
+      - provider: openai
+        model: gpt-4o
 
   gpt-4o:
-    - provider: openai
-    - provider: openai_backup
-    - provider: openrouter
-      model: openai/gpt-4o
+    endpoints:
+      - provider: openai
+      - provider: openai_backup
+      - provider: openrouter
+        model: openai/gpt-4o
 
   cheap:
-    - provider: cerebras
-      model: zai-glm-4.7
-      flags: [keep_reasoning]
-    - provider: openrouter
+    mode: race
+    endpoints:
+      - provider: cerebras
+        model: zai-glm-4.7
+        flags: [keep_reasoning]
+      - provider: openrouter
