@@ -44,7 +44,7 @@ async def _post(app, body):
 
 
 @pytest.mark.asyncio
-async def test_models_lists_non_default_groups(app_with_endpoints):
+async def test_models_lists_all_groups(app_with_endpoints):
     app, _calls = app_with_endpoints({
         "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
         "groups": {
@@ -59,10 +59,7 @@ async def test_models_lists_non_default_groups(app_with_endpoints):
     assert resp.status_code == 200
     data = resp.json()
     assert data["object"] == "list"
-    ids = [m["id"] for m in data["data"]]
-    assert "cheap" in ids
-    assert "fast" in ids
-    assert "default" not in ids
+    assert {m["id"] for m in data["data"]} == {"default", "cheap", "fast"}
 
 
 @pytest.mark.asyncio
@@ -86,18 +83,14 @@ async def test_named_group_routes_in_order(app_with_endpoints):
 
 
 @pytest.mark.asyncio
-async def test_unknown_model_falls_back_to_default_group(app_with_endpoints):
+async def test_unknown_model_returns_404(app_with_endpoints):
     app, calls = app_with_endpoints({
-        "providers": {
-            "a": {"base_url": "https://a.test", "api_key": "k"},
-            "b": {"base_url": "https://b.test", "api_key": "k"},
-        },
-        "groups": {"default": {"endpoints": [{"provider": "a"}, {"provider": "b"}]}},
+        "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+        "groups": {"default": {"endpoints": [{"provider": "a"}]}},
     })
     resp = await _post(app, {"model": "anything", "messages": []})
-    assert resp.status_code == 200
-    assert calls[0][0] == "https://a.test"
-    assert calls[0][1]["model"] == "anything"
+    assert resp.status_code == 404
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -154,16 +147,12 @@ async def test_group_name_matching_is_case_insensitive(app_with_endpoints):
 @pytest.mark.asyncio
 async def test_group_name_separators_are_not_normalized(app_with_endpoints):
     """Only case is normalized — 'gpt-4.1' and 'gpt_4_1' remain distinct."""
-    app, calls = app_with_endpoints({
+    app, _calls = app_with_endpoints({
         "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
-        "groups": {
-            "default": {"endpoints": [{"provider": "a", "model": "fallback"}]},
-            "gpt-4.1": {"endpoints": [{"provider": "a", "model": "model-a"}]},
-        },
+        "groups": {"gpt-4.1": {"endpoints": [{"provider": "a", "model": "model-a"}]}},
     })
     resp = await _post(app, {"model": "gpt_4_1", "messages": []})
-    assert resp.status_code == 200
-    assert calls[0][1]["model"] == "fallback"  # didn't match gpt-4.1
+    assert resp.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -173,7 +162,7 @@ async def test_reload_picks_up_new_providers(app_with_endpoints, tmp_path, monke
         "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
         "groups": {"default": {"endpoints": [{"provider": "a", "model": "model-a"}]}},
     })
-    resp = await _post(app, {"model": "anything", "messages": []})
+    resp = await _post(app, {"model": "default", "messages": []})
     assert resp.status_code == 200
     assert calls[-1][0] == "https://a.test"
 
@@ -192,7 +181,7 @@ async def test_reload_picks_up_new_providers(app_with_endpoints, tmp_path, monke
     config.reload()
     main._build_provider_groups()
 
-    resp = await _post(app, {"model": "anything", "messages": []})
+    resp = await _post(app, {"model": "default", "messages": []})
     assert resp.status_code == 200
     assert calls[-1][0] == "https://b.test"
     assert calls[-1][1]["model"] == "model-b"

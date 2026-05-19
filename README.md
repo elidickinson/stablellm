@@ -67,9 +67,7 @@ groups:
   - `model` — model name to send upstream. If omitted, falls back to the provider's `model` (if set), otherwise the client's requested model passes through unchanged.
   - `flags` — per-endpoint flags: `keep_reasoning` preserves `reasoning`/`reasoning_content`/`thinking` fields in messages (otherwise stripped).
 
-**Group names are plain strings** — `glm-4.7` matches exactly `model: glm-4.7` from the client. No normalization or case folding.
-
-**`default` group** is the fallback when no other group matches the request model. It is optional — if omitted, requests with an unknown model will receive a 400 error.
+**Group names match the client's `model` field case-insensitively.** `glm-4.7` matches `model: GLM-4.7`. Separators are not normalized, so `gpt-4.1` and `gpt_4_1` are distinct.
 
 ## Run
 
@@ -77,16 +75,11 @@ groups:
 uv run uvicorn main:app --host $HOST --port $PORT
 ```
 
-POST to `/v1/chat/completions` (or any path) like the OpenAI API.
+POST to `/v1/chat/completions` (or any path) like the OpenAI API. Every request must include a `model` field whose value matches a configured group name; otherwise the proxy returns 404.
 
 ## Routing
 
-Every request resolves to a group:
-
-1. If the request `model` matches a group name, that group's provider list is used.
-2. Otherwise the `default` group is used.
-
-Within a group, the routing mode determines how endpoints are dispatched:
+The request's `model` field selects the group. Within that group, the routing mode determines how endpoints are dispatched:
 
 - **`seq`** (default) — try endpoints in order. A failing endpoint cools off for `cooloff_seconds` before being retried. If all endpoints fail, the request returns a 502.
 - **`race`** — send the request to one endpoint per provider concurrently; the fastest response wins and becomes the preferred provider for subsequent requests. A re-race triggers when either `race_interval_requests` requests have passed or `race_interval_secs` seconds have elapsed since the last race (defaults: **25 requests** or **6 hours**). If the race fails, the proxy falls back to sequential.

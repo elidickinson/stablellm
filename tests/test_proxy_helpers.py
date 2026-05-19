@@ -100,20 +100,14 @@ def test_parse_model_suffix_colon_in_name_not_a_suffix(main_module):
 def test_effective_model_endpoint_model_wins(main_module):
     from config import Endpoint
     ep = Endpoint(base_url="x", api_key="k", model="gpt-4o-mini")
-    assert main_module._effective_model(ep, "client-model", "any") == "gpt-4o-mini"
+    assert main_module._effective_model(ep, "client-model") == "gpt-4o-mini"
 
 
-def test_effective_model_default_group_with_no_endpoint_model_is_empty(main_module):
-    """Default group + no endpoint model → empty (request passes upstream as-is)."""
+def test_effective_model_falls_back_to_client_model(main_module):
+    """No endpoint model → client's requested model passes through."""
     from config import Endpoint
     ep = Endpoint(base_url="x", api_key="k", model="")
-    assert main_module._effective_model(ep, "client-model", "default") == ""
-
-
-def test_effective_model_named_group_passes_through_client_model(main_module):
-    from config import Endpoint
-    ep = Endpoint(base_url="x", api_key="k", model="")
-    assert main_module._effective_model(ep, "gpt-4o", "gpt-4o") == "gpt-4o"
+    assert main_module._effective_model(ep, "gpt-4o") == "gpt-4o"
 
 
 # --- _strip_unsupported ---
@@ -123,7 +117,7 @@ def test_strip_unsupported_drops_unknown_keys(main_module):
     ep = Endpoint(base_url="x", api_key="k", model="m")
     out = main_module._strip_unsupported(
         {"model": "ignored", "messages": [], "bogus_param": 1, "another": "x"},
-        ep, "default",
+        ep,
     )
     assert "bogus_param" not in out
     assert "another" not in out
@@ -138,7 +132,7 @@ def test_strip_unsupported_removes_reasoning_from_messages_by_default(main_modul
             {"role": "assistant", "content": "hi", "reasoning": "...", "thinking": "..."},
             {"role": "user", "content": "yo"},
         ]},
-        ep, "default",
+        ep,
     )
     msgs = out["messages"]
     assert "reasoning" not in msgs[0] and "thinking" not in msgs[0]
@@ -151,7 +145,7 @@ def test_strip_unsupported_keeps_reasoning_when_flag_set(main_module):
     ep = Endpoint(base_url="x", api_key="k", model="m", keep_reasoning=True)
     out = main_module._strip_unsupported(
         {"messages": [{"role": "assistant", "content": "hi", "reasoning": "kept"}]},
-        ep, "default",
+        ep,
     )
     assert out["messages"][0]["reasoning"] == "kept"
 

@@ -68,7 +68,7 @@ _EXCLUDED_HEADERS = {"transfer-encoding", "connection", "keep-alive", "content-e
 
 _background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
 
-# Per-group state (every request goes through a group; "default" is implicit)
+# Per-group state (every request resolves to exactly one group by exact model match)
 _group_provider_groups: dict[str, dict[tuple[str, str], list[int]]] = {}
 _group_preferred_providers: dict[str, list[tuple[str, str]]] = {}
 _group_race_request_count: dict[str, int] = defaultdict(int)
@@ -85,7 +85,7 @@ def _build_provider_groups():
         g: dict[tuple[str, str], list[int]] = {}
         for idx in group.endpoints:
             ep = config.ENDPOINTS[idx]
-            key = (ep.model or "default", ep.base_url)
+            key = (ep.model, ep.base_url)
             g.setdefault(key, []).append(idx)
         _group_provider_groups[group_name] = g
         _group_preferred_providers[group_name] = list(g.keys())
@@ -117,12 +117,8 @@ def _parse_model_suffix(model: str) -> tuple[str, str | None]:
     return model, None
 
 
-def _effective_model(ep: Endpoint, client_model: str, group_name: str) -> str:
-    if ep.model:
-        return ep.model
-    if group_name != "default":
-        return client_model
-    return ""
+def _effective_model(ep: Endpoint, client_model: str) -> str:
+    return ep.model or client_model
 
 
 @asynccontextmanager
@@ -131,8 +127,7 @@ async def lifespan(_app: FastAPI):
     requestlog.init()
     http_client = httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=CONNECT_TIMEOUT))
     _build_provider_groups()
-    group_names = [g for g in config.GROUPS if g != "default"]
-    log.info("stablellm started with %d endpoint(s), groups: default + %s", len(config.ENDPOINTS), group_names if group_names else "(none)")
+    log.info("stablellm started with %d endpoint(s), groups: %s", len(config.ENDPOINTS), list(config.GROUPS))
     yield
     await http_client.aclose()
 
@@ -245,11 +240,11 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
         raise
 
 
-async def _proxy_buffered(ep: Endpoint, method: str, path: str, headers: dict, body: bytes, metrics):
+async def _proxy_buffered(ep: Endpoint, path: str, headers: dict, body: bytes, metrics):
     """Non-streaming: send request, return full response or (None, reason)."""
     url = f"{ep.base_url}/{path}"
     t0 = time.monotonic()
-    resp = await http_client.request(method, url, headers=headers, content=body)
+    resp = await http_client.post(url, headers=headers, content=body)
     elapsed = time.monotonic() - t0
 
     if resp.status_code != 200:
@@ -332,23 +327,20 @@ SUPPORTED_PARAMS = {
 _REASONING_KEYS = frozenset({"reasoning", "reasoning_content", "thinking"})
 
 
-def _rewrite_model(body: dict, ep: Endpoint, group_name: str) -> dict:
-    effective = _effective_model(ep, body.get("model", ""), group_name)
-    if effective:
-        body = {**body, "model": effective}
-    return body
+def _rewrite_model(body: dict, ep: Endpoint) -> dict:
+    return {**body, "model": _effective_model(ep, body.get("model", ""))}
 
 
 def _strip_message_reasoning(messages: list) -> list:
     return [{k: v for k, v in msg.items() if k not in _REASONING_KEYS} for msg in messages]
 
 
-def _strip_unsupported(body: dict, ep: Endpoint, group_name: str) -> dict:
+def _strip_unsupported(body: dict, ep: Endpoint) -> dict:
     """Keep only supported params, strip reasoning from messages, apply model name."""
     base = {k: v for k, v in body.items() if k in SUPPORTED_PARAMS}
     if not ep.keep_reasoning and "messages" in base:
         base["messages"] = _strip_message_reasoning(base["messages"])
-    return _rewrite_model(base, ep, group_name)
+    return _rewrite_model(base, ep)
 
 
 def _should_race(group: str) -> bool:
@@ -373,7 +365,7 @@ def _finish_race(race_times: dict[tuple[str, str], float], group: str):
     log.info("race complete (group=%s): %s", group, [(k[1], f"{v:.1f}s") for k, v in sorted(race_times.items(), key=lambda x: x[1])])
 
 
-async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: str = "default"):
+async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: str):
     """Race one endpoint per provider group with real request. Returns response or None."""
     pg = _group_provider_groups[group]
 
@@ -411,7 +403,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
     async def _send(pk: tuple, idx: int):
         ep = config.ENDPOINTS[idx]
         headers = _build_upstream_headers(ep)
-        stripped = _strip_unsupported(body_dict, ep, group)
+        stripped = _strip_unsupported(body_dict, ep)
         send_body = json.dumps(stripped).encode()
         url = f"{ep.base_url}/{path}"
         req = http_client.build_request("POST", url, headers=headers, content=send_body)
@@ -448,7 +440,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
 
     win_pk, win_idx, win_resp = winner
     ep = config.ENDPOINTS[win_idx]
-    model_name = _effective_model(ep, body_dict.get("model", ""), group) or "(client model)"
+    model_name = _effective_model(ep, body_dict.get("model", ""))
     log.info("race: first response from %s (model: %s) %.0fms", win_pk[1], model_name, (time.monotonic() - race_start) * 1000)
     _stats["requests"][win_idx] += 1
     _stats["successes"][win_idx] += 1
@@ -562,7 +554,6 @@ async def list_models(authorization: str | None = Header(None)):
         "data": [
             {"id": name, "object": "model", "created": 0, "owned_by": "stablellm"}
             for name in config.GROUPS
-            if name != "default"
         ],
     }
 
@@ -762,16 +753,14 @@ async def config_save(request: Request, x_config_password: str | None = Header(N
     _reset_runtime_state()
     logging.getLogger().setLevel(getattr(logging, config.SETTINGS.log_level, logging.INFO))
 
-    group_names = [g for g in config.GROUPS if g != "default"]
-    log.info("config reloaded via editor: %d endpoint(s), groups: default + %s",
-             len(config.ENDPOINTS), group_names if group_names else "(none)")
+    group_names = list(config.GROUPS)
+    log.info("config reloaded via editor: %d endpoint(s), groups: %s", len(config.ENDPOINTS), group_names)
     return PlainTextResponse(
-        f"saved and reloaded: {len(config.ENDPOINTS)} endpoint(s), "
-        f"groups: default + {group_names if group_names else '(none)'}"
+        f"saved and reloaded: {len(config.ENDPOINTS)} endpoint(s), groups: {group_names}"
     )
 
 
-@app.api_route("/v1/{path:path}", methods=["GET", "POST"])
+@app.post("/v1/{path:path}")
 async def proxy(request: Request, path: str, authorization: str | None = Header(None)):
     auth_err = _check_auth(authorization)
     if auth_err:
@@ -783,36 +772,29 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         return JSONResponse({"error": "invalid path"}, status_code=400)
 
     raw_body = await request.body()
-    is_streaming = False
-    mode_override: str | None = None
+    if not raw_body:
+        return JSONResponse({"error": "request body is required"}, status_code=400)
+    try:
+        body_dict = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
-    if request.method == "POST" and raw_body:
-        try:
-            body_dict = json.loads(raw_body)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-        is_streaming = body_dict.get("stream", False)
+    is_streaming = body_dict.get("stream", False)
+    model = body_dict.get("model", "")
+    if not model:
+        return JSONResponse({"error": "'model' is required"}, status_code=400)
 
-        model = body_dict.get("model", "")
-        try:
-            model, mode_override = _parse_model_suffix(model)
-        except ValueError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=400)
-        if mode_override is not None:
-            body_dict = {**body_dict, "model": model}
+    try:
+        model, mode_override = _parse_model_suffix(model)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    if mode_override is not None:
+        body_dict = {**body_dict, "model": model}
 
-        group_name = model.lower() if model.lower() in config.GROUPS else "default"
-    else:
-        body_dict = None
-        group_name = "default"
-        model = ""
-
+    group_name = model.lower()
     if group_name not in config.GROUPS:
-        log.warning("invalid model requested: '%s'", model)
-        return JSONResponse(
-            {"error": f"model '{model}' does not match any group and no default group is configured"},
-            status_code=404,
-        )
+        log.warning("unknown model: %r", model)
+        return JSONResponse({"error": f"unknown model: '{model}'"}, status_code=404)
 
     mode = mode_override or config.GROUPS[group_name].mode
 
@@ -847,12 +829,9 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
 
         _stats["requests"][idx] += 1
 
-        if body_dict is not None:
-            stripped = _strip_unsupported(body_dict, ep, group_name)
-            send_body = json.dumps(stripped).encode()
-            log.debug("-> %s body (keys): %s", ep.base_url, list(stripped.keys()))
-        else:
-            send_body = raw_body
+        stripped = _strip_unsupported(body_dict, ep)
+        send_body = json.dumps(stripped).encode()
+        log.debug("-> %s body (keys): %s", ep.base_url, list(stripped.keys()))
 
         headers = _build_upstream_headers(ep)
         log.debug(
@@ -861,8 +840,8 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             {k: v for k, v in headers.items() if k.lower() != "authorization"},
         )
 
-        client_model = body_dict.get("model", "") if body_dict else ""
-        model_name = _effective_model(ep, client_model, group_name) or "(client model)"
+        client_model = body_dict.get("model", "")
+        model_name = _effective_model(ep, client_model)
         metrics = requestlog.RequestMetrics(
             model_requested=client_model,
             provider_served=ep.base_url,
@@ -873,7 +852,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             if is_streaming:
                 result, reason = await _proxy_stream(ep, path, headers, send_body, metrics)
             else:
-                result, reason = await _proxy_buffered(ep, request.method, path, headers, send_body, metrics)
+                result, reason = await _proxy_buffered(ep, path, headers, send_body, metrics)
 
             if result is not None:
                 _stats["successes"][idx] += 1

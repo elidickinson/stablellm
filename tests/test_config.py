@@ -85,7 +85,8 @@ def test_missing_provider_key_is_config_error():
         parse_config(make_minimal(groups={"default": _group([{"model": "x"}])}))
 
 
-def test_missing_default_group_ok_without_implicit_creation(make_config):
+def test_group_name_default_has_no_special_meaning(make_config):
+    """'default' is just a name; not auto-created and not required."""
     cfg = make_config({
         "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
         "groups": {"other": _group([{"provider": "a", "model": "m1"}])},

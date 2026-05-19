@@ -83,7 +83,7 @@ async def test_5xx_marks_endpoint_down_and_tries_next(proxy_app):
         },
         handler,
     )
-    resp = await _post(app, {"model": "anything", "messages": []})
+    resp = await _post(app, {"model": "default", "messages": []})
     assert resp.status_code == 200
     assert [c[0] for c in calls] == ["https://a.test", "https://b.test"]
     assert main._stats["failures"][0] == 1
@@ -108,7 +108,7 @@ async def test_4xx_also_triggers_failover(proxy_app):
         },
         handler,
     )
-    resp = await _post(app, {"model": "anything", "messages": []})
+    resp = await _post(app, {"model": "default", "messages": []})
     assert resp.status_code == 200
     assert len(calls) == 2
 
@@ -128,7 +128,7 @@ async def test_all_endpoints_failing_returns_502(proxy_app):
         },
         handler,
     )
-    resp = await _post(app, {"model": "anything", "messages": []})
+    resp = await _post(app, {"model": "default", "messages": []})
     assert resp.status_code == 502
     assert "exhausted" in resp.json()["error"]
 
@@ -150,7 +150,7 @@ async def test_connection_error_marks_down_and_tries_next(proxy_app):
         },
         handler,
     )
-    resp = await _post(app, {"model": "anything", "messages": []})
+    resp = await _post(app, {"model": "default", "messages": []})
     assert resp.status_code == 200
     assert main._stats["failures"][0] == 1
 
@@ -180,12 +180,12 @@ async def test_cooled_off_endpoint_is_skipped_on_next_request(proxy_app):
         handler,
     )
     # First request: a fails, b succeeds
-    await _post(app, {"messages": []})
+    await _post(app, {"model": "default", "messages": []})
     assert len(calls) == 2
 
     # Second request: a is cooled off, only b is tried
     calls.clear()
-    resp = await _post(app, {"messages": []})
+    resp = await _post(app, {"model": "default", "messages": []})
     assert resp.status_code == 200
     assert [c[0] for c in calls] == ["https://b.test"]
 
@@ -211,7 +211,7 @@ async def test_streaming_response_passes_through_chunks(proxy_app):
         handler,
     )
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
-        async with c.stream("POST", "/v1/chat/completions", json={"stream": True, "messages": []}) as resp:
+        async with c.stream("POST", "/v1/chat/completions", json={"model": "default", "stream": True, "messages": []}) as resp:
             assert resp.status_code == 200
             chunks = b"".join([chunk async for chunk in resp.aiter_bytes()])
     assert b"hello" in chunks
@@ -232,8 +232,8 @@ async def test_stats_reflects_request_counts(proxy_app):
         },
         handler,
     )
-    await _post(app, {"messages": []})
-    await _post(app, {"messages": []})
+    await _post(app, {"model": "default", "messages": []})
+    await _post(app, {"model": "default", "messages": []})
 
     resp = await _get(app, "/stats")
     assert resp.status_code == 200
@@ -260,7 +260,7 @@ async def test_oversized_body_is_rejected(proxy_app, monkeypatch):
         },
         lambda r: _ok_response(),
     )
-    big_body = {"messages": [{"role": "user", "content": "x" * 500}]}
+    big_body = {"model": "default", "messages": [{"role": "user", "content": "x" * 500}]}
     resp = await _post(app, big_body)
     assert resp.status_code == 413
 
@@ -280,15 +280,15 @@ async def test_api_key_required_when_configured(proxy_app, monkeypatch):
         lambda r: _ok_response(),
     )
     # No auth header → 401
-    no_auth = await _post(app, {"messages": []})
+    no_auth = await _post(app, {"model": "default", "messages": []})
     assert no_auth.status_code == 401
 
     # Wrong key → 401
-    wrong = await _post(app, {"messages": []}, headers={"Authorization": "Bearer wrong"})
+    wrong = await _post(app, {"model": "default", "messages": []}, headers={"Authorization": "Bearer wrong"})
     assert wrong.status_code == 401
 
     # Correct key → 200
-    ok = await _post(app, {"messages": []}, headers={"Authorization": "Bearer secret-proxy-key"})
+    ok = await _post(app, {"model": "default", "messages": []}, headers={"Authorization": "Bearer secret-proxy-key"})
     assert ok.status_code == 200
 
 
@@ -301,12 +301,12 @@ async def test_path_traversal_rejected(proxy_app):
         },
         lambda r: _ok_response(),
     )
-    resp = await _post(app, {"messages": []}, path="/v1/..%2Fsecret")
+    resp = await _post(app, {"model": "default", "messages": []}, path="/v1/..%2Fsecret")
     assert resp.status_code == 400
 
 
 @pytest.mark.asyncio
-async def test_unknown_model_returns_404_when_no_default_group(proxy_app):
+async def test_unknown_model_returns_404(proxy_app):
     app, _calls, _ = proxy_app(
         {
             "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
@@ -479,11 +479,40 @@ async def test_reasoning_stripped_from_messages_by_default(proxy_app):
         handler,
     )
     await _post(app, {
+        "model": "default",
         "messages": [{"role": "assistant", "content": "x", "reasoning": "secret", "thinking": "also"}],
     })
     sent_msg = calls[0][1]["messages"][0]
     assert "reasoning" not in sent_msg
     assert "thinking" not in sent_msg
+
+
+@pytest.mark.asyncio
+async def test_missing_model_returns_400(proxy_app):
+    app, _calls, _ = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"default": {"endpoints": [{"provider": "a"}]}},
+        },
+        lambda r: _ok_response(),
+    )
+    resp = await _post(app, {"messages": []})
+    assert resp.status_code == 400
+    assert "'model'" in resp.json()["error"]
+
+
+@pytest.mark.asyncio
+async def test_empty_body_returns_400(proxy_app):
+    app, _calls, _ = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"default": {"endpoints": [{"provider": "a"}]}},
+        },
+        lambda r: _ok_response(),
+    )
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        resp = await c.post("/v1/chat/completions")
+    assert resp.status_code == 400
 
 
 @pytest.mark.asyncio
@@ -537,6 +566,7 @@ async def test_reasoning_kept_with_flag(proxy_app):
         handler,
     )
     await _post(app, {
+        "model": "default",
         "messages": [{"role": "assistant", "content": "x", "reasoning": "kept"}],
     })
     assert calls[0][1]["messages"][0]["reasoning"] == "kept"

@@ -35,16 +35,12 @@ providers:
     api_key: ${SYNTHETIC_API_KEY}
 
 # Groups map a request model name to a routing mode and an ordered list of
-# (provider, model_override) endpoints. "default" is the fallback when no other
-# group matches. mode is "seq" (try in order, default) or "race" (send to all,
-# first response wins). The client can override with a :race or :seq suffix
-# on the model name (e.g., "cheap:race").
+# (provider, model_override) endpoints. The client's 'model' field must match
+# a group name (case-insensitively); unknown models get a 404.
+# mode is "seq" (try in order, default) or "race" (send to all, first response wins).
+# The client can override with a :race or :seq suffix on the model name (e.g.,
+# "cheap:race"). :fastest and :normal are aliases.
 groups:
-  default:
-    endpoints:
-      - provider: openai
-        model: gpt-4o
-
   gpt-4o:
     endpoints:
       - provider: openai
