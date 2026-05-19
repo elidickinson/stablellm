@@ -816,6 +816,11 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
 
     mode = mode_override or config.GROUPS[group_name].mode
 
+    log.info(
+        "-> /v1/%s model=%r group=%s mode=%s stream=%s",
+        path, model, group_name, mode, is_streaming,
+    )
+
     if mode == config.MODE_RACE:
         _group_race_request_count[group_name] += 1
 
