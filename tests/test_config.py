@@ -85,13 +85,16 @@ def test_env_var_interpolation(make_config, monkeypatch):
     assert cfg.ENDPOINTS[0].api_key == "secret-value"
 
 
-def test_missing_env_var_is_config_error(monkeypatch):
+def test_missing_env_var_warns_and_preserves_placeholder(monkeypatch, caplog):
+    """Missing env vars warn (not fatal) and the literal ${VAR} stays in place."""
     monkeypatch.delenv("DEFINITELY_UNSET_VAR", raising=False)
-    with pytest.raises(ConfigError):
-        parse_config({
+    with caplog.at_level("WARNING", logger="stablellm.config"):
+        endpoints, _, _ = parse_config({
             "providers": {"a": {"base_url": "https://a", "api_key": "${DEFINITELY_UNSET_VAR}"}},
             "groups": {"default": [{"provider": "a"}]},
         })
+    assert endpoints[0].api_key == "${DEFINITELY_UNSET_VAR}"
+    assert any("DEFINITELY_UNSET_VAR" in r.message for r in caplog.records)
 
 
 def test_settings_loaded_from_yaml(make_config):

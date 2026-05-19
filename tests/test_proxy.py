@@ -1,0 +1,473 @@
+"""Integration tests for the proxy runtime: failover, cooloff, race, streaming, auth."""
+import asyncio
+import json
+import sys
+
+import httpx
+import pytest
+
+from conftest import fresh_config
+
+
+def _ok_response(extra: dict | None = None) -> httpx.Response:
+    body = {
+        "id": "x",
+        "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+        "usage": {"completion_tokens": 5},
+    }
+    if extra:
+        body.update(extra)
+    return httpx.Response(200, json=body)
+
+
+@pytest.fixture
+def proxy_app(monkeypatch, tmp_path):
+    """Build a fresh proxy app. The caller supplies (config_dict, route_handler).
+
+    The handler is called for each upstream request: handler(request) -> httpx.Response
+    (or raises httpx.* errors to simulate transport failures).
+    """
+    def build(content, route_handler):
+        fresh_config(monkeypatch, tmp_path, content)
+        sys.modules.pop("main", None)
+        import main
+
+        calls: list[tuple[str, dict | None, str]] = []
+
+        async def wrapped(request: httpx.Request) -> httpx.Response:
+            try:
+                body = json.loads(request.content.decode()) if request.content else None
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                body = None
+            base = f"{request.url.scheme}://{request.url.host}"
+            calls.append((base, body, str(request.url.path)))
+            result = route_handler(request)
+            if asyncio.iscoroutine(result):
+                result = await result
+            return result
+
+        main.http_client = httpx.AsyncClient(transport=httpx.MockTransport(wrapped))
+        main._build_provider_groups()
+        main._reset_runtime_state()
+        return main.app, calls, main
+
+    return build
+
+
+async def _post(app, body, headers=None, path="/v1/chat/completions"):
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        return await c.post(path, json=body, headers=headers or {})
+
+
+async def _get(app, path, headers=None):
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        return await c.get(path, headers=headers or {})
+
+
+# --- failover on non-200 responses ---
+
+@pytest.mark.asyncio
+async def test_5xx_marks_endpoint_down_and_tries_next(proxy_app):
+    def handler(req):
+        if req.url.host == "a.test":
+            return httpx.Response(503, json={"error": "down"})
+        return _ok_response()
+
+    app, calls, main = proxy_app(
+        {
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k"},
+                "b": {"base_url": "https://b.test", "api_key": "k"},
+            },
+            "groups": {"default": [{"provider": "a"}, {"provider": "b"}]},
+        },
+        handler,
+    )
+    resp = await _post(app, {"model": "anything", "messages": []})
+    assert resp.status_code == 200
+    assert [c[0] for c in calls] == ["https://a.test", "https://b.test"]
+    assert main._stats["failures"][0] == 1
+    assert main._stats["successes"][1] == 1
+
+
+@pytest.mark.asyncio
+async def test_4xx_also_triggers_failover(proxy_app):
+    """Any non-200 — including 400/401 — should fail over (per commit efe9e08)."""
+    def handler(req):
+        if req.url.host == "a.test":
+            return httpx.Response(401, json={"error": "unauthorized"})
+        return _ok_response()
+
+    app, calls, _ = proxy_app(
+        {
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k"},
+                "b": {"base_url": "https://b.test", "api_key": "k"},
+            },
+            "groups": {"default": [{"provider": "a"}, {"provider": "b"}]},
+        },
+        handler,
+    )
+    resp = await _post(app, {"model": "anything", "messages": []})
+    assert resp.status_code == 200
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_all_endpoints_failing_returns_502(proxy_app):
+    def handler(req):
+        return httpx.Response(500, json={"error": "boom"})
+
+    app, _calls, _ = proxy_app(
+        {
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k"},
+                "b": {"base_url": "https://b.test", "api_key": "k"},
+            },
+            "groups": {"default": [{"provider": "a"}, {"provider": "b"}]},
+        },
+        handler,
+    )
+    resp = await _post(app, {"model": "anything", "messages": []})
+    assert resp.status_code == 502
+    assert "exhausted" in resp.json()["error"]
+
+
+@pytest.mark.asyncio
+async def test_connection_error_marks_down_and_tries_next(proxy_app):
+    def handler(req):
+        if req.url.host == "a.test":
+            raise httpx.ConnectError("refused", request=req)
+        return _ok_response()
+
+    app, calls, main = proxy_app(
+        {
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k"},
+                "b": {"base_url": "https://b.test", "api_key": "k"},
+            },
+            "groups": {"default": [{"provider": "a"}, {"provider": "b"}]},
+        },
+        handler,
+    )
+    resp = await _post(app, {"model": "anything", "messages": []})
+    assert resp.status_code == 200
+    assert main._stats["failures"][0] == 1
+
+
+# --- cooloff ---
+
+@pytest.mark.asyncio
+async def test_cooled_off_endpoint_is_skipped_on_next_request(proxy_app):
+    """After a failure, the failed endpoint stays cooling off and is skipped."""
+    state = {"calls": 0}
+
+    def handler(req):
+        state["calls"] += 1
+        if req.url.host == "a.test":
+            return httpx.Response(503)
+        return _ok_response()
+
+    app, calls, main = proxy_app(
+        {
+            "settings": {"cooloff_seconds": 30},
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k"},
+                "b": {"base_url": "https://b.test", "api_key": "k"},
+            },
+            "groups": {"default": [{"provider": "a"}, {"provider": "b"}]},
+        },
+        handler,
+    )
+    # First request: a fails, b succeeds
+    await _post(app, {"messages": []})
+    assert len(calls) == 2
+
+    # Second request: a is cooled off, only b is tried
+    calls.clear()
+    resp = await _post(app, {"messages": []})
+    assert resp.status_code == 200
+    assert [c[0] for c in calls] == ["https://b.test"]
+
+
+# --- streaming ---
+
+@pytest.mark.asyncio
+async def test_streaming_response_passes_through_chunks(proxy_app):
+    sse_body = (
+        b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+        b'data: {"choices":[{"delta":{"content":" world"}}],"usage":{"completion_tokens":2}}\n\n'
+        b"data: [DONE]\n\n"
+    )
+
+    def handler(req):
+        return httpx.Response(200, content=sse_body, headers={"content-type": "text/event-stream"})
+
+    app, _calls, _ = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"default": [{"provider": "a"}]},
+        },
+        handler,
+    )
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        async with c.stream("POST", "/v1/chat/completions", json={"stream": True, "messages": []}) as resp:
+            assert resp.status_code == 200
+            chunks = b"".join([chunk async for chunk in resp.aiter_bytes()])
+    assert b"hello" in chunks
+    assert b"[DONE]" in chunks
+
+
+# --- /stats ---
+
+@pytest.mark.asyncio
+async def test_stats_reflects_request_counts(proxy_app):
+    def handler(req):
+        return _ok_response()
+
+    app, _calls, _ = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"default": [{"provider": "a"}]},
+        },
+        handler,
+    )
+    await _post(app, {"messages": []})
+    await _post(app, {"messages": []})
+
+    resp = await _get(app, "/stats")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["endpoints"][0]["requests"] == 2
+    assert data["endpoints"][0]["successes"] == 2
+    assert data["endpoints"][0]["failures"] == 0
+
+
+# --- middleware: body size + auth + invalid path ---
+
+@pytest.mark.asyncio
+async def test_oversized_body_is_rejected(proxy_app, monkeypatch):
+    monkeypatch.setenv("MAX_BODY_BYTES", "100")
+    # Reload config so the new env var takes effect
+    import importlib
+    import config
+    importlib.reload(config)
+
+    app, _calls, _ = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"default": [{"provider": "a"}]},
+        },
+        lambda r: _ok_response(),
+    )
+    big_body = {"messages": [{"role": "user", "content": "x" * 500}]}
+    resp = await _post(app, big_body)
+    assert resp.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_api_key_required_when_configured(proxy_app, monkeypatch):
+    monkeypatch.setenv("API_KEY", "secret-proxy-key")
+    import importlib
+    import config
+    importlib.reload(config)
+
+    app, _calls, _ = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"default": [{"provider": "a"}]},
+        },
+        lambda r: _ok_response(),
+    )
+    # No auth header → 401
+    no_auth = await _post(app, {"messages": []})
+    assert no_auth.status_code == 401
+
+    # Wrong key → 401
+    wrong = await _post(app, {"messages": []}, headers={"Authorization": "Bearer wrong"})
+    assert wrong.status_code == 401
+
+    # Correct key → 200
+    ok = await _post(app, {"messages": []}, headers={"Authorization": "Bearer secret-proxy-key"})
+    assert ok.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_path_traversal_rejected(proxy_app):
+    app, _calls, _ = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"default": [{"provider": "a"}]},
+        },
+        lambda r: _ok_response(),
+    )
+    resp = await _post(app, {"messages": []}, path="/v1/..%2Fsecret")
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_unknown_model_returns_404_when_no_default_group(proxy_app):
+    app, _calls, _ = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"only-this-model": [{"provider": "a", "model": "m"}]},
+        },
+        lambda r: _ok_response(),
+    )
+    resp = await _post(app, {"model": "something-else", "messages": []})
+    assert resp.status_code == 404
+
+
+# --- :fastest race path ---
+
+@pytest.mark.asyncio
+async def test_fastest_race_winner_routes_response(proxy_app):
+    """Race picks the first responder. b is faster → its response is what the client gets."""
+    async def handler(req):
+        if req.url.host == "a.test":
+            await asyncio.sleep(0.05)
+            return _ok_response({"who": "a"})
+        return _ok_response({"who": "b"})
+
+    app, calls, _ = proxy_app(
+        {
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k"},
+                "b": {"base_url": "https://b.test", "api_key": "k"},
+            },
+            "groups": {"fast": [{"provider": "a", "model": "ma"}, {"provider": "b", "model": "mb"}]},
+        },
+        handler,
+    )
+    resp = await _post(app, {"model": "fast:fastest", "messages": []})
+    assert resp.status_code == 200
+    assert resp.json()["who"] == "b"
+    # Both endpoints were called (race)
+    assert {c[0] for c in calls} == {"https://a.test", "https://b.test"}
+
+
+@pytest.mark.asyncio
+async def test_fastest_falls_back_to_sequential_when_race_fails(proxy_app):
+    """When all race candidates fail, the proxy retries them sequentially (cooloff=0 here so they stay eligible)."""
+    state = {"race_done": False}
+
+    def handler(req):
+        if not state["race_done"]:
+            return httpx.Response(503)
+        return _ok_response()
+
+    app, calls, _ = proxy_app(
+        {
+            "settings": {"cooloff_seconds": 0},
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k"},
+                "b": {"base_url": "https://b.test", "api_key": "k"},
+            },
+            "groups": {"fast": [{"provider": "a", "model": "ma"}, {"provider": "b", "model": "mb"}]},
+        },
+        handler,
+    )
+    # All upstreams 503 → both race and sequential fall through → 502
+    resp = await _post(app, {"model": "fast:fastest", "messages": []})
+    assert resp.status_code == 502
+    # Both endpoints were tried at least once during the race AND again during sequential
+    # fallback (cooloff=0 means they're not skipped on the second pass).
+    assert len(calls) >= 4
+
+
+@pytest.mark.asyncio
+async def test_fastest_with_single_candidate_skips_race(proxy_app):
+    """With only one (model, base_url) key, there's no one to race against — route directly."""
+    def handler(req):
+        return _ok_response()
+
+    app, calls, _ = proxy_app(
+        {
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k"},
+            },
+            "groups": {"only": [{"provider": "a", "model": "ma"}]},
+        },
+        handler,
+    )
+    resp = await _post(app, {"model": "only:fastest", "messages": []})
+    assert resp.status_code == 200
+    assert len(calls) == 1
+
+
+# --- reasoning strip ---
+
+@pytest.mark.asyncio
+async def test_reasoning_stripped_from_messages_by_default(proxy_app):
+    def handler(req):
+        return _ok_response()
+
+    app, calls, _ = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"default": [{"provider": "a", "model": "m"}]},
+        },
+        handler,
+    )
+    await _post(app, {
+        "messages": [{"role": "assistant", "content": "x", "reasoning": "secret", "thinking": "also"}],
+    })
+    sent_msg = calls[0][1]["messages"][0]
+    assert "reasoning" not in sent_msg
+    assert "thinking" not in sent_msg
+
+
+@pytest.mark.asyncio
+async def test_invalid_json_body_returns_400(proxy_app):
+    app, _calls, _ = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"default": [{"provider": "a"}]},
+        },
+        lambda r: _ok_response(),
+    )
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        resp = await c.post("/v1/chat/completions", content=b"{not json")
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_models_endpoint_requires_auth_when_api_key_set(proxy_app, monkeypatch):
+    monkeypatch.setenv("API_KEY", "secret-proxy-key")
+    import importlib
+    import config
+    importlib.reload(config)
+
+    app, _calls, _ = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {
+                "default": [{"provider": "a"}],
+                "fast": [{"provider": "a", "model": "m"}],
+            },
+        },
+        lambda r: _ok_response(),
+    )
+    no_auth = await _get(app, "/v1/models")
+    assert no_auth.status_code == 401
+
+    ok = await _get(app, "/v1/models", headers={"Authorization": "Bearer secret-proxy-key"})
+    assert ok.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_reasoning_kept_with_flag(proxy_app):
+    def handler(req):
+        return _ok_response()
+
+    app, calls, _ = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"default": [{"provider": "a", "model": "m", "flags": ["keep_reasoning"]}]},
+        },
+        handler,
+    )
+    await _post(app, {
+        "messages": [{"role": "assistant", "content": "x", "reasoning": "kept"}],
+    })
+    assert calls[0][1]["messages"][0]["reasoning"] == "kept"
