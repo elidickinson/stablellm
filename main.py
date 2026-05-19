@@ -83,15 +83,17 @@ _SUFFIX_MODES: dict[str, str] = {
 
 
 def _parse_model_suffix(model: str) -> tuple[str, str | None]:
-    """Strip a single mode suffix. Returns (stripped, override_mode).
+    """Strip a single mode suffix (case-insensitive). Returns (stripped, override_mode).
 
     Recognized suffixes: :race / :fastest (race), :seq / :normal (seq).
-    Raises ValueError if more than one suffix is present.
+    Raises ValueError if more than one suffix is present. The returned stem
+    preserves the original case of the model so it can be passed upstream as-is.
     """
+    model_lc = model.lower()
     for suffix, mode in _SUFFIX_MODES.items():
-        if model.endswith(suffix):
-            stem = model.removesuffix(suffix)
-            if any(stem.endswith(s) for s in _SUFFIX_MODES):
+        if model_lc.endswith(suffix):
+            stem = model[:-len(suffix)]
+            if any(stem.lower().endswith(s) for s in _SUFFIX_MODES):
                 raise ValueError(f"multiple mode suffixes on model '{model}'")
             return stem, mode
     return model, None
@@ -781,7 +783,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         if mode_override is not None:
             body_dict = {**body_dict, "model": model}
 
-        group_name = model if model in config.GROUPS else "default"
+        group_name = model.lower() if model.lower() in config.GROUPS else "default"
     else:
         body_dict = None
         group_name = "default"

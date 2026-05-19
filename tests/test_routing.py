@@ -136,8 +136,24 @@ async def test_mode_suffix_is_stripped_before_group_lookup(app_with_endpoints):
 
 
 @pytest.mark.asyncio
-async def test_group_name_matches_exactly_no_normalization(app_with_endpoints):
-    """Group names are plain strings — 'gpt-4.1' only matches 'gpt-4.1', not 'gpt_4_1'."""
+async def test_group_name_matching_is_case_insensitive(app_with_endpoints):
+    """A group declared as 'GPT-4o' matches whether the client sends 'gpt-4o' or 'GPT-4O'."""
+    app, calls = app_with_endpoints({
+        "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+        "groups": {
+            "default": {"endpoints": [{"provider": "a", "model": "fallback"}]},
+            "GPT-4o": {"endpoints": [{"provider": "a", "model": "model-a"}]},
+        },
+    })
+    for client_model in ("gpt-4o", "GPT-4O", "Gpt-4O"):
+        resp = await _post(app, {"model": client_model, "messages": []})
+        assert resp.status_code == 200
+        assert calls[-1][1]["model"] == "model-a"
+
+
+@pytest.mark.asyncio
+async def test_group_name_separators_are_not_normalized(app_with_endpoints):
+    """Only case is normalized — 'gpt-4.1' and 'gpt_4_1' remain distinct."""
     app, calls = app_with_endpoints({
         "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
         "groups": {
@@ -145,9 +161,9 @@ async def test_group_name_matches_exactly_no_normalization(app_with_endpoints):
             "gpt-4.1": {"endpoints": [{"provider": "a", "model": "model-a"}]},
         },
     })
-    resp = await _post(app, {"model": "gpt-4.1", "messages": []})
+    resp = await _post(app, {"model": "gpt_4_1", "messages": []})
     assert resp.status_code == 200
-    assert calls[0][1]["model"] == "model-a"
+    assert calls[0][1]["model"] == "fallback"  # didn't match gpt-4.1
 
 
 @pytest.mark.asyncio

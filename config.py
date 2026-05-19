@@ -164,7 +164,10 @@ def _parse_groups(raw: object, providers: dict[str, Provider]) -> tuple[dict[str
             ))
             indices.append(len(endpoints) - 1)
 
-        groups[str(group_name)] = Group(endpoints=indices, mode=mode)
+        name_lower = str(group_name).lower()
+        if name_lower in groups:
+            raise ConfigError(f"duplicate group name (case-insensitive): '{group_name}'")
+        groups[name_lower] = Group(endpoints=indices, mode=mode)
 
     if not groups:
         raise ConfigError("at least one group is required")

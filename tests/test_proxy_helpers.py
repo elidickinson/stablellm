@@ -83,6 +83,13 @@ def test_parse_model_suffix_double_suffix_raises(main_module):
         main_module._parse_model_suffix("cheap:fastest:normal")
 
 
+def test_parse_model_suffix_is_case_insensitive(main_module):
+    """Match suffixes regardless of case; stem keeps its original case."""
+    assert main_module._parse_model_suffix("GPT-4o:RACE") == ("GPT-4o", "race")
+    assert main_module._parse_model_suffix("GPT-4o:Fastest") == ("GPT-4o", "race")
+    assert main_module._parse_model_suffix("GPT-4o:Seq") == ("GPT-4o", "seq")
+
+
 def test_parse_model_suffix_colon_in_name_not_a_suffix(main_module):
     """A model name like 'hf:foo/bar' must not be treated as a suffixed name."""
     assert main_module._parse_model_suffix("hf:foo/bar") == ("hf:foo/bar", None)

@@ -51,18 +51,28 @@ def test_group_routes_endpoints_in_order(make_config):
     assert len(cfg.ENDPOINTS) == 2
 
 
-def test_group_name_is_plain_string_no_normalization(make_config):
-    """Group names match request models directly — no case/separator munging."""
+def test_group_names_stored_lowercased(make_config):
+    """Group names are normalized to lowercase at parse time."""
     cfg = make_config({
         "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
         "groups": {
             "default": _group([{"provider": "a"}]),
-            "gpt-4.1": _group([{"provider": "a", "model": "gpt-4.1"}]),
+            "GPT-4.1": _group([{"provider": "a", "model": "gpt-4.1"}]),
         },
     })
     assert "gpt-4.1" in cfg.GROUPS
-    assert "gpt_4_1" not in cfg.GROUPS
-    assert "GPT-4.1" not in cfg.GROUPS
+    assert "GPT-4.1" not in cfg.GROUPS  # stored lowercased
+
+
+def test_duplicate_group_names_case_insensitive_is_error():
+    with pytest.raises(ConfigError, match="duplicate group name"):
+        parse_config({
+            "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
+            "groups": {
+                "cheap": _group([{"provider": "a"}]),
+                "Cheap": _group([{"provider": "a"}]),
+            },
+        })
 
 
 def test_unknown_provider_in_group_is_config_error():
