@@ -5,7 +5,6 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 WORKDIR /app
 
 RUN adduser --disabled-password --no-create-home app
-RUN chown app:app /app
 
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-cache-dir

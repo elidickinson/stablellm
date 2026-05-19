@@ -18,6 +18,7 @@ Two files. Bind-time settings live in `.env` (changing them requires a restart).
 | `CONFIG_FILE` | `config.yaml` | Path to the YAML config |
 | `MAX_BODY_BYTES` | `52428800` (50MB) | Max inbound request body size |
 | `CONFIG_EDITOR_PASSWORD` | *(none)* | If set, enables the web config editor at `/config/editor` |
+| `REQUEST_LOG_DB` | *(none)* | If set, SQLite request-logging is enabled at the given path |
 
 API keys for upstream providers are set as individual vars here and referenced from YAML via `${VAR}` interpolation (e.g. `OPENAI_API_KEY`).
 

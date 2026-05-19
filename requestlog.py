@@ -3,11 +3,14 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from config import REQUEST_LOG_DB
 
-DB_PATH = Path("data/requests.db")
+DB_PATH = Path(REQUEST_LOG_DB) if REQUEST_LOG_DB else None
 
 
 def init():
+    if DB_PATH is None:
+        return
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -37,6 +40,8 @@ class RequestMetrics:
 
 
 def log_request(m: RequestMetrics):
+    if DB_PATH is None:
+        return
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         "INSERT INTO requests (timestamp, api_key_id, model_requested, provider_served, model_served, ttft_ms, tokens_per_sec) "

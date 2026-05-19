@@ -50,6 +50,7 @@ API_KEY = os.getenv("API_KEY", "")
 CONFIG_FILE = os.getenv("CONFIG_FILE", "config.yaml")
 CONFIG_EDITOR_PASSWORD = os.getenv("CONFIG_EDITOR_PASSWORD", "")
 MAX_BODY_BYTES = int(os.getenv("MAX_BODY_BYTES", str(50 * 1024 * 1024)))
+REQUEST_LOG_DB = os.getenv("REQUEST_LOG_DB", "")
 
 # --- Reloadable state (updated atomically by apply_config) ---
 ENDPOINTS: list[Endpoint] = []
