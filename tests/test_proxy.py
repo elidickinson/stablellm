@@ -114,6 +114,34 @@ async def test_4xx_also_triggers_failover(proxy_app):
 
 
 @pytest.mark.asyncio
+async def test_upstream_error_log_includes_request_context_and_body(proxy_app, capsys):
+    def handler(req):
+        if req.url.host == "a.test":
+            return httpx.Response(400, json={"error": {"message": "bad model"}})
+        return _ok_response()
+
+    app, _, _ = proxy_app(
+        {
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k", "model": "upstream-a"},
+                "b": {"base_url": "https://b.test", "api_key": "k"},
+            },
+            "groups": {"default": {"endpoints": [{"provider": "a"}, {"provider": "b"}]}},
+        },
+        handler,
+    )
+    resp = await _post(app, {"model": "default", "messages": [{"role": "user", "content": "x"}]})
+    assert resp.status_code == 200
+
+    logged = capsys.readouterr().err
+    assert "path=/v1/chat/completions" in logged
+    assert "requested_model='default'" in logged
+    assert "upstream_model='upstream-a'" in logged
+    assert "messages=1" in logged
+    assert "bad model" in logged
+
+
+@pytest.mark.asyncio
 async def test_all_endpoints_failing_returns_502(proxy_app):
     def handler(req):
         return httpx.Response(500, json={"error": "boom"})

@@ -160,12 +160,68 @@ def _is_available(idx: int) -> bool:
     return time.monotonic() >= _cooloff_until.get(idx, 0)
 
 
-def _mark_down(idx: int, reason: str):
+def _mark_down(idx: int, reason: str, request_context: str = ""):
     cooloff = config.SETTINGS.cooloff_seconds
     _cooloff_until[idx] = time.monotonic() + cooloff
     _stats["failures"][idx] += 1
     ep = config.ENDPOINTS[idx]
-    log.warning("endpoint %s marked down for %ss: %s", ep.base_url, cooloff, reason)
+    context = f" ({request_context})" if request_context else ""
+    log.warning("endpoint %s marked down for %ss%s: %s", ep.base_url, cooloff, context, reason)
+
+
+class UpstreamError(Exception):
+    pass
+
+
+def _exception_detail(exc: BaseException) -> str:
+    msg = str(exc)
+    if isinstance(exc, UpstreamError) and msg:
+        return msg
+    if msg:
+        return f"{type(exc).__name__}: {msg}"
+    return type(exc).__name__
+
+
+def _body_snippet(content: bytes, limit: int = 1000) -> str:
+    if not content:
+        return ""
+    try:
+        obj = json.loads(content)
+        text = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        text = content.decode(errors="replace").strip()
+    if len(text) > limit:
+        return f"{text[:limit]}..."
+    return text
+
+
+async def _http_error_reason(resp: httpx.Response) -> str:
+    content = await resp.aread()
+    detail = _body_snippet(content)
+    reason = f"HTTP {resp.status_code}"
+    if resp.reason_phrase:
+        reason = f"{reason} {resp.reason_phrase}"
+    if detail:
+        return f"{reason}: {detail}"
+    return reason
+
+
+def _request_context(path: str, body: dict, group: str = "", ep: Endpoint | None = None) -> str:
+    parts = [f"path=/v1/{path}"]
+    if group:
+        parts.append(f"group={group!r}")
+    client_model = body.get("model", "")
+    if client_model:
+        parts.append(f"requested_model={client_model!r}")
+    if ep is not None:
+        parts.append(f"upstream_model={_effective_model(ep, client_model)!r}")
+    parts.append(f"stream={bool(body.get('stream', False))}")
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        parts.append(f"messages={len(messages)}")
+    keys = sorted(k for k in body if k != "messages")
+    parts.append(f"keys={keys}")
+    return " ".join(parts)
 
 
 def _check_auth(authorization: str | None) -> JSONResponse | None:
@@ -199,7 +255,7 @@ def _extract_usage_from_sse(buffer: bytearray, chunk: bytes) -> int | None:
     return None
 
 
-async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, metrics):
+async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, metrics, request_context: str):
     """Stream response from upstream. Returns (StreamingResponse, None) or (None, reason)."""
     url = f"{ep.base_url}/{path}"
     t0 = time.monotonic()
@@ -209,8 +265,10 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
 
     try:
         if resp.status_code != 200:
+            reason = await _http_error_reason(resp)
             await resp.aclose()
-            return None, f"HTTP {resp.status_code}"
+            log.warning("upstream rejected streaming request to %s (%s): %s", ep.base_url, request_context, reason)
+            return None, reason
 
         async def generate():
             first = True
@@ -240,7 +298,7 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
         raise
 
 
-async def _proxy_buffered(ep: Endpoint, path: str, headers: dict, body: bytes, metrics):
+async def _proxy_buffered(ep: Endpoint, path: str, headers: dict, body: bytes, metrics, request_context: str):
     """Non-streaming: send request, return full response or (None, reason)."""
     url = f"{ep.base_url}/{path}"
     t0 = time.monotonic()
@@ -248,12 +306,19 @@ async def _proxy_buffered(ep: Endpoint, path: str, headers: dict, body: bytes, m
     elapsed = time.monotonic() - t0
 
     if resp.status_code != 200:
-        return None, f"HTTP {resp.status_code}"
+        reason = await _http_error_reason(resp)
+        log.warning("upstream rejected buffered request to %s (%s): %s", ep.base_url, request_context, reason)
+        return None, reason
 
     try:
         data = resp.json()
-    except Exception:
-        return None, "invalid JSON"
+    except Exception as exc:
+        reason = f"invalid JSON: {_exception_detail(exc)}"
+        detail = _body_snippet(resp.content)
+        if detail:
+            reason = f"{reason}: {detail}"
+        log.warning("upstream returned invalid JSON from %s (%s): %s", ep.base_url, request_context, reason)
+        return None, reason
 
     metrics.ttft_ms = elapsed * 1000
     usage = data.get("usage")
@@ -362,7 +427,11 @@ def _finish_race(race_times: dict[tuple[str, str], float], group: str):
         if k not in race_times:
             new_order.append(k)
     _group_preferred_providers[group] = new_order
-    log.info("race complete (group=%s): %s", group, [(k[1], f"{v:.1f}s") for k, v in sorted(race_times.items(), key=lambda x: x[1])])
+    log.info(
+        "race complete (group=%s): %s",
+        group,
+        [(f"{k[1]} model={k[0]}", f"{v:.1f}s") for k, v in sorted(race_times.items(), key=lambda x: x[1])],
+    )
 
 
 async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: str):
@@ -386,7 +455,13 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
     _group_race_generation[group] += 1
     gen = _group_race_generation[group]
 
-    log.info("race: starting with %d providers: %s", len(candidates), [pk[1] for pk, _ in candidates])
+    race_context = _request_context(path, body_dict, group)
+    log.info(
+        "race: starting with %d providers (%s): %s",
+        len(candidates),
+        race_context,
+        [f"{pk[1]} model={_effective_model(config.ENDPOINTS[idx], body_dict.get('model', ''))}" for pk, idx in candidates],
+    )
 
     race_times: dict[tuple[str, str], float] = {}
     race_start = time.monotonic()
@@ -409,8 +484,9 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         req = http_client.build_request("POST", url, headers=headers, content=send_body)
         resp = await http_client.send(req, stream=True)
         if resp.status_code != 200:
+            reason = await _http_error_reason(resp)
             await resp.aclose()
-            raise Exception(f"HTTP {resp.status_code}")
+            raise UpstreamError(reason)
         return pk, idx, resp
 
     tasks = {asyncio.create_task(_send(pk, idx)): (pk, idx) for pk, idx in candidates}
@@ -431,7 +507,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                     losers_to_drain.append((rpk, resp))
             except Exception as exc:
                 race_state["failures"] += 1
-                _mark_down(idx, str(exc))
+                _mark_down(idx, _exception_detail(exc), _request_context(path, body_dict, group, config.ENDPOINTS[idx]))
 
     if winner is None:
         for t in pending:
@@ -465,7 +541,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         except Exception as exc:
             race_state["failures"] += 1
             if idx is not None:
-                _mark_down(idx, str(exc))
+                _mark_down(idx, _exception_detail(exc), _request_context(path, body_dict, group, config.ENDPOINTS[idx]))
         _maybe_finalize()
 
     async def _await_and_drain(task, pk, idx):
@@ -473,7 +549,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
             _, _, resp = await task
         except Exception as exc:
             race_state["failures"] += 1
-            _mark_down(idx, str(exc))
+            _mark_down(idx, _exception_detail(exc), _request_context(path, body_dict, group, config.ENDPOINTS[idx]))
             _maybe_finalize()
             return
         await _drain(pk, resp, idx)
@@ -524,9 +600,15 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
             await win_resp.aclose()
             race_times[win_pk] = time.monotonic() - race_start
             _maybe_finalize()
+        response_body = b"".join(chunks)
         try:
-            data = json.loads(b"".join(chunks))
-        except Exception:
+            data = json.loads(response_body)
+        except Exception as exc:
+            reason = f"invalid JSON from race winner: {_exception_detail(exc)}"
+            detail = _body_snippet(response_body)
+            if detail:
+                reason = f"{reason}: {detail}"
+            log.error("upstream returned invalid JSON from race winner %s (%s): %s", ep.base_url, race_context, reason)
             return JSONResponse({"error": "upstream returned invalid JSON"}, status_code=502)
         elapsed = time.monotonic() - race_start
         race_metrics.ttft_ms = elapsed * 1000
@@ -793,7 +875,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
 
     group_name = model.lower()
     if group_name not in config.GROUPS:
-        log.warning("unknown model: %r", model)
+        log.warning("unknown model for /v1/%s: requested_model=%r available=%s", path, model, sorted(config.GROUPS))
         return JSONResponse({"error": f"unknown model: '{model}'"}, status_code=404)
 
     mode = mode_override or config.GROUPS[group_name].mode
@@ -810,7 +892,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             result = await _race_request(path, body_dict, is_streaming, group_name)
             if result is not None:
                 return result
-            log.warning("race failed (group=%s), falling back to sequential", group_name)
+            log.warning("race failed (%s), falling back to sequential", _request_context(path, body_dict, group_name))
 
         pref = _group_preferred_providers[group_name]
         pg = _group_provider_groups[group_name]
@@ -842,6 +924,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
 
         client_model = body_dict.get("model", "")
         model_name = _effective_model(ep, client_model)
+        request_context = _request_context(path, body_dict, group_name, ep)
         metrics = requestlog.RequestMetrics(
             model_requested=client_model,
             provider_served=ep.base_url,
@@ -850,9 +933,9 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
 
         try:
             if is_streaming:
-                result, reason = await _proxy_stream(ep, path, headers, send_body, metrics)
+                result, reason = await _proxy_stream(ep, path, headers, send_body, metrics, request_context)
             else:
-                result, reason = await _proxy_buffered(ep, path, headers, send_body, metrics)
+                result, reason = await _proxy_buffered(ep, path, headers, send_body, metrics, request_context)
 
             if result is not None:
                 _stats["successes"][idx] += 1
@@ -862,14 +945,15 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
                     _last_endpoint_idx = idx
                 return result
 
-            _mark_down(idx, reason)
+            _mark_down(idx, reason, request_context)
             last_failure = reason
 
         except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
-            _mark_down(idx, str(exc))
-            last_failure = type(exc).__name__
+            reason = _exception_detail(exc)
+            _mark_down(idx, reason, request_context)
+            last_failure = reason
 
-    log.error("all endpoints failed (exhausted) for /v1/%s (last: %s)", path, last_failure)
+    log.error("all endpoints failed (exhausted) for %s (last: %s)", _request_context(path, body_dict, group_name), last_failure)
     return JSONResponse(
         {"error": f"all endpoints exhausted (last: {last_failure})"},
         status_code=502,
