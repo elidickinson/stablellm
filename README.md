@@ -86,6 +86,19 @@ The request's `model` field selects the group. Within that group, the routing mo
 
 The client can override a group's mode with a `:race` or `:seq` suffix on the model name (e.g. `glm-4.7:race`).
 
+## Response metadata
+
+Every proxied response includes headers telling the client which upstream actually served the request:
+
+| Header | Example | Description |
+|---|---|---|
+| `X-StableLLM-Provider` | `cerebras` | Provider name from config |
+| `X-StableLLM-Model` | `zai-glm-4.7` | Model sent upstream (may differ from requested) |
+| `X-StableLLM-Mode` | `race` | Routing mode used (`seq` or `race`) |
+| `X-StableLLM-Group` | `glm-4.7` | Group the request resolved to |
+
+Headers are present on both streaming and non-streaming responses. They are exposed via CORS so browser clients can read them.
+
 **Unknown request parameters** (not in the supported set) are silently stripped per-endpoint before forwarding. This lets providers with different capabilities share the same request body.
 
 ## Inspect

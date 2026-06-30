@@ -140,6 +140,12 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=[
+        "X-StableLLM-Provider",
+        "X-StableLLM-Model",
+        "X-StableLLM-Mode",
+        "X-StableLLM-Group",
+    ],
 )
 
 
@@ -348,6 +354,13 @@ def _streaming_response(resp: httpx.Response, generator) -> StreamingResponse:
         headers=forward_headers,
         media_type=resp.headers.get("content-type", "text/event-stream"),
     )
+
+
+def _set_meta_headers(response, *, provider: str, model: str, mode: str, group: str):
+    response.headers["X-StableLLM-Provider"] = provider
+    response.headers["X-StableLLM-Model"] = model
+    response.headers["X-StableLLM-Mode"] = mode
+    response.headers["X-StableLLM-Group"] = group
 
 
 # Only pass these known-supported params to upstream
@@ -590,7 +603,9 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                 _maybe_finalize()
                 await asyncio.to_thread(requestlog.log_request, race_metrics)
 
-        return _streaming_response(win_resp, generate())
+        result = _streaming_response(win_resp, generate())
+        _set_meta_headers(result, provider=ep.provider, model=model_name, mode=config.MODE_RACE, group=group)
+        return result
     else:
         chunks = []
         try:
@@ -618,7 +633,9 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
             if ct is not None:
                 race_metrics.tokens_per_sec = ct / elapsed
         await asyncio.to_thread(requestlog.log_request, race_metrics)
-        return JSONResponse(content=data, status_code=win_resp.status_code)
+        result = JSONResponse(content=data, status_code=win_resp.status_code)
+        _set_meta_headers(result, provider=ep.provider, model=model_name, mode=config.MODE_RACE, group=group)
+        return result
 
 
 @app.get("/health")
@@ -943,6 +960,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
                 if _last_endpoint_idx != idx:
                     log.info("using endpoint: %s (model: %s)", ep.base_url, model_name)
                     _last_endpoint_idx = idx
+                _set_meta_headers(result, provider=ep.provider, model=model_name, mode=mode, group=group_name)
                 return result
 
             _mark_down(idx, reason, request_context)

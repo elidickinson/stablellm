@@ -492,6 +492,84 @@ async def test_race_with_single_candidate_skips_race(proxy_app):
     assert len(calls) == 1
 
 
+# --- response metadata headers ---
+
+
+@pytest.mark.asyncio
+async def test_meta_headers_on_buffered_response(proxy_app):
+    app, _, _ = proxy_app(
+        {
+            "providers": {"openai": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"mygroup": {"endpoints": [{"provider": "openai", "model": "gpt-4"}]}},
+        },
+        lambda r: _ok_response(),
+    )
+    resp = await _post(app, {"model": "mygroup", "messages": []})
+    assert resp.status_code == 200
+    assert resp.headers["x-stablellm-provider"] == "openai"
+    assert resp.headers["x-stablellm-model"] == "gpt-4"
+    assert resp.headers["x-stablellm-mode"] == "seq"
+    assert resp.headers["x-stablellm-group"] == "mygroup"
+
+
+@pytest.mark.asyncio
+async def test_meta_headers_on_streaming_response(proxy_app):
+    sse_body = (
+        b'data: {"choices":[{"delta":{"content":"hi"}}],"usage":{"completion_tokens":1}}\n\n'
+        b"data: [DONE]\n\n"
+    )
+
+    def handler(req):
+        return httpx.Response(200, content=sse_body, headers={"content-type": "text/event-stream"})
+
+    app, _, _ = proxy_app(
+        {
+            "providers": {"cerebras": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"mygroup": {"endpoints": [{"provider": "cerebras", "model": "fast-m"}]}},
+        },
+        handler,
+    )
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        async with c.stream("POST", "/v1/chat/completions", json={"model": "mygroup", "stream": True, "messages": []}) as resp:
+            assert resp.headers["x-stablellm-provider"] == "cerebras"
+            assert resp.headers["x-stablellm-model"] == "fast-m"
+            assert resp.headers["x-stablellm-mode"] == "seq"
+            _ = [chunk async for chunk in resp.aiter_bytes()]
+
+
+@pytest.mark.asyncio
+async def test_meta_headers_on_race_response(proxy_app):
+    app, _, _ = proxy_app(_TWO_PROVIDER_RACE_CFG, _race_winner_handler)
+    resp = await _post(app, {"model": "fast:race", "messages": []})
+    assert resp.status_code == 200
+    assert resp.headers["x-stablellm-provider"] == "b"
+    assert resp.headers["x-stablellm-model"] == "mb"
+    assert resp.headers["x-stablellm-mode"] == "race"
+    assert resp.headers["x-stablellm-group"] == "fast"
+
+
+@pytest.mark.asyncio
+async def test_meta_headers_after_failover(proxy_app):
+    def handler(req):
+        if req.url.host == "a.test":
+            return httpx.Response(503)
+        return _ok_response()
+
+    app, _, _ = proxy_app(
+        {
+            "providers": {
+                "bad": {"base_url": "https://a.test", "api_key": "k"},
+                "good": {"base_url": "https://b.test", "api_key": "k"},
+            },
+            "groups": {"g": {"endpoints": [{"provider": "bad"}, {"provider": "good"}]}},
+        },
+        handler,
+    )
+    resp = await _post(app, {"model": "g", "messages": []})
+    assert resp.status_code == 200
+    assert resp.headers["x-stablellm-provider"] == "good"
+
+
 # --- reasoning strip ---
 
 @pytest.mark.asyncio

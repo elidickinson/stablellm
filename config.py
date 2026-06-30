@@ -27,6 +27,7 @@ class Endpoint:
     api_key: str
     model: str = ""  # empty → pass through client's model
     keep_reasoning: bool = False
+    provider: str = ""
 
 
 MODE_SEQ = "seq"
@@ -161,6 +162,7 @@ def _parse_groups(raw: object, providers: dict[str, Provider]) -> tuple[dict[str
                 api_key=prov.api_key,
                 model=str(entry.get("model", prov.model)),
                 keep_reasoning="keep_reasoning" in flags,
+                provider=prov_lower,
             ))
             indices.append(len(endpoints) - 1)
 
