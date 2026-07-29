@@ -6,7 +6,7 @@ import posixpath
 import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 import httpx
 import yaml
@@ -145,6 +145,7 @@ app.add_middleware(
         "X-StableLLM-Model",
         "X-StableLLM-Mode",
         "X-StableLLM-Group",
+        "X-StableLLM-Via",
     ],
 )
 
@@ -276,18 +277,45 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
             log.warning("upstream rejected streaming request to %s (%s): %s", ep.base_url, request_context, reason)
             return None, reason
 
+        # Prime upstream chunks until we see the serving sub-provider (OpenRouter
+        # tags every data chunk with top-level `provider`, but may first send
+        # `: OPENROUTER PROCESSING` keepalive comments) so we can set the
+        # X-StableLLM-Via header before response headers are committed.
+        want_via = _openrouter_via(ep)
+        byte_iter = resp.aiter_bytes()
+        primed: list[bytes] = []
+        via = None
+        if want_via:
+            try:
+                while len(primed) < 8:
+                    chunk = await byte_iter.__anext__()
+                    if metrics.ttft_ms is None:
+                        metrics.ttft_ms = (time.monotonic() - t0) * 1000
+                        log.info("%s TTFT %.0fms (TTFB %.0fms)", ep.base_url, metrics.ttft_ms, ttfb * 1000)
+                    primed.append(chunk)
+                    via = _provider_from_sse(chunk)
+                    if via:
+                        break
+            except StopAsyncIteration:
+                pass
+
         async def generate():
-            first = True
             t_first = None
             completion_tokens = None
             sse_buf = bytearray()
             try:
-                async for chunk in resp.aiter_bytes():
-                    if first:
+                for chunk in primed:
+                    ct = _extract_usage_from_sse(sse_buf, chunk)
+                    if ct is not None:
+                        completion_tokens = ct
+                    if t_first is None:
+                        t_first = time.monotonic()
+                    yield chunk
+                async for chunk in byte_iter:
+                    if t_first is None:
                         t_first = time.monotonic()
                         metrics.ttft_ms = (t_first - t0) * 1000
                         log.info("%s TTFT %.0fms (TTFB %.0fms)", ep.base_url, metrics.ttft_ms, ttfb * 1000)
-                        first = False
                     ct = _extract_usage_from_sse(sse_buf, chunk)
                     if ct is not None:
                         completion_tokens = ct
@@ -298,7 +326,10 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
                 await resp.aclose()
                 await asyncio.to_thread(requestlog.log_request, metrics)
 
-        return _streaming_response(resp, generate()), None
+        result = _streaming_response(resp, generate())
+        if via:
+            result.headers["X-StableLLM-Via"] = via
+        return result, None
     except BaseException:
         await resp.aclose()
         raise
@@ -335,8 +366,13 @@ async def _proxy_buffered(ep: Endpoint, path: str, headers: dict, body: bytes, m
 
     log.info("%s TTFB %.0fms", ep.base_url, elapsed * 1000)
 
+    via = _openrouter_served_provider(data) if _openrouter_via(ep) else None
+    result = JSONResponse(content=data, status_code=resp.status_code)
+    if via:
+        result.headers["X-StableLLM-Via"] = via
+
     await asyncio.to_thread(requestlog.log_request, metrics)
-    return JSONResponse(content=data, status_code=resp.status_code), None
+    return result, None
 
 
 def _build_upstream_headers(ep: Endpoint) -> dict:
@@ -344,6 +380,45 @@ def _build_upstream_headers(ep: Endpoint) -> dict:
         "Authorization": f"Bearer {ep.api_key}",
         "Content-Type": "application/json",
     }
+
+
+def _openrouter_via(ep: Endpoint) -> bool:
+    """True if the endpoint routes through OpenRouter, which tags every
+    response/chunk with the serving sub-provider in a top-level ``provider`` field."""
+    host = urlparse(ep.base_url).hostname or ""
+    return host == "openrouter.ai" or host.endswith(".openrouter.ai")
+
+
+def _openrouter_served_provider(data: object) -> str | None:
+    """Serving sub-provider from an OpenRouter response body / stream chunk
+    (top-level ``provider`` field), or None if absent."""
+    if not isinstance(data, dict):
+        return None
+    p = data.get("provider")
+    if not isinstance(p, str) or not p:
+        return None
+    # Header-unsafe control chars would break response encoding; strip to latin-1 safe.
+    return p if p.isascii() and "\r" not in p and "\n" not in p else None
+
+
+def _provider_from_sse(bytes_data: bytes) -> str | None:
+    """Scan an SSE payload for the first ``data: {...}`` chunk carrying a
+    top-level ``provider`` field (OpenRouter). Skips comment/keepalive lines."""
+    for line in bytes_data.split(b"\n"):
+        line = line.strip()
+        if not line.startswith(b"data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == b"[DONE]":
+            continue
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        via = _openrouter_served_provider(obj)
+        if via:
+            return via
+    return None
 
 
 def _streaming_response(resp: httpx.Response, generator) -> StreamingResponse:
@@ -356,11 +431,13 @@ def _streaming_response(resp: httpx.Response, generator) -> StreamingResponse:
     )
 
 
-def _set_meta_headers(response, *, provider: str, model: str, mode: str, group: str):
+def _set_meta_headers(response, *, provider: str, model: str, mode: str, group: str, via: str | None = None):
     response.headers["X-StableLLM-Provider"] = provider
     response.headers["X-StableLLM-Model"] = model
     response.headers["X-StableLLM-Mode"] = mode
     response.headers["X-StableLLM-Group"] = group
+    if via:
+        response.headers["X-StableLLM-Via"] = via
 
 
 # Only pass these known-supported params to upstream
@@ -532,7 +609,6 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
     model_name = _effective_model(ep, body_dict.get("model", ""))
     log.info("race: first response from %s (model: %s) %.0fms", win_pk[1], model_name, (time.monotonic() - race_start) * 1000)
     _stats["requests"][win_idx] += 1
-    _stats["successes"][win_idx] += 1
 
     global _last_endpoint_idx
     if _last_endpoint_idx != win_idx:
@@ -580,17 +656,50 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
 
     if is_streaming:
         t0_race = race_start
+        want_via = _openrouter_via(ep)
+        byte_iter = win_resp.aiter_bytes()
+        primed: list[bytes] = []
+        via = None
+        if want_via:
+            try:
+                while len(primed) < 8:
+                    chunk = await byte_iter.__anext__()
+                    if race_metrics.ttft_ms is None:
+                        race_metrics.ttft_ms = (time.monotonic() - t0_race) * 1000
+                    primed.append(chunk)
+                    via = _provider_from_sse(chunk)
+                    if via:
+                        break
+            except StopAsyncIteration:
+                pass
+            except BaseException as exc:
+                # Winner stalled mid-priming (transport error or client cancel).
+                # Close it and fail the race so the caller falls back to
+                # sequential rather than 500-ing the client / leaking the conn.
+                race_state["failures"] += 1
+                await win_resp.aclose()
+                _mark_down(win_idx, _exception_detail(exc), race_context)
+                _maybe_finalize()
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                return None
+
         async def generate():
-            first = True
             t_first = None
             completion_tokens = None
             sse_buf = bytearray()
             try:
-                async for chunk in win_resp.aiter_bytes():
-                    if first:
+                for chunk in primed:
+                    ct = _extract_usage_from_sse(sse_buf, chunk)
+                    if ct is not None:
+                        completion_tokens = ct
+                    if t_first is None:
+                        t_first = time.monotonic()
+                    yield chunk
+                async for chunk in byte_iter:
+                    if t_first is None:
                         t_first = time.monotonic()
                         race_metrics.ttft_ms = (t_first - t0_race) * 1000
-                        first = False
                     ct = _extract_usage_from_sse(sse_buf, chunk)
                     if ct is not None:
                         completion_tokens = ct
@@ -604,7 +713,8 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                 await asyncio.to_thread(requestlog.log_request, race_metrics)
 
         result = _streaming_response(win_resp, generate())
-        _set_meta_headers(result, provider=ep.provider, model=model_name, mode=config.MODE_RACE, group=group)
+        _stats["successes"][win_idx] += 1
+        _set_meta_headers(result, provider=ep.provider, model=model_name, mode=config.MODE_RACE, group=group, via=via)
         return result
     else:
         chunks = []
@@ -634,7 +744,9 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                 race_metrics.tokens_per_sec = ct / elapsed
         await asyncio.to_thread(requestlog.log_request, race_metrics)
         result = JSONResponse(content=data, status_code=win_resp.status_code)
-        _set_meta_headers(result, provider=ep.provider, model=model_name, mode=config.MODE_RACE, group=group)
+        via = _openrouter_served_provider(data) if _openrouter_via(ep) else None
+        _stats["successes"][win_idx] += 1
+        _set_meta_headers(result, provider=ep.provider, model=model_name, mode=config.MODE_RACE, group=group, via=via)
         return result
 
 
@@ -966,7 +1078,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             _mark_down(idx, reason, request_context)
             last_failure = reason
 
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
+        except httpx.TransportError as exc:
             reason = _exception_detail(exc)
             _mark_down(idx, reason, request_context)
             last_failure = reason

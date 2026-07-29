@@ -96,8 +96,11 @@ Every proxied response includes headers telling the client which upstream actual
 | `X-StableLLM-Model` | `zai-glm-4.7` | Model sent upstream (may differ from requested) |
 | `X-StableLLM-Mode` | `race` | Routing mode used (`seq` or `race`) |
 | `X-StableLLM-Group` | `glm-4.7` | Group the request resolved to |
+| `X-StableLLM-Via` | `OpenAI` | Sub-provider that served the request — only present when routing through OpenRouter (see below) |
 
 Headers are present on both streaming and non-streaming responses. They are exposed via CORS so browser clients can read them.
+
+**OpenRouter sub-provider (`X-StableLLM-Via`).** OpenRouter itself fans a request out to one of several underlying providers (e.g. `OpenAI`, `Azure`, `Cerebras`). It tags every response body / stream chunk with that choice in a top-level `provider` field. When an endpoint's `base_url` points at `openrouter.ai`, stablellm reads that field and surfaces it as `X-StableLLM-Via`, so `X-StableLLM-Provider: openrouter` + `X-StableLLM-Via: Cerebras` means the request went through OpenRouter and was served by Cerebras. Non-OpenRouter endpoints don't set this header. (On streaming responses, stablellm peeks at the leading chunks to extract it before headers are committed.)
 
 **Unknown request parameters** (not in the supported set) are silently stripped per-endpoint before forwarding. This lets providers with different capabilities share the same request body.
 

@@ -570,6 +570,99 @@ async def test_meta_headers_after_failover(proxy_app):
     assert resp.headers["x-stablellm-provider"] == "good"
 
 
+# --- X-StableLLM-Via (OpenRouter sub-provider) ---
+
+
+@pytest.mark.asyncio
+async def test_via_header_from_openrouter_buffered(proxy_app):
+    """OpenRouter upstreams tag the body with top-level `provider`; surface it."""
+    app, _, _ = proxy_app(
+        {
+            "providers": {"or": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"}},
+            "groups": {"g": {"endpoints": [{"provider": "or", "model": "openai/gpt-4o-mini"}]}},
+        },
+        lambda r: _ok_response({"provider": "OpenAI", "model": "openai/gpt-4o-mini"}),
+    )
+    resp = await _post(app, {"model": "g", "messages": []})
+    assert resp.status_code == 200
+    assert resp.headers["x-stablellm-via"] == "OpenAI"
+    # Upstream body passes through untouched (provider field preserved)
+    assert resp.json()["provider"] == "OpenAI"
+
+
+@pytest.mark.asyncio
+async def test_via_header_from_openrouter_streaming(proxy_app):
+    sse_body = (
+        b': OPENROUTER PROCESSING\n\n'
+        b'data: {"choices":[{"delta":{"content":"hi"}}],"provider":"Cerebras","model":"m"}\n\n'
+        b"data: [DONE]\n\n"
+    )
+
+    def handler(req):
+        return httpx.Response(200, content=sse_body, headers={"content-type": "text/event-stream"})
+
+    app, _, _ = proxy_app(
+        {
+            "providers": {"or": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"}},
+            "groups": {"g": {"endpoints": [{"provider": "or", "model": "m"}]}},
+        },
+        handler,
+    )
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        async with c.stream("POST", "/v1/chat/completions", json={"model": "g", "stream": True, "messages": []}) as resp:
+            assert resp.headers["x-stablellm-via"] == "Cerebras"
+            body = b"".join([chunk async for chunk in resp.aiter_bytes()])
+    # First-chunk priming must not corrupt the stream
+    assert b"hi" in body
+    assert b"[DONE]" in body
+
+
+@pytest.mark.asyncio
+async def test_no_via_header_for_non_openrouter(proxy_app):
+    """Non-OpenRouter upstreams don't carry a sub-provider; no via header."""
+    app, _, _ = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"g": {"endpoints": [{"provider": "a"}]}},
+        },
+        lambda r: _ok_response(),
+    )
+    resp = await _post(app, {"model": "g", "messages": []})
+    assert resp.status_code == 200
+    assert "x-stablellm-via" not in resp.headers
+
+
+@pytest.mark.asyncio
+async def test_via_header_from_openrouter_race_streaming(proxy_app):
+    """Race winner through OpenRouter: priming must read past the keepalive
+    comment to find the provider, and the winner's stream stays intact."""
+    def handler(req):
+        sse = (
+            b': OPENROUTER PROCESSING\n\n'
+            b'data: {"choices":[{"delta":{"content":"x"}}],"provider":"Azure","model":"m"}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        return httpx.Response(200, content=sse, headers={"content-type": "text/event-stream"})
+
+    cfg = {
+        "providers": {
+            "or1": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"},
+            "or2": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"},
+        },
+        "groups": {"fast": {"endpoints": [
+            {"provider": "or1", "model": "ma"},
+            {"provider": "or2", "model": "mb"},
+        ]}},
+    }
+    app, _, _ = proxy_app(cfg, handler)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        async with c.stream("POST", "/v1/chat/completions", json={"model": "fast:race", "stream": True, "messages": []}) as resp:
+            assert resp.status_code == 200
+            assert resp.headers["x-stablellm-via"] == "Azure"
+            body = b"".join([chunk async for chunk in resp.aiter_bytes()])
+    assert b"x" in body and b"[DONE]" in body
+
+
 # --- reasoning strip ---
 
 @pytest.mark.asyncio
