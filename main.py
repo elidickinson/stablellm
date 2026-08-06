@@ -6,17 +6,33 @@ import posixpath
 import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
+from decimal import Decimal
+from pathlib import Path
+from typing import ClassVar
 from urllib.parse import unquote, urlparse
 
 import httpx
 import yaml
 from fastapi import FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    StreamingResponse,
+)
 
 import config
 import requestlog
-from config import API_KEY, CONNECT_TIMEOUT, HOST, PORT, REQUEST_TIMEOUT, Endpoint
+from config import (
+    API_KEY,
+    CONNECT_TIMEOUT,
+    HOST,
+    PORT,
+    REQUEST_TIMEOUT,
+    Endpoint,
+    ModelMeta,
+)
 
 config.load_or_exit()
 
@@ -25,7 +41,7 @@ class _DokployFormatter(logging.Formatter):
     WARN/ERROR lines tag correctly instead of falling into 'success'.
     Ref: https://deepwiki.com/Dokploy/dokploy/11-monitoring-and-logging
     """
-    _PREFIX_BY_LEVEL = {
+    _PREFIX_BY_LEVEL: ClassVar[dict[int, str]] = {
         logging.WARNING: " [warning]",
         logging.ERROR: " [failed]",
     }
@@ -349,7 +365,7 @@ async def _proxy_buffered(ep: Endpoint, path: str, headers: dict, body: bytes, m
 
     try:
         data = resp.json()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - upstream garbage must degrade, not crash
         reason = f"invalid JSON: {_exception_detail(exc)}"
         detail = _body_snippet(resp.content)
         if detail:
@@ -473,6 +489,7 @@ SUPPORTED_PARAMS = {
     "modalities",
     "web_search_options",
     "user",
+    "reasoning",
     "reasoning_effort",
     "thinking",
     "clear_thinking",
@@ -505,9 +522,7 @@ def _should_race(group: str) -> bool:
         return True
     if count >= config.SETTINGS.race_interval_requests:
         return True
-    if time.monotonic() - last_time >= config.SETTINGS.race_interval_secs:
-        return True
-    return False
+    return time.monotonic() - last_time >= config.SETTINGS.race_interval_secs
 
 
 def _finish_race(race_times: dict[tuple[str, str], float], group: str):
@@ -595,7 +610,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                     winner = (rpk, ridx, resp)
                 else:
                     losers_to_drain.append((rpk, resp))
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - a failed racer must not abort the request
                 race_state["failures"] += 1
                 _mark_down(idx, _exception_detail(exc), _request_context(path, body_dict, group, config.ENDPOINTS[idx]))
 
@@ -627,7 +642,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                 pass
             await resp.aclose()
             race_times[pk] = time.monotonic() - race_start
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - drain failures are incidental
             race_state["failures"] += 1
             if idx is not None:
                 _mark_down(idx, _exception_detail(exc), _request_context(path, body_dict, group, config.ENDPOINTS[idx]))
@@ -636,7 +651,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
     async def _await_and_drain(task, pk, idx):
         try:
             _, _, resp = await task
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a failed racer must not abort the request
             race_state["failures"] += 1
             _mark_down(idx, _exception_detail(exc), _request_context(path, body_dict, group, config.ENDPOINTS[idx]))
             _maybe_finalize()
@@ -728,7 +743,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         response_body = b"".join(chunks)
         try:
             data = json.loads(response_body)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - upstream garbage must degrade, not crash
             reason = f"invalid JSON from race winner: {_exception_detail(exc)}"
             detail = _body_snippet(response_body)
             if detail:
@@ -755,6 +770,65 @@ async def health():
     return {"status": "ok"}
 
 
+def _usd_per_token(cost_per_million: float) -> str:
+    """Convert $/million-tokens config value to OpenRouter's $/token string.
+    Decimal-based so sub-$0.0001/M and high-precision costs aren't truncated."""
+    return format(Decimal(str(cost_per_million)).scaleb(-6).normalize(), "f")
+
+
+def _serialize_meta(meta: ModelMeta) -> dict:
+    """Render a ModelMeta into OpenRouter-compatible /v1/models fields.
+    Only present keys are emitted — unset values are omitted, not null."""
+    entry: dict = {}
+    if meta.name:
+        entry["name"] = meta.name
+    if meta.description:
+        entry["description"] = meta.description
+    if meta.context is not None:
+        entry["context_length"] = meta.context
+
+    architecture: dict = {"input_modalities": ["text"], "output_modalities": ["text"]}
+    if meta.modalities:
+        architecture["input_modalities"] = list(meta.modalities)
+    architecture["modality"] = "+".join(architecture["input_modalities"]) + "->text"
+    entry["architecture"] = architecture
+
+    pricing: dict = {}
+    if meta.input_cost is not None:
+        pricing["prompt"] = _usd_per_token(meta.input_cost)
+    if meta.output_cost is not None:
+        pricing["completion"] = _usd_per_token(meta.output_cost)
+    if meta.cache_read_cost is not None:
+        pricing["input_cache_read"] = _usd_per_token(meta.cache_read_cost)
+    if meta.cache_write_cost is not None:
+        pricing["input_cache_write"] = _usd_per_token(meta.cache_write_cost)
+    if pricing:
+        entry["pricing"] = pricing
+
+    # OpenRouter's is_moderated refers to its own moderation layer, not the
+    # upstream model's — a proxy always reports false.
+    if meta.context is not None or meta.max_output is not None:
+        top_provider: dict = {"is_moderated": False}
+        if meta.context is not None:
+            top_provider["context_length"] = meta.context
+        if meta.max_output is not None:
+            top_provider["max_completion_tokens"] = meta.max_output
+        entry["top_provider"] = top_provider
+
+    if meta.supports_reasoning:
+        reasoning: dict = {"mandatory": meta.reasoning_mandatory}
+        if meta.reasoning_default_enabled is not None:
+            reasoning["default_enabled"] = meta.reasoning_default_enabled
+        if meta.reasoning_efforts:
+            reasoning["supported_efforts"] = list(meta.reasoning_efforts)
+        # OpenRouter emits default_effort with default_enabled: true when no
+        # default is configured; kept mandatory for OpenRouter compatibility.
+        reasoning["default_effort"] = meta.reasoning_default or (meta.reasoning_efforts[0] if meta.reasoning_efforts else "high")
+        entry["reasoning"] = reasoning
+
+    return entry
+
+
 @app.get("/v1/models")
 async def list_models(authorization: str | None = Header(None)):
     auth_err = _check_auth(authorization)
@@ -763,8 +837,16 @@ async def list_models(authorization: str | None = Header(None)):
     return {
         "object": "list",
         "data": [
-            {"id": name, "object": "model", "created": 0, "owned_by": "stablellm"}
-            for name in config.GROUPS
+            # OpenAI keys always present (strict SDKs require them); OpenRouter
+            # keys are additive when meta is configured.
+            {
+                "id": name,
+                "object": "model",
+                "created": 0,
+                "owned_by": "stablellm",
+                **(_serialize_meta(group.meta) if group.meta else {}),
+            }
+            for name, group in config.GROUPS.items()
         ],
     }
 
@@ -926,8 +1008,7 @@ async def config_get_content(x_config_password: str | None = Header(None)):
     if err:
         return err
     try:
-        with open(config.CONFIG_FILE) as f:
-            return PlainTextResponse(f.read())
+        return PlainTextResponse(await asyncio.to_thread(Path(config.CONFIG_FILE).read_text))
     except OSError as exc:
         return PlainTextResponse(f"read failed: {exc}", status_code=500)
 
@@ -954,8 +1035,7 @@ async def config_save(request: Request, x_config_password: str | None = Header(N
         return PlainTextResponse(f"validation failed: {exc}", status_code=400)
 
     try:
-        with open(config.CONFIG_FILE, "w") as f:
-            f.write(new_content)
+        await asyncio.to_thread(Path(config.CONFIG_FILE).write_text, new_content)
     except OSError as exc:
         return PlainTextResponse(f"write failed: {exc}", status_code=500)
 

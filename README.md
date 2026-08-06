@@ -66,6 +66,16 @@ groups:
   - `provider` — name from the providers section (required)
   - `model` — model name to send upstream. If omitted, falls back to the provider's `model` (if set), otherwise the client's requested model passes through unchanged.
   - `flags` — per-endpoint flags: `keep_reasoning` preserves `reasoning`/`reasoning_content`/`thinking` fields in messages (otherwise stripped).
+- `meta` — optional descriptive metadata published on `/v1/models` in OpenRouter's response shape. When set, the entry uses OpenRouter keys (`context_length`, `architecture`, `pricing`, `top_provider`, `reasoning`) instead of the minimal OpenAI shape. All fields optional. Fields:
+  - `name` / `description`
+  - `context` / `max_output` — window and max completion tokens (tokens)
+  - `modalities` — input modalities (e.g. `[text, image]`); output is reported as `text`
+  - `input_cost` / `output_cost` / `cache_read_cost` / `cache_write_cost` — dollars per million tokens
+  - `supports_reasoning` — whether reasoning is available (emits a `reasoning` block)
+  - `reasoning_mandatory` — whether reasoning can't be disabled by the client
+  - `reasoning_efforts` — supported effort levels
+  - `reasoning_default` — default effort (must be one of `reasoning_efforts`; defaults to the first entry, or `"high"` when no efforts are declared)
+  - `reasoning_default_enabled` — whether reasoning is on by default (omitted unless set)
 
 **Group names match the client's `model` field case-insensitively.** `glm-4.7` matches `model: GLM-4.7`. Separators are not normalized, so `gpt-4.1` and `gpt_4_1` are distinct.
 

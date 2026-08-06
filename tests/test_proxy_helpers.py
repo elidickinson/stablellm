@@ -5,7 +5,6 @@ These don't need a running app — just the functions, exercised directly.
 import sys
 
 import pytest
-
 from conftest import fresh_config
 
 
@@ -140,6 +139,38 @@ def test_strip_unsupported_removes_reasoning_from_messages_by_default(main_modul
     assert msgs[1] == {"role": "user", "content": "yo"}
 
 
+def test_strip_unsupported_forwards_top_level_reasoning_param(main_module):
+    from config import Endpoint
+    ep = Endpoint(base_url="x", api_key="k", model="m", keep_reasoning=False)
+    out = main_module._strip_unsupported(
+        {"messages": [{"role": "user", "content": "hi", "reasoning": "drop"}],
+         "reasoning": {"effort": "low"}},
+        ep,
+    )
+    assert out["reasoning"] == {"effort": "low"}
+    assert "reasoning" not in out["messages"][0]
+
+
+def test_usd_per_token_precision(main_module):
+    assert main_module._usd_per_token(1.0) == "0.000001"
+    assert main_module._usd_per_token(0.15) == "0.00000015"
+    assert main_module._usd_per_token(2.50) == "0.0000025"
+    # Sub-$0.0001/M must not truncate to "0", high precision must survive
+    assert main_module._usd_per_token(0.00005) == "0.00000000005"
+    assert main_module._usd_per_token(12.345678) == "0.000012345678"
+    assert main_module._usd_per_token(0.0) == "0"
+
+
+def test_serialize_meta_reasoning_variants(main_module):
+    from config import ModelMeta
+    # efforts + non-default default + default_enabled: all config-driven
+    meta = ModelMeta(supports_reasoning=True, reasoning_efforts=("low", "medium", "high"),
+                     reasoning_default="medium", reasoning_default_enabled=False)
+    r = main_module._serialize_meta(meta)["reasoning"]
+    assert r == {"mandatory": False, "default_enabled": False,
+                 "supported_efforts": ["low", "medium", "high"], "default_effort": "medium"}
+
+
 def test_strip_unsupported_keeps_reasoning_when_flag_set(main_module):
     from config import Endpoint
     ep = Endpoint(base_url="x", api_key="k", model="m", keep_reasoning=True)
@@ -195,6 +226,7 @@ def test_finish_race_orders_by_completion_time(main_module):
 
 def test_should_race_true_after_time_threshold(main_module):
     import time
+
     import config
     main_module._group_last_race_time["default"] = time.monotonic() - (config.SETTINGS.race_interval_secs + 1)
     main_module._group_race_request_count["default"] = 0

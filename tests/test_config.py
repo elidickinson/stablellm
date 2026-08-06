@@ -216,3 +216,134 @@ def test_empty_endpoints_list_is_config_error():
             "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
             "groups": {"default": _group([])},
         })
+
+
+# --- Group meta ---
+
+def test_group_meta_parsed(make_config):
+    cfg = make_config({
+        "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
+        "groups": {
+            "default": {
+                "endpoints": [{"provider": "a"}],
+                "meta": {
+                    "name": "GLM 5.2",
+                    "description": "flagship",
+                    "context": 200000,
+                    "max_output": 128000,
+                    "modalities": ["text", "image"],
+                    "input_cost": 0.6,
+                    "output_cost": 2.2,
+                    "cache_read_cost": 0.06,
+                    "cache_write_cost": 2.2,
+                    "supports_reasoning": True,
+                    "reasoning_efforts": ["low", "high"],
+                },
+            },
+        },
+    })
+    m = cfg.GROUPS["default"].meta
+    assert m is not None
+    assert m.name == "GLM 5.2"
+    assert m.context == 200000
+    assert m.input_cost == 0.6
+    assert m.modalities == ("text", "image")
+    assert m.supports_reasoning is True
+    assert m.reasoning_efforts == ("low", "high")
+
+
+def test_group_meta_default_is_none(make_config):
+    cfg = make_config(make_minimal())
+    assert cfg.GROUPS["default"].meta is None
+
+
+def test_unknown_meta_key_is_config_error():
+    with pytest.raises(ConfigError, match="unknown meta keys"):
+        parse_config({
+            "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
+            "groups": {"default": {"endpoints": [{"provider": "a"}], "meta": {"bogus": 1}}},
+        })
+
+
+def test_meta_context_must_be_positive_int_is_config_error():
+    with pytest.raises(ConfigError, match="context"):
+        parse_config({
+            "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
+            "groups": {"default": {"endpoints": [{"provider": "a"}], "meta": {"context": -5}}},
+        })
+
+
+def test_meta_cost_must_be_nonneg_is_config_error():
+    with pytest.raises(ConfigError, match="input_cost"):
+        parse_config({
+            "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
+            "groups": {"default": {"endpoints": [{"provider": "a"}], "meta": {"input_cost": -1}}},
+        })
+
+
+def test_meta_supports_reasoning_must_be_bool_is_config_error():
+    with pytest.raises(ConfigError, match="supports_reasoning"):
+        parse_config({
+            "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
+            "groups": {"default": {"endpoints": [{"provider": "a"}], "meta": {"supports_reasoning": "false"}}},
+        })
+
+
+def test_meta_name_must_be_string_is_config_error():
+    with pytest.raises(ConfigError, match="name"):
+        parse_config({
+            "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
+            "groups": {"default": {"endpoints": [{"provider": "a"}], "meta": {"name": 123}}},
+        })
+
+
+def test_meta_reasoning_efforts_require_reasoning_is_config_error():
+    with pytest.raises(ConfigError, match="supports_reasoning"):
+        parse_config({
+            "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
+            "groups": {"default": {"endpoints": [{"provider": "a"}], "meta": {"reasoning_efforts": ["low"]}}},
+        })
+
+
+def test_meta_reasoning_fields_require_supports_reasoning_is_config_error():
+    for extra in ({"reasoning_mandatory": True}, {"reasoning_default": "high"},
+                  {"reasoning_default_enabled": True}):
+        with pytest.raises(ConfigError, match="supports_reasoning"):
+            parse_config({
+                "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
+                "groups": {"default": {"endpoints": [{"provider": "a"}], "meta": extra}},
+            })
+
+
+def test_meta_mandatory_without_efforts_is_valid(make_config):
+    # Mandatory reasoning with no effort list exists in OpenRouter's catalog
+    cfg = make_config({
+        "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
+        "groups": {"default": {"endpoints": [{"provider": "a"}], "meta": {
+            "supports_reasoning": True, "reasoning_mandatory": True,
+        }}},
+    })
+    m = cfg.GROUPS["default"].meta
+    assert m.reasoning_mandatory is True
+    assert m.reasoning_efforts == ()
+
+
+def test_meta_reasoning_default_must_be_in_efforts_is_config_error():
+    with pytest.raises(ConfigError, match="reasoning_default"):
+        parse_config({
+            "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
+            "groups": {"default": {"endpoints": [{"provider": "a"}], "meta": {
+                "supports_reasoning": True, "reasoning_efforts": ["low", "high"],
+                "reasoning_default": "medium",
+            }}},
+        })
+
+
+def test_meta_default_enabled_false_requires_efforts_is_config_error():
+    with pytest.raises(ConfigError, match="reasoning_default_enabled"):
+        parse_config({
+            "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
+            "groups": {"default": {"endpoints": [{"provider": "a"}], "meta": {
+                "supports_reasoning": True, "reasoning_default_enabled": False,
+            }}},
+        })

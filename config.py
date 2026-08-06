@@ -30,6 +30,29 @@ class Endpoint:
     provider: str = ""
 
 
+@dataclass(frozen=True)
+class ModelMeta:
+    """Descriptive per-group metadata, surfaced on /v1/models.
+
+    All fields are optional. Costs are dollars per million tokens in config and
+    serialized as OpenRouter's per-token strings.
+    """
+    name: str = ""
+    description: str = ""
+    context: int | None = None
+    max_output: int | None = None
+    modalities: tuple[str, ...] = ()
+    input_cost: float | None = None
+    output_cost: float | None = None
+    cache_read_cost: float | None = None
+    cache_write_cost: float | None = None
+    supports_reasoning: bool = False
+    reasoning_mandatory: bool = False
+    reasoning_efforts: tuple[str, ...] = ()
+    reasoning_default: str = ""
+    reasoning_default_enabled: bool | None = None
+
+
 MODE_SEQ = "seq"
 MODE_RACE = "race"
 VALID_MODES = frozenset({MODE_SEQ, MODE_RACE})
@@ -40,6 +63,7 @@ class Group:
     """An ordered set of endpoint indices and the routing mode used to dispatch them."""
     endpoints: list[int]
     mode: str = MODE_SEQ
+    meta: ModelMeta | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +133,78 @@ def _parse_providers(raw: object) -> dict[str, Provider]:
     return providers
 
 
+def _meta_str(value: object, key: str) -> str:
+    if not isinstance(value, str):
+        raise ConfigError(f"meta '{key}' must be a string")
+    return value
+
+
+def _meta_bool(value: object, key: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"meta '{key}' must be a boolean")
+    return value
+
+
+def _meta_pos_int(value: object, key: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ConfigError(f"meta '{key}' must be a positive integer")
+    return value
+
+
+def _meta_nonneg_num(value: object, key: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ConfigError(f"meta '{key}' must be a non-negative number")
+    return float(value)
+
+
+def _meta_str_list(value: object, key: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+        raise ConfigError(f"meta '{key}' must be a list of strings")
+    return tuple(value)
+
+
+_META_FIELDS = {
+    "name": _meta_str,
+    "description": _meta_str,
+    "context": _meta_pos_int,
+    "max_output": _meta_pos_int,
+    "modalities": _meta_str_list,
+    "input_cost": _meta_nonneg_num,
+    "output_cost": _meta_nonneg_num,
+    "cache_read_cost": _meta_nonneg_num,
+    "cache_write_cost": _meta_nonneg_num,
+    "supports_reasoning": _meta_bool,
+    "reasoning_mandatory": _meta_bool,
+    "reasoning_efforts": _meta_str_list,
+    "reasoning_default": _meta_str,
+    "reasoning_default_enabled": _meta_bool,
+}
+
+
+def _parse_meta(raw: object) -> ModelMeta | None:
+    """Parse an optional group 'meta' mapping. Returns None when absent/empty."""
+    if raw is None or raw == {}:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError("'meta' must be a mapping")
+
+    unknown = set(raw) - _META_FIELDS.keys()
+    if unknown:
+        raise ConfigError(f"unknown meta keys: {', '.join(sorted(map(str, unknown)))}")
+
+    fields = {key: _META_FIELDS[key](value, key) for key, value in raw.items()}
+    reasoning_keys = {"reasoning_mandatory", "reasoning_efforts", "reasoning_default", "reasoning_default_enabled"}
+    if reasoning_keys & fields.keys() and not fields.get("supports_reasoning"):
+        raise ConfigError("reasoning fields require 'supports_reasoning: true'")
+    default = fields.get("reasoning_default", "")
+    efforts = fields.get("reasoning_efforts", ())
+    if default and default not in efforts:
+        raise ConfigError("'reasoning_default' must be one of 'reasoning_efforts'")
+    if fields.get("reasoning_default_enabled") is False and not efforts:
+        raise ConfigError("'reasoning_default_enabled: false' requires 'reasoning_efforts'")
+    return ModelMeta(**fields)
+
+
 def _parse_groups(raw: object, providers: dict[str, Provider]) -> tuple[dict[str, Group], list[Endpoint]]:
     """Parse 'groups' mapping. Returns (groups, endpoints).
 
@@ -166,10 +262,12 @@ def _parse_groups(raw: object, providers: dict[str, Provider]) -> tuple[dict[str
             ))
             indices.append(len(endpoints) - 1)
 
+        meta = _parse_meta(spec.get("meta"))
+
         name_lower = str(group_name).lower()
         if name_lower in groups:
             raise ConfigError(f"duplicate group name (case-insensitive): '{group_name}'")
-        groups[name_lower] = Group(endpoints=indices, mode=mode)
+        groups[name_lower] = Group(endpoints=indices, mode=mode, meta=meta)
 
     if not groups:
         raise ConfigError("at least one group is required")

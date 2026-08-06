@@ -17,9 +17,7 @@ import sys
 import httpx
 import pytest
 import pytest_asyncio
-
 from conftest import fresh_config
-
 
 pytestmark = pytest.mark.live
 
@@ -30,6 +28,7 @@ if not os.getenv("STABLELLM_LIVE_TESTS"):
 
 # Read live-test config from real env (not via dotenv neutralization)
 import dotenv as _dotenv
+
 _dotenv.load_dotenv()
 LIVE_BASE_URL = os.getenv("LIVE_TEST_BASE_URL")
 LIVE_API_KEY = os.getenv("LIVE_TEST_API_KEY")
@@ -92,11 +91,11 @@ async def test_live_chat_completion_non_streaming(live_app):
 
 @pytest.mark.asyncio
 async def test_live_chat_completion_streaming(live_app):
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=live_app), base_url="http://t") as c:
-        async with c.stream("POST", "/v1/chat/completions",
-                             json={**TINY_PROMPT, "model": "live", "stream": True},
-                             timeout=30) as resp:
-            assert resp.status_code == 200
-            body = b"".join([chunk async for chunk in resp.aiter_bytes()])
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=live_app), base_url="http://t") as c, \
+            c.stream("POST", "/v1/chat/completions",
+                     json={**TINY_PROMPT, "model": "live", "stream": True},
+                     timeout=30) as resp:
+        assert resp.status_code == 200
+        body = b"".join([chunk async for chunk in resp.aiter_bytes()])
     assert b"data:" in body
     assert b"[DONE]" in body

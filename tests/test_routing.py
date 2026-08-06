@@ -2,7 +2,6 @@ import sys
 
 import httpx
 import pytest
-
 from conftest import fresh_config
 
 

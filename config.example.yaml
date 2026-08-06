@@ -42,6 +42,24 @@ providers:
 # "cheap:race"). :fastest and :normal are aliases.
 groups:
   gpt-4o:
+    # Optional per-group metadata, surfaced on /v1/models in OpenRouter's shape.
+    # Every field is optional; omit any you don't want to publish. Costs are
+    # dollars per million tokens (serialized as OpenRouter's per-token strings).
+    meta:
+      name: "GPT-4o"
+      description: "OpenAI flagship multimodal model"
+      context: 128000
+      max_output: 16384
+      modalities: [text, image]
+      input_cost: 2.50
+      output_cost: 10.00
+      cache_read_cost: 0.31
+      cache_write_cost: 10.00
+      supports_reasoning: false
+      # reasoning_efforts: [low, medium, high]     # only valid when supports_reasoning: true
+      # reasoning_default: medium                  # must be one of reasoning_efforts
+      # reasoning_default_enabled: true            # omit unless you need to publish it
+      # reasoning_mandatory: false                 # reasoning cannot be disabled by the client
     endpoints:
       - provider: openai
       - provider: openai_backup

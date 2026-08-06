@@ -37,7 +37,7 @@ def fresh_config(monkeypatch, tmp_path: Path, content: str | dict):
     monkeypatch.setenv("CONFIG_FILE", str(path))
     # Clear any leaked env vars that could affect interpolation behavior
     for k in list(os.environ):
-        if k.startswith("ENDPOINT_") or k.startswith("GROUP_"):
+        if k.startswith(("ENDPOINT_", "GROUP_")):
             monkeypatch.delenv(k, raising=False)
     # Neutralize dotenv so the real .env doesn't leak in
     import dotenv

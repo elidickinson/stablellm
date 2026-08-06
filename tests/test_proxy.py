@@ -5,7 +5,6 @@ import sys
 
 import httpx
 import pytest
-
 from conftest import fresh_config
 
 
@@ -168,7 +167,7 @@ async def test_connection_error_marks_down_and_tries_next(proxy_app):
             raise httpx.ConnectError("refused", request=req)
         return _ok_response()
 
-    app, calls, main = proxy_app(
+    app, _, main = proxy_app(
         {
             "providers": {
                 "a": {"base_url": "https://a.test", "api_key": "k"},
@@ -196,7 +195,7 @@ async def test_cooled_off_endpoint_is_skipped_on_next_request(proxy_app):
             return httpx.Response(503)
         return _ok_response()
 
-    app, calls, main = proxy_app(
+    app, calls, _ = proxy_app(
         {
             "settings": {"cooloff_seconds": 30},
             "providers": {
@@ -238,10 +237,10 @@ async def test_streaming_response_passes_through_chunks(proxy_app):
         },
         handler,
     )
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
-        async with c.stream("POST", "/v1/chat/completions", json={"model": "default", "stream": True, "messages": []}) as resp:
-            assert resp.status_code == 200
-            chunks = b"".join([chunk async for chunk in resp.aiter_bytes()])
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c, \
+            c.stream("POST", "/v1/chat/completions", json={"model": "default", "stream": True, "messages": []}) as resp:
+        assert resp.status_code == 200
+        chunks = b"".join([chunk async for chunk in resp.aiter_bytes()])
     assert b"hello" in chunks
     assert b"[DONE]" in chunks
 
@@ -278,6 +277,7 @@ async def test_oversized_body_is_rejected(proxy_app, monkeypatch):
     monkeypatch.setenv("MAX_BODY_BYTES", "100")
     # Reload config so the new env var takes effect
     import importlib
+
     import config
     importlib.reload(config)
 
@@ -297,6 +297,7 @@ async def test_oversized_body_is_rejected(proxy_app, monkeypatch):
 async def test_api_key_required_when_configured(proxy_app, monkeypatch):
     monkeypatch.setenv("API_KEY", "secret-proxy-key")
     import importlib
+
     import config
     importlib.reload(config)
 
@@ -529,12 +530,12 @@ async def test_meta_headers_on_streaming_response(proxy_app):
         },
         handler,
     )
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
-        async with c.stream("POST", "/v1/chat/completions", json={"model": "mygroup", "stream": True, "messages": []}) as resp:
-            assert resp.headers["x-stablellm-provider"] == "cerebras"
-            assert resp.headers["x-stablellm-model"] == "fast-m"
-            assert resp.headers["x-stablellm-mode"] == "seq"
-            _ = [chunk async for chunk in resp.aiter_bytes()]
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c, \
+            c.stream("POST", "/v1/chat/completions", json={"model": "mygroup", "stream": True, "messages": []}) as resp:
+        assert resp.headers["x-stablellm-provider"] == "cerebras"
+        assert resp.headers["x-stablellm-model"] == "fast-m"
+        assert resp.headers["x-stablellm-mode"] == "seq"
+        _ = [chunk async for chunk in resp.aiter_bytes()]
 
 
 @pytest.mark.asyncio
@@ -608,10 +609,10 @@ async def test_via_header_from_openrouter_streaming(proxy_app):
         },
         handler,
     )
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
-        async with c.stream("POST", "/v1/chat/completions", json={"model": "g", "stream": True, "messages": []}) as resp:
-            assert resp.headers["x-stablellm-via"] == "Cerebras"
-            body = b"".join([chunk async for chunk in resp.aiter_bytes()])
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c, \
+            c.stream("POST", "/v1/chat/completions", json={"model": "g", "stream": True, "messages": []}) as resp:
+        assert resp.headers["x-stablellm-via"] == "Cerebras"
+        body = b"".join([chunk async for chunk in resp.aiter_bytes()])
     # First-chunk priming must not corrupt the stream
     assert b"hi" in body
     assert b"[DONE]" in body
@@ -655,11 +656,11 @@ async def test_via_header_from_openrouter_race_streaming(proxy_app):
         ]}},
     }
     app, _, _ = proxy_app(cfg, handler)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
-        async with c.stream("POST", "/v1/chat/completions", json={"model": "fast:race", "stream": True, "messages": []}) as resp:
-            assert resp.status_code == 200
-            assert resp.headers["x-stablellm-via"] == "Azure"
-            body = b"".join([chunk async for chunk in resp.aiter_bytes()])
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c, \
+            c.stream("POST", "/v1/chat/completions", json={"model": "fast:race", "stream": True, "messages": []}) as resp:
+        assert resp.status_code == 200
+        assert resp.headers["x-stablellm-via"] == "Azure"
+        body = b"".join([chunk async for chunk in resp.aiter_bytes()])
     assert b"x" in body and b"[DONE]" in body
 
 
@@ -732,6 +733,7 @@ async def test_invalid_json_body_returns_400(proxy_app):
 async def test_models_endpoint_requires_auth_when_api_key_set(proxy_app, monkeypatch):
     monkeypatch.setenv("API_KEY", "secret-proxy-key")
     import importlib
+
     import config
     importlib.reload(config)
 
@@ -750,6 +752,130 @@ async def test_models_endpoint_requires_auth_when_api_key_set(proxy_app, monkeyp
 
     ok = await _get(app, "/v1/models", headers={"Authorization": "Bearer secret-proxy-key"})
     assert ok.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_models_endpoint_includes_meta(proxy_app, monkeypatch):
+    monkeypatch.setenv("API_KEY", "secret-proxy-key")
+    app, _, _ = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {
+                "m1": {
+                    "endpoints": [{"provider": "a"}],
+                    "meta": {
+                        "name": "M1",
+                        "context": 100000,
+                        "max_output": 8000,
+                        "modalities": ["text", "image"],
+                        "input_cost": 1.0,
+                        "output_cost": 3.0,
+                        "cache_read_cost": 0.1,
+                        "cache_write_cost": 3.0,
+                        "supports_reasoning": True,
+                        "reasoning_efforts": ["low", "high"],
+                    },
+                },
+            },
+        },
+        lambda r: _ok_response(),
+    )
+    resp = await _get(app, "/v1/models", headers={"Authorization": "Bearer secret-proxy-key"})
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert len(data) == 1
+    m = data[0]
+    assert m["id"] == "m1"
+    assert m["object"] == "model"  # OpenAI keys stay even in OpenRouter shape
+    assert m["context_length"] == 100000
+    assert m["architecture"] == {
+        "input_modalities": ["text", "image"],
+        "output_modalities": ["text"],
+        "modality": "text+image->text",
+    }
+    assert m["pricing"]["prompt"] == "0.000001"
+    assert m["pricing"]["completion"] == "0.000003"
+    assert m["pricing"]["input_cache_read"] == "0.0000001"
+    assert m["pricing"]["input_cache_write"] == "0.000003"
+    assert m["top_provider"] == {
+        "is_moderated": False, "context_length": 100000, "max_completion_tokens": 8000,
+    }
+    # No default_enabled given -> key omitted; default_effort falls back to first effort
+    assert m["reasoning"] == {
+        "mandatory": False, "supported_efforts": ["low", "high"], "default_effort": "low",
+    }
+
+
+@pytest.mark.asyncio
+async def test_models_endpoint_partial_meta_has_no_null(proxy_app, monkeypatch):
+    monkeypatch.setenv("API_KEY", "secret-proxy-key")
+    app, _, _ = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"only": {"endpoints": [{"provider": "a"}], "meta": {"name": "Only"}}},
+        },
+        lambda r: _ok_response(),
+    )
+    resp = await _get(app, "/v1/models", headers={"Authorization": "Bearer secret-proxy-key"})
+    assert resp.status_code == 200
+    assert resp.json()["data"][0] == {
+        "id": "only", "object": "model", "created": 0, "owned_by": "stablellm",
+        "name": "Only",
+        "architecture": {
+            "input_modalities": ["text"], "output_modalities": ["text"], "modality": "text->text",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_models_endpoint_mandatory_reasoning(proxy_app, monkeypatch):
+    monkeypatch.setenv("API_KEY", "secret-proxy-key")
+    app, _, _ = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"r": {"endpoints": [{"provider": "a"}], "meta": {
+                "supports_reasoning": True, "reasoning_mandatory": True,
+            }}},
+        },
+        lambda r: _ok_response(),
+    )
+    # Mandatory reasoning without efforts mirrors real OpenRouter entries
+    resp = await _get(app, "/v1/models", headers={"Authorization": "Bearer secret-proxy-key"})
+    assert resp.json()["data"][0]["reasoning"] == {"mandatory": True, "default_effort": "high"}
+
+
+@pytest.mark.asyncio
+async def test_models_endpoint_without_meta_is_minimal(proxy_app, monkeypatch):
+    monkeypatch.setenv("API_KEY", "secret-proxy-key")
+    app, _, _ = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"plain": {"endpoints": [{"provider": "a"}]}},
+        },
+        lambda r: _ok_response(),
+    )
+    resp = await _get(app, "/v1/models", headers={"Authorization": "Bearer secret-proxy-key"})
+    m = resp.json()["data"][0]
+    assert m == {"id": "plain", "object": "model", "created": 0, "owned_by": "stablellm"}
+
+
+@pytest.mark.asyncio
+async def test_reasoning_param_passthrough(proxy_app):
+    sent = {}
+
+    def handler(req):
+        sent.update(json.loads(req.content))
+        return _ok_response()
+
+    app, _, _ = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"default": {"endpoints": [{"provider": "a"}]}},
+        },
+        handler,
+    )
+    await _post(app, {"model": "default", "messages": [], "reasoning": {"effort": "low"}})
+    assert sent["reasoning"] == {"effort": "low"}
 
 
 @pytest.mark.asyncio

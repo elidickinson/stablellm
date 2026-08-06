@@ -3,7 +3,6 @@ import sys
 import httpx
 import pytest
 import yaml as _yaml
-
 from conftest import fresh_config
 
 MINIMAL_CONFIG = {
@@ -82,7 +81,7 @@ async def test_editor_auth_applies_constant_delay(app_factory):
 
 @pytest.mark.asyncio
 async def test_editor_loads_current_yaml(app_factory):
-    app, cfg = app_factory(password="secret")
+    app, _ = app_factory(password="secret")
     resp = await _get(app, "/config/api/content", headers={"X-Config-Password": "secret"})
     assert resp.status_code == 200
     assert "providers:" in resp.text
