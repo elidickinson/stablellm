@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
@@ -25,7 +26,7 @@ from fastapi.responses import (
 import config
 import requestlog
 from config import (
-    API_KEY,
+    API_KEYS,
     CONNECT_TIMEOUT,
     HOST,
     PORT,
@@ -247,13 +248,16 @@ def _request_context(path: str, body: dict, group: str = "", ep: Endpoint | None
     return " ".join(parts)
 
 
-def _check_auth(authorization: str | None) -> JSONResponse | None:
-    if not API_KEY:
-        return None
-    if not authorization or not hmac.compare_digest(authorization, f"Bearer {API_KEY}"):
+def _authenticate(authorization: str | None) -> tuple[str, JSONResponse | None]:
+    """Returns (client name, error response). Name is empty when auth is disabled."""
+    if not API_KEYS:
+        return "", None
+    token = authorization[7:] if authorization and authorization.startswith("Bearer ") else ""
+    client = API_KEYS.get(hashlib.sha256(token.encode()).hexdigest()) if token else None
+    if client is None:
         log.warning("auth failed: %s", "missing header" if not authorization else "invalid token")
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    return None
+        return "", JSONResponse({"error": "unauthorized"}, status_code=401)
+    return client, None
 
 
 def _extract_usage_from_sse(buffer: bytearray, chunk: bytes) -> int | None:
@@ -539,7 +543,7 @@ def _finish_race(race_times: dict[tuple[str, str], float], group: str):
     )
 
 
-async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: str):
+async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: str, client: str):
     """Race one endpoint per provider group with real request. Returns response or None."""
     pg = _group_provider_groups[group]
 
@@ -631,6 +635,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         _last_endpoint_idx = win_idx
 
     race_metrics = requestlog.RequestMetrics(
+        api_key_id=client,
         model_requested=body_dict.get("model", "") if body_dict else "",
         provider_served=win_pk[1],
         model_served=model_name,
@@ -831,7 +836,7 @@ def _serialize_meta(meta: ModelMeta) -> dict:
 
 @app.get("/v1/models")
 async def list_models(authorization: str | None = Header(None)):
-    auth_err = _check_auth(authorization)
+    _, auth_err = _authenticate(authorization)
     if auth_err:
         return auth_err
     return {
@@ -852,7 +857,10 @@ async def list_models(authorization: str | None = Header(None)):
 
 
 @app.get("/stats")
-async def stats():
+async def stats(authorization: str | None = Header(None)):
+    _, auth_err = _authenticate(authorization)
+    if auth_err:
+        return auth_err
     result = {"endpoints": []}
     for idx, ep in enumerate(config.ENDPOINTS):
         result["endpoints"].append({
@@ -1053,7 +1061,7 @@ async def config_save(request: Request, x_config_password: str | None = Header(N
 
 @app.post("/v1/{path:path}")
 async def proxy(request: Request, path: str, authorization: str | None = Header(None)):
-    auth_err = _check_auth(authorization)
+    client, auth_err = _authenticate(authorization)
     if auth_err:
         return auth_err
 
@@ -1090,15 +1098,15 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
     mode = mode_override or config.GROUPS[group_name].mode
 
     log.info(
-        "-> /v1/%s model=%r group=%s mode=%s stream=%s",
-        path, model, group_name, mode, is_streaming,
+        "-> /v1/%s model=%r group=%s mode=%s stream=%s client=%s",
+        path, model, group_name, mode, is_streaming, client or "-",
     )
 
     if mode == config.MODE_RACE:
         _group_race_request_count[group_name] += 1
 
         if _should_race(group_name):
-            result = await _race_request(path, body_dict, is_streaming, group_name)
+            result = await _race_request(path, body_dict, is_streaming, group_name, client)
             if result is not None:
                 return result
             log.warning("race failed (%s), falling back to sequential", _request_context(path, body_dict, group_name))
@@ -1135,6 +1143,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         model_name = _effective_model(ep, client_model)
         request_context = _request_context(path, body_dict, group_name, ep)
         metrics = requestlog.RequestMetrics(
+            api_key_id=client,
             model_requested=client_model,
             provider_served=ep.base_url,
             model_served=model_name,

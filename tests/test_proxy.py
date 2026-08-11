@@ -294,12 +294,8 @@ async def test_oversized_body_is_rejected(proxy_app, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_api_key_required_when_configured(proxy_app, monkeypatch):
-    monkeypatch.setenv("API_KEY", "secret-proxy-key")
-    import importlib
-
-    import config
-    importlib.reload(config)
+async def test_any_configured_api_key_grants_access(proxy_app, monkeypatch):
+    monkeypatch.setenv("API_KEY", "alice:secret-one, plain-two")
 
     app, _calls, _ = proxy_app(
         {
@@ -316,9 +312,31 @@ async def test_api_key_required_when_configured(proxy_app, monkeypatch):
     wrong = await _post(app, {"model": "default", "messages": []}, headers={"Authorization": "Bearer wrong"})
     assert wrong.status_code == 401
 
-    # Correct key → 200
-    ok = await _post(app, {"model": "default", "messages": []}, headers={"Authorization": "Bearer secret-proxy-key"})
-    assert ok.status_code == 200
+    for key in ("secret-one", "plain-two"):
+        ok = await _post(app, {"model": "default", "messages": []}, headers={"Authorization": f"Bearer {key}"})
+        assert ok.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_authenticated_client_name_reaches_request_log(proxy_app, monkeypatch):
+    monkeypatch.setenv("API_KEY", "alice:secret-one,plain-two")
+
+    app, _calls, main = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"default": {"endpoints": [{"provider": "a"}]}},
+        },
+        lambda r: _ok_response(),
+    )
+    logged: list[str] = []
+    monkeypatch.setattr(main.requestlog, "log_request", lambda m: logged.append(m.api_key_id))
+
+    await _post(app, {"model": "default", "messages": []}, headers={"Authorization": "Bearer secret-one"})
+    await _post(app, {"model": "default", "messages": []}, headers={"Authorization": "Bearer plain-two"})
+
+    # Unnamed keys get a stable id derived from their hash.
+    assert logged[0] == "alice"
+    assert logged[1].startswith("key-")
 
 
 @pytest.mark.asyncio

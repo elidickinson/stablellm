@@ -32,6 +32,7 @@ def init():
 
 @dataclass
 class RequestMetrics:
+    api_key_id: str = ""
     model_requested: str = ""
     provider_served: str = ""
     model_served: str = ""
@@ -46,7 +47,7 @@ def log_request(m: RequestMetrics):
     conn.execute(
         "INSERT INTO requests (timestamp, api_key_id, model_requested, provider_served, model_served, ttft_ms, tokens_per_sec) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (time.time(), None, m.model_requested, m.provider_served, m.model_served, m.ttft_ms, m.tokens_per_sec),
+        (time.time(), m.api_key_id or None, m.model_requested, m.provider_served, m.model_served, m.ttft_ms, m.tokens_per_sec),
     )
     conn.commit()
     conn.close()

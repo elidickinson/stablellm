@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 import re
@@ -78,12 +79,33 @@ class ConfigError(Exception):
     pass
 
 
+def _parse_api_keys(raw: str) -> dict[str, str]:
+    """Parse API_KEY ('name:secret,secret,...') into {sha256(secret): client name}.
+
+    Names are optional and only used for logging; unnamed keys get a stable id
+    derived from their own hash so they stay distinct in the request log.
+    """
+    keys: dict[str, str] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        name, sep, secret = entry.partition(":")
+        if not sep:
+            name, secret = "", name
+        if not secret:
+            raise ConfigError(f"API_KEY entry '{entry}' has a name but no key")
+        digest = hashlib.sha256(secret.encode()).hexdigest()
+        keys[digest] = name or f"key-{digest[:6]}"
+    return keys
+
+
 # --- Bind-time settings ---
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "4000"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "120"))
 CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "4"))
-API_KEY = os.getenv("API_KEY", "")
+API_KEYS = _parse_api_keys(os.getenv("API_KEY", ""))
 CONFIG_FILE = os.getenv("CONFIG_FILE", "config.yaml")
 CONFIG_EDITOR_PASSWORD = os.getenv("CONFIG_EDITOR_PASSWORD", "")
 MAX_BODY_BYTES = int(os.getenv("MAX_BODY_BYTES", str(50 * 1024 * 1024)))

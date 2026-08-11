@@ -14,13 +14,21 @@ Two files. Bind-time settings live in `.env` (changing them requires a restart).
 | `PORT` | `4000` | Server port |
 | `REQUEST_TIMEOUT` | `120` | Outbound HTTP request timeout (seconds) |
 | `CONNECT_TIMEOUT` | `4` | Outbound TCP connect timeout (seconds) |
-| `API_KEY` | *(none)* | If set, clients must send `Authorization: Bearer <API_KEY>` |
+| `API_KEY` | *(none)* | If set, clients must send `Authorization: Bearer <key>`. Comma-separated for multiple keys (see below) |
 | `CONFIG_FILE` | `config.yaml` | Path to the YAML config |
 | `MAX_BODY_BYTES` | `52428800` (50MB) | Max inbound request body size |
 | `CONFIG_EDITOR_PASSWORD` | *(none)* | If set, enables the web config editor at `/config/editor` |
 | `REQUEST_LOG_DB` | *(none)* | If set, SQLite request-logging is enabled at the given path |
 
 API keys for upstream providers are set as individual vars here and referenced from YAML via `${VAR}` interpolation (e.g. `OPENAI_API_KEY`).
+
+**Client keys.** `API_KEY` accepts a comma-separated list, so each client can hold its own revocable key. Prefix an entry with `name:` to label it; the name is recorded on every request the key makes (`client=` in the logs, `api_key_id` in the request log DB). Unlabelled keys get a stable `key-<hash>` id instead.
+
+```
+API_KEY=alice:sk-alice-secret,ci-bot:sk-ci-secret,sk-unlabelled
+```
+
+Leaving `API_KEY` unset disables client auth entirely.
 
 ### `config.yaml` — reloadable settings
 
@@ -116,7 +124,7 @@ Headers are present on both streaming and non-streaming responses. They are expo
 
 ## Inspect
 
-`GET /stats` — per-endpoint request/success/failure counts and per-group preferred provider order (which provider won the last race).
+`GET /stats` — per-endpoint request/success/failure counts and per-group preferred provider order (which provider won the last race). Requires a client key when `API_KEY` is set.
 
 ## Deploy on Dokploy
 

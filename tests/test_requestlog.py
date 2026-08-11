@@ -32,6 +32,7 @@ def test_log_request_round_trip(fresh_requestlog):
     requestlog.init()
 
     requestlog.log_request(requestlog.RequestMetrics(
+        api_key_id="alice",
         model_requested="kimi-k2p6",
         provider_served="https://api.fireworks.ai/inference/v1",
         model_served="accounts/fireworks/routers/kimi-k2p6-turbo",
@@ -41,12 +42,13 @@ def test_log_request_round_trip(fresh_requestlog):
 
     conn = sqlite3.connect(db_path)
     rows = conn.execute(
-        "SELECT model_requested, provider_served, model_served, ttft_ms, tokens_per_sec FROM requests"
+        "SELECT api_key_id, model_requested, provider_served, model_served, ttft_ms, tokens_per_sec FROM requests"
     ).fetchall()
     conn.close()
 
     assert len(rows) == 1
     assert rows[0] == (
+        "alice",
         "kimi-k2p6",
         "https://api.fireworks.ai/inference/v1",
         "accounts/fireworks/routers/kimi-k2p6-turbo",
