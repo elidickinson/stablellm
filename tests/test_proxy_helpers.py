@@ -52,6 +52,18 @@ def test_sse_tolerates_malformed_json(main_module):
     assert main_module._extract_usage_from_sse(buf, b"data: {not json\n\n") is None
 
 
+@pytest.mark.asyncio
+async def test_close_quietly_does_not_swallow_cancellation(main_module):
+    import asyncio
+
+    class Response:
+        async def aclose(self):
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await main_module._close_quietly(Response())
+
+
 # --- _parse_model_suffix ---
 
 def test_parse_model_suffix_no_suffix(main_module):

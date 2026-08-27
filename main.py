@@ -214,7 +214,7 @@ async def _close_quietly(resp: httpx.Response):
     """Release an upstream connection without masking the in-flight outcome."""
     try:
         await resp.aclose()
-    except BaseException:  # noqa: BLE001, S110 - cleanup must not mask the in-flight outcome
+    except Exception:  # noqa: BLE001, S110 - cleanup must not mask the in-flight outcome
         pass
 
 
@@ -814,13 +814,11 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
             # sequential. No terminal row: the sequential outcome owns it.
             race_state["failures"] += 1
             _mark_down(win_idx, _exception_detail(exc), race_context)
+            return None, True
+        finally:
             await _close_quietly(win_resp)
             race_times[win_pk] = time.monotonic() - race_start
             _maybe_finalize()
-            return None, True
-        await _close_quietly(win_resp)
-        race_times[win_pk] = time.monotonic() - race_start
-        _maybe_finalize()
         elapsed = time.monotonic() - race_start
         race_metrics.elapsed_ms = elapsed * 1000
         response_body = b"".join(chunks)

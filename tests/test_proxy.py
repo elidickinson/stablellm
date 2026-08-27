@@ -612,6 +612,62 @@ async def test_race_with_single_candidate_skips_race(proxy_app):
     assert len(calls) == 1
 
 
+@pytest.mark.asyncio
+async def test_race_buffered_drain_closes_response_on_cancellation(proxy_app):
+    """A cancelled race winner still closes its response before propagating."""
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, cancelled=False):
+            self.cancelled = cancelled
+            self.closed = False
+
+        async def aiter_bytes(self):
+            yield b"partial"
+            if self.cancelled:
+                raise asyncio.CancelledError
+
+        async def aclose(self):
+            self.closed = True
+
+    winner = FakeResponse(cancelled=True)
+    loser = FakeResponse()
+
+    class FakeClient:
+        def build_request(self, _method, url, **_kwargs):
+            return url
+
+        async def send(self, url, **_kwargs):
+            if url.startswith("https://a.test/"):
+                return winner
+            await asyncio.sleep(0.01)
+            return loser
+
+    _app, _calls, main = proxy_app(
+        {
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k"},
+                "b": {"base_url": "https://b.test", "api_key": "k"},
+            },
+            "groups": {"fast": {"mode": "race", "endpoints": [
+                {"provider": "a", "model": "ma"},
+                {"provider": "b", "model": "mb"},
+            ]}},
+        },
+        lambda _req: _ok_response(),
+    )
+    main.http_client = FakeClient()
+
+    with pytest.raises(asyncio.CancelledError):
+        await main._race_request(
+            "chat/completions", {"model": "fast", "messages": []}, False,
+            "fast", "", "req-test", "test",
+        )
+
+    assert winner.closed
+    await asyncio.gather(*tuple(main._background_tasks), return_exceptions=True)
+
+
 # --- response metadata headers ---
 
 
