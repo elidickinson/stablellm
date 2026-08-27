@@ -84,6 +84,11 @@ _inflight: dict[tuple[str, str], int] = defaultdict(int)
 _session_pins: dict[tuple[str, str], tuple[int, float]] = {}
 _PIN_TTL_SECS = 600.0
 _PIN_TABLE_MAX = 500
+_HASH_CAP = 65536  # serialized bytes of a message fed to the session-key hash
+
+# Times the seq loop routed a request to its pinned endpoint; zero would mean
+# pinning never engages (e.g. clients with per-turn-volatile system prompts).
+_pin_promotions = 0
 
 # endpoint index -> stats
 _stats = {
@@ -228,20 +233,33 @@ def _slot_releaser(ep: Endpoint, model_name: str):
 
 
 def _session_key(body: dict) -> str:
-    """Stable per-conversation key for session pinning: the client-supplied
-    'user' field, else a hash of the first message (system prompt + opening
-    turn are stable across the requests of a session). Empty if derivable."""
+    """Stable per-conversation key for session pinning.
+
+    OpenAI-compatible requests carry no conversation id, so combine what is
+    stable within a session but distinct across a client's concurrent
+    sessions: the 'user' field, the first message (usually the system prompt),
+    and the first user turn (the opening instruction). Everything is hashed;
+    large messages are truncated so hashing never stalls the event loop."""
+    parts = []
     user = body.get("user")
     if isinstance(user, str) and user:
-        return "u:" + user
+        parts.append(user)
     messages = body.get("messages")
     if isinstance(messages, list) and messages:
-        try:
-            first = json.dumps(messages[0], sort_keys=True, ensure_ascii=False)
-        except (TypeError, ValueError):
-            return ""
-        return "m:" + hashlib.sha256(first.encode()).hexdigest()[:16]
-    return ""
+        picks = [messages[0]]
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                picks.append(msg)
+                break
+        for msg in picks:
+            try:
+                serialized = json.dumps(msg, sort_keys=True, ensure_ascii=False)
+            except (TypeError, ValueError):
+                return ""
+            parts.append(serialized[:_HASH_CAP])
+    if not parts:
+        return ""
+    return "m:" + hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
 
 
 def _pinned_endpoint(group: str, skey: str) -> int | None:
@@ -424,19 +442,24 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
         byte_iter = resp.aiter_bytes()
         primed: list[bytes] = []
         via = None
-        if want_via:
-            try:
-                while len(primed) < 8:
-                    chunk = await byte_iter.__anext__()
-                    if metrics.ttft_ms is None:
-                        metrics.ttft_ms = (time.monotonic() - t0) * 1000
-                        log.debug("req=%s %s TTFT %.0fms (TTFB %.0fms)", metrics.req_id, ep.provider, metrics.ttft_ms, ttfb * 1000)
-                    primed.append(chunk)
+        # Always prime at least one chunk (more for OpenRouter via-detection):
+        # an async generator that is never started does not run its finally —
+        # not on aclose, not on GC — so starting generate() below before the
+        # response is returned is what guarantees the slot release fires even
+        # if the client disconnects before Starlette iterates the stream.
+        try:
+            while len(primed) < (8 if want_via else 1):
+                chunk = await byte_iter.__anext__()
+                if metrics.ttft_ms is None:
+                    metrics.ttft_ms = (time.monotonic() - t0) * 1000
+                    log.debug("req=%s %s TTFT %.0fms (TTFB %.0fms)", metrics.req_id, ep.provider, metrics.ttft_ms, ttfb * 1000)
+                primed.append(chunk)
+                if want_via:
                     via = _provider_from_sse(chunk)
                     if via:
                         break
-            except StopAsyncIteration:
-                pass
+        except StopAsyncIteration:
+            pass
         metrics.via = via or ""
 
         async def generate():
@@ -445,6 +468,7 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
             sse_buf = bytearray()
             outcome = "200"
             try:
+                yield b""  # placeholder, consumed by the priming step below
                 for chunk in primed:
                     ct = _extract_usage_from_sse(sse_buf, chunk)
                     if ct is not None:
@@ -482,7 +506,11 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
                 await asyncio.to_thread(requestlog.log_request, metrics)
                 await _close_quietly(resp)
 
-        result = _streaming_response(resp, generate())
+        # Start the generator so its finally (and the slot release) is armed
+        # before anything can drop the response un-iterated.
+        gen = generate()
+        await gen.__anext__()
+        result = _streaming_response(resp, gen)
         if via:
             result.headers["X-StableLLM-Via"] = via
         return result, None
@@ -869,38 +897,40 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         byte_iter = win_resp.aiter_bytes()
         primed: list[bytes] = []
         via = None
-        if want_via:
-            try:
-                while len(primed) < 8:
-                    chunk = await byte_iter.__anext__()
-                    if race_metrics.ttft_ms is None:
-                        race_metrics.ttft_ms = (time.monotonic() - t0_race) * 1000
-                    primed.append(chunk)
+        # Prime unconditionally: same never-started-generator slot leak as the
+        # seq path if the response is dropped before iteration begins.
+        try:
+            while len(primed) < (8 if want_via else 1):
+                chunk = await byte_iter.__anext__()
+                if race_metrics.ttft_ms is None:
+                    race_metrics.ttft_ms = (time.monotonic() - t0_race) * 1000
+                primed.append(chunk)
+                if want_via:
                     via = _provider_from_sse(chunk)
                     if via:
                         break
-            except StopAsyncIteration:
-                pass
-            except (asyncio.CancelledError, GeneratorExit):
-                # Request is dying (shutdown or client cancel): not the endpoint's
-                # fault, so no mark-down. This aborted row is the terminal line;
-                # the cancel propagates and no sequential fallback follows.
-                race_metrics.status = "aborted"
-                win_release()
-                await asyncio.to_thread(requestlog.log_request, race_metrics)
-                await _close_quietly(win_resp)
-                raise
-            except BaseException as exc:  # noqa: BLE001 - any priming failure must fail the race, not the request
-                # Winner stalled mid-priming (transport error or similar). Close it
-                # and fail the race so the caller falls back to sequential rather
-                # than 500-ing the client / leaking the conn. No terminal row here:
-                # the sequential outcome owns it.
-                race_state["failures"] += 1
-                _mark_down(win_idx, _exception_detail(exc), race_context)
-                win_release()
-                await _close_quietly(win_resp)
-                _maybe_finalize()
-                return None, True
+        except StopAsyncIteration:
+            pass
+        except (asyncio.CancelledError, GeneratorExit):
+            # Request is dying (shutdown or client cancel): not the endpoint's
+            # fault, so no mark-down. This aborted row is the terminal line;
+            # the cancel propagates and no sequential fallback follows.
+            race_metrics.status = "aborted"
+            win_release()
+            await asyncio.to_thread(requestlog.log_request, race_metrics)
+            await _close_quietly(win_resp)
+            raise
+        except BaseException as exc:  # noqa: BLE001 - any priming failure must fail the race, not the request
+            # Winner stalled mid-priming (transport error or similar). Close it
+            # and fail the race so the caller falls back to sequential rather
+            # than 500-ing the client / leaking the conn. No terminal row here:
+            # the sequential outcome owns it.
+            race_state["failures"] += 1
+            _mark_down(win_idx, _exception_detail(exc), race_context)
+            win_release()
+            await _close_quietly(win_resp)
+            _maybe_finalize()
+            return None, True
         race_metrics.via = via or ""
 
         async def generate():
@@ -909,6 +939,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
             sse_buf = bytearray()
             outcome = "200"
             try:
+                yield b""  # placeholder, consumed by the priming step below
                 for chunk in primed:
                     ct = _extract_usage_from_sse(sse_buf, chunk)
                     if ct is not None:
@@ -946,7 +977,11 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                 await asyncio.to_thread(requestlog.log_request, race_metrics)
                 await _close_quietly(win_resp)
 
-        result = _streaming_response(win_resp, generate())
+        # Start the generator so its finally (and win_release) is armed before
+        # anything can drop the response un-iterated.
+        gen = generate()
+        await gen.__anext__()
+        result = _streaming_response(win_resp, gen)
         _stats["successes"][win_idx] += 1
         _set_meta_headers(result, provider=ep.provider, model=model_name, mode=config.MODE_RACE, group=group, via=via)
         return result, True
@@ -1111,6 +1146,7 @@ async def stats(authorization: str | None = Header(None)):
     # No filter: a zero or negative row is exactly the accounting bug signal we want visible.
     result["inflight"] = {f"{base_url} model={model!r}": n for (base_url, model), n in sorted(_inflight.items())}
     result["session_pins"] = len(_session_pins)
+    result["session_pin_hits"] = _pin_promotions
     return result
 
 
@@ -1218,6 +1254,8 @@ def _reset_runtime_state():
     _group_race_request_count.clear()
     _group_last_race_time.clear()
     _session_pins.clear()  # pin values are endpoint indices; stale after reload
+    global _pin_promotions
+    _pin_promotions = 0
 
 
 EDITOR_AUTH_DELAY_SECS = 0.5
@@ -1367,6 +1405,8 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
     if pinned in order:
         # Prefer the endpoint that served this session's previous request so
         # upstream prompt caches stay warm.
+        global _pin_promotions
+        _pin_promotions += 1
         order.remove(pinned)
         order.insert(0, pinned)
         log.debug("req=%s pinned session -> %s", req_id, _endpoint_label(config.ENDPOINTS[pinned]))

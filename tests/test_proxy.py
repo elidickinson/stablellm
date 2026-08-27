@@ -1246,3 +1246,34 @@ async def test_ttfb_deadline_fails_over_to_next_endpoint(proxy_app):
     assert resp.status_code == 200
     assert [c[0] for c in calls] == ["https://a.test", "https://b.test"]
     assert main._cooloff_until[0] > time.monotonic()  # a marked down
+
+
+@pytest.mark.asyncio
+async def test_stream_slot_released_when_client_never_iterates(proxy_app):
+    """A response dropped before iteration (early client disconnect) must still
+    release the slot: _proxy_stream starts the generator, so its finally runs."""
+    async def two_chunk_stream():
+        yield b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    def handler(req):
+        return httpx.Response(200, content=two_chunk_stream())
+
+    _app, _calls, main = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k", "max_concurrency": 1}},
+            "groups": {"default": {"endpoints": [{"provider": "a", "model": "m"}]}},
+        },
+        handler,
+    )
+    ep = main.config.ENDPOINTS[0]
+    assert main._try_acquire_slot(ep, "m")
+    release = main._slot_releaser(ep, "m")
+    metrics = main.requestlog.RequestMetrics(
+        req_id="t", keyname="", model_requested="m", model_served="m", provider_served="a", mode="seq", stream=True,
+    )
+
+    result, _reason = await main._proxy_stream(ep, "/v1/chat/completions", {}, b"{}", metrics, "ctx", on_done=release)
+    assert result is not None
+    await result.body_iterator.aclose()  # starlette drops it without iterating
+    assert main._inflight[("https://a.test", "m")] == 0

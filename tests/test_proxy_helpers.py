@@ -253,19 +253,30 @@ def test_should_race_true_after_time_threshold(main_module):
 # --- _session_key ---
 
 
-def test_session_key_prefers_user_field(main_module):
-    body = {"user": "alice", "messages": [{"role": "user", "content": "hi"}]}
-    assert main_module._session_key(body) == "u:alice"
-
-
-def test_session_key_hashes_first_message_stably(main_module):
-    body = {"messages": [{"role": "system", "content": "sys"}, {"role": "user", "content": "q"}]}
+def test_session_key_stable_within_session(main_module):
+    body = {"messages": [{"role": "system", "content": "sys"}, {"role": "user", "content": "opening turn"}]}
     key = main_module._session_key(body)
     assert key.startswith("m:")
     assert key == main_module._session_key(dict(reversed(list(body.items()))))
-    assert key != main_module._session_key({"messages": [{"role": "system", "content": "other"}]})
+
+
+def test_session_key_distinguishes_sessions_sharing_a_system_prompt(main_module):
+    """Concurrent sessions of one client share the system prompt; the opening
+    user turn must be what tells them apart."""
+    a = {"messages": [{"role": "system", "content": "sys"}, {"role": "user", "content": "session A"}]}
+    b = {"messages": [{"role": "system", "content": "sys"}, {"role": "user", "content": "session B"}]}
+    assert main_module._session_key(a) != main_module._session_key(b)
+
+
+def test_session_key_combines_user_with_messages(main_module):
+    """'user' is an end-user id, not a conversation id: same user, two
+    conversations -> two keys; two users, same transcript -> two keys."""
+    msgs = [{"role": "user", "content": "hi"}]
+    assert main_module._session_key({"user": "alice", "messages": msgs}) != main_module._session_key({"user": "alice", "messages": [{"role": "user", "content": "other"}]})
+    assert main_module._session_key({"user": "alice", "messages": msgs}) != main_module._session_key({"user": "bob", "messages": msgs})
 
 
 def test_session_key_empty_without_usable_input(main_module):
     assert main_module._session_key({}) == ""
     assert main_module._session_key({"messages": []}) == ""
+    assert main_module._session_key({"user": "alice"}) != ""  # user alone still pins
