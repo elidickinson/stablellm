@@ -113,7 +113,7 @@ async def test_4xx_also_triggers_failover(proxy_app):
 
 
 @pytest.mark.asyncio
-async def test_upstream_error_log_includes_request_context_and_body(proxy_app, capsys):
+async def test_upstream_error_log_includes_group_and_reason(proxy_app, capsys):
     def handler(req):
         if req.url.host == "a.test":
             return httpx.Response(400, json={"error": {"message": "bad model"}})
@@ -133,10 +133,10 @@ async def test_upstream_error_log_includes_request_context_and_body(proxy_app, c
     assert resp.status_code == 200
 
     logged = capsys.readouterr().err
-    assert "path=/v1/chat/completions" in logged
-    assert "requested_model='default'" in logged
-    assert "upstream_model='upstream-a'" in logged
+    assert "req=" in logged
+    assert "group='default'" in logged
     assert "messages=1" in logged
+    assert "marked down" in logged
     assert "bad model" in logged
 
 
@@ -158,6 +158,47 @@ async def test_all_endpoints_failing_returns_502(proxy_app):
     resp = await _post(app, {"model": "default", "messages": []})
     assert resp.status_code == 502
     assert "exhausted" in resp.json()["error"]
+
+
+@pytest.mark.asyncio
+async def test_all_endpoints_cooling_off_returns_502(proxy_app):
+    """With nothing left to try, exhaustion must still produce a 502, not a 500."""
+    def handler(req):
+        return httpx.Response(503, json={"error": "down"})
+
+    app, _calls, _ = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"default": {"endpoints": [{"provider": "a"}]}},
+        },
+        handler,
+    )
+    first = await _post(app, {"model": "default", "messages": []})
+    assert first.status_code == 502
+    # Endpoint is cooling off now; the next request skips it and must still 502.
+    second = await _post(app, {"model": "default", "messages": []})
+    assert second.status_code == 502
+    assert "cooling off" in second.json()["error"]
+
+
+@pytest.mark.asyncio
+async def test_race_group_without_raceable_providers_dispatches_seq(proxy_app, capsys):
+    """A race group with a single available provider runs sequentially: no
+    'race failed' warning, and the summary shows the actual dispatch mode."""
+    app, _calls, _ = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"default": {"mode": "race", "endpoints": [{"provider": "a"}]}},
+        },
+        lambda req: _ok_response(),
+    )
+    resp = await _post(app, {"model": "default", "messages": []})
+    assert resp.status_code == 200
+
+    logged = capsys.readouterr().err
+    assert "race failed" not in logged
+    assert "mode=seq" in logged
+    assert "mode=race" not in logged
 
 
 @pytest.mark.asyncio
@@ -245,6 +286,66 @@ async def test_streaming_response_passes_through_chunks(proxy_app):
     assert b"[DONE]" in chunks
 
 
+@pytest.mark.asyncio
+async def test_midstream_upstream_failure_emits_single_interrupted_row(proxy_app, monkeypatch):
+    """Upstream dying after headers yields exactly one terminal row: interrupted, with reason."""
+    async def broken_stream():
+        yield b'data: {"choices":[{"delta":{"content":"x"}}]}\n\n'
+        raise httpx.RemoteProtocolError("peer closed connection mid-stream")
+
+    def handler(req):
+        return httpx.Response(200, content=broken_stream(), headers={"content-type": "text/event-stream"})
+
+    app, _calls, main = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"default": {"endpoints": [{"provider": "a"}]}},
+        },
+        handler,
+    )
+    rows: list[object] = []
+    monkeypatch.setattr(main.requestlog, "log_request", rows.append)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        with pytest.raises(httpx.RemoteProtocolError):
+            async with c.stream("POST", "/v1/chat/completions", json={"model": "default", "stream": True, "messages": []}) as resp:
+                async for _chunk in resp.aiter_bytes():
+                    pass
+
+    assert len(rows) == 1
+    metrics = rows[0]
+    assert metrics.status == "interrupted"
+    assert "peer closed connection mid-stream" in metrics.reason
+
+
+@pytest.mark.asyncio
+async def test_streaming_failover_emits_single_terminal_row(proxy_app, monkeypatch):
+    """A rejected first attempt must not log; only the successful attempt gets a row."""
+    sse_body = b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+
+    def handler(req):
+        if req.url.host == "a.test":
+            return httpx.Response(503, json={"error": "down"})
+        return httpx.Response(200, content=sse_body, headers={"content-type": "text/event-stream"})
+
+    app, _calls, main = proxy_app(
+        {
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k"},
+                "b": {"base_url": "https://b.test", "api_key": "k"},
+            },
+            "groups": {"default": {"endpoints": [{"provider": "a"}, {"provider": "b"}]}},
+        },
+        handler,
+    )
+    rows: list[object] = []
+    monkeypatch.setattr(main.requestlog, "log_request", rows.append)
+
+    resp = await _post(app, {"model": "default", "messages": [], "stream": True})
+    assert resp.status_code == 200
+    assert [m.status for m in rows] == ["200"]
+
+
 # --- /stats ---
 
 @pytest.mark.asyncio
@@ -329,7 +430,7 @@ async def test_authenticated_client_name_reaches_request_log(proxy_app, monkeypa
         lambda r: _ok_response(),
     )
     logged: list[str] = []
-    monkeypatch.setattr(main.requestlog, "log_request", lambda m: logged.append(m.api_key_id))
+    monkeypatch.setattr(main.requestlog, "log_request", lambda m: logged.append(m.keyname))
 
     await _post(app, {"model": "default", "messages": []}, headers={"Authorization": "Bearer secret-one"})
     await _post(app, {"model": "default", "messages": []}, headers={"Authorization": "Bearer plain-two"})

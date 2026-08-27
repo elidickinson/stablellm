@@ -4,6 +4,7 @@ import hmac
 import json
 import logging
 import posixpath
+import secrets
 import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -53,7 +54,7 @@ class _DokployFormatter(logging.Formatter):
 
 
 _LOG_HANDLER = logging.StreamHandler()
-_LOG_HANDLER.setFormatter(_DokployFormatter("%(asctime)s %(levelname)s%(dokploy)s %(name)s: %(message)s"))
+_LOG_HANDLER.setFormatter(_DokployFormatter("%(asctime)s %(levelname)-7s%(dokploy)s %(name)s: %(message)s"))
 logging.basicConfig(
     level=getattr(logging, config.SETTINGS.log_level, logging.INFO),
     handlers=[_LOG_HANDLER],
@@ -68,9 +69,6 @@ for noisy in ("uvicorn.access", "httpx", "httpcore", "asyncio"):
 
 # endpoint index -> timestamp when it becomes available again
 _cooloff_until: dict[int, float] = {}
-
-# Track last used endpoint for change detection
-_last_endpoint_idx: int | None = None
 
 # endpoint index -> stats
 _stats = {
@@ -190,7 +188,7 @@ def _mark_down(idx: int, reason: str, request_context: str = ""):
     _stats["failures"][idx] += 1
     ep = config.ENDPOINTS[idx]
     context = f" ({request_context})" if request_context else ""
-    log.warning("endpoint %s marked down for %ss%s: %s", ep.base_url, cooloff, context, reason)
+    log.warning("endpoint %s marked down for %ss%s: %s", ep.base_url, cooloff, context, _clip(reason))
 
 
 class UpstreamError(Exception):
@@ -204,6 +202,20 @@ def _exception_detail(exc: BaseException) -> str:
     if msg:
         return f"{type(exc).__name__}: {msg}"
     return type(exc).__name__
+
+
+def _clip(text: str, limit: int = 200) -> str:
+    """Collapse whitespace (log lines must stay single-line) and cap length."""
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+async def _close_quietly(resp: httpx.Response):
+    """Release an upstream connection without masking the in-flight outcome."""
+    try:
+        await resp.aclose()
+    except BaseException:  # noqa: BLE001, S110 - cleanup must not mask the in-flight outcome
+        pass
 
 
 def _body_snippet(content: bytes, limit: int = 1000) -> str:
@@ -230,34 +242,28 @@ async def _http_error_reason(resp: httpx.Response) -> str:
     return reason
 
 
-def _request_context(path: str, body: dict, group: str = "", ep: Endpoint | None = None) -> str:
-    parts = [f"path=/v1/{path}"]
+def _request_context(body: dict, group: str = "", req_id: str = "") -> str:
+    """Slim per-request context for warnings: correlation id + routing shape."""
+    parts = [f"req={req_id or '-'}"]
     if group:
         parts.append(f"group={group!r}")
-    client_model = body.get("model", "")
-    if client_model:
-        parts.append(f"requested_model={client_model!r}")
-    if ep is not None:
-        parts.append(f"upstream_model={_effective_model(ep, client_model)!r}")
     parts.append(f"stream={bool(body.get('stream', False))}")
     messages = body.get("messages")
     if isinstance(messages, list):
         parts.append(f"messages={len(messages)}")
-    keys = sorted(k for k in body if k != "messages")
-    parts.append(f"keys={keys}")
     return " ".join(parts)
 
 
-def _authenticate(authorization: str | None) -> tuple[str, JSONResponse | None]:
-    """Returns (client name, error response). Name is empty when auth is disabled."""
+def _authenticate(authorization: str | None, req_id: str = "") -> tuple[str, JSONResponse | None]:
+    """Returns (key name, error response). Name is empty when auth is disabled."""
     if not API_KEYS:
         return "", None
     token = authorization[7:] if authorization and authorization.startswith("Bearer ") else ""
-    client = API_KEYS.get(hashlib.sha256(token.encode()).hexdigest()) if token else None
-    if client is None:
-        log.warning("auth failed: %s", "missing header" if not authorization else "invalid token")
+    keyname = API_KEYS.get(hashlib.sha256(token.encode()).hexdigest()) if token else None
+    if keyname is None:
+        log.warning("req=%s auth failed: %s", req_id or "-", "missing header" if not authorization else "invalid token")
         return "", JSONResponse({"error": "unauthorized"}, status_code=401)
-    return client, None
+    return keyname, None
 
 
 def _extract_usage_from_sse(buffer: bytearray, chunk: bytes) -> int | None:
@@ -272,13 +278,15 @@ def _extract_usage_from_sse(buffer: bytearray, chunk: bytes) -> int | None:
                     continue
                 try:
                     obj = json.loads(data)
-                    usage = obj.get("usage")
-                    if usage:
-                        ct = usage.get("completion_tokens")
-                        if ct is not None:
-                            return ct
                 except json.JSONDecodeError:
-                    pass
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                usage = obj.get("usage")
+                if isinstance(usage, dict):
+                    ct = usage.get("completion_tokens")
+                    if ct is not None:
+                        return ct
     return None
 
 
@@ -289,6 +297,7 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
     req = http_client.build_request("POST", url, headers=headers, content=body)
     resp = await http_client.send(req, stream=True)
     ttfb = time.monotonic() - t0
+    metrics.ttfb_ms = ttfb * 1000
 
     try:
         if resp.status_code != 200:
@@ -311,18 +320,20 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
                     chunk = await byte_iter.__anext__()
                     if metrics.ttft_ms is None:
                         metrics.ttft_ms = (time.monotonic() - t0) * 1000
-                        log.info("%s TTFT %.0fms (TTFB %.0fms)", ep.base_url, metrics.ttft_ms, ttfb * 1000)
+                        log.debug("req=%s %s TTFT %.0fms (TTFB %.0fms)", metrics.req_id, ep.provider, metrics.ttft_ms, ttfb * 1000)
                     primed.append(chunk)
                     via = _provider_from_sse(chunk)
                     if via:
                         break
             except StopAsyncIteration:
                 pass
+        metrics.via = via or ""
 
         async def generate():
             t_first = None
             completion_tokens = None
             sse_buf = bytearray()
+            outcome = "200"
             try:
                 for chunk in primed:
                     ct = _extract_usage_from_sse(sse_buf, chunk)
@@ -335,23 +346,36 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
                     if t_first is None:
                         t_first = time.monotonic()
                         metrics.ttft_ms = (t_first - t0) * 1000
-                        log.info("%s TTFT %.0fms (TTFB %.0fms)", ep.base_url, metrics.ttft_ms, ttfb * 1000)
+                        log.debug("req=%s %s TTFT %.0fms (TTFB %.0fms)", metrics.req_id, ep.provider, metrics.ttft_ms, ttfb * 1000)
                     ct = _extract_usage_from_sse(sse_buf, chunk)
                     if ct is not None:
                         completion_tokens = ct
                     yield chunk
-                if metrics.ttft_ms is not None and completion_tokens is not None:
-                    metrics.tokens_per_sec = completion_tokens / (time.monotonic() - t_first)
+            except (asyncio.CancelledError, GeneratorExit):
+                # Client hung up mid-stream (or response was closed early).
+                outcome = "aborted"
+                raise
+            except BaseException as exc:
+                # Upstream died after headers were sent; client saw a truncated stream.
+                outcome = "interrupted"
+                metrics.reason = _clip(_exception_detail(exc))
+                raise
             finally:
-                await resp.aclose()
+                if metrics.ttft_ms is not None and completion_tokens is not None and t_first is not None:
+                    duration = time.monotonic() - t_first
+                    if duration > 0:
+                        metrics.tokens_per_sec = completion_tokens / duration
+                metrics.tokens = completion_tokens
+                metrics.status = outcome
                 await asyncio.to_thread(requestlog.log_request, metrics)
+                await _close_quietly(resp)
 
         result = _streaming_response(resp, generate())
         if via:
             result.headers["X-StableLLM-Via"] = via
         return result, None
     except BaseException:
-        await resp.aclose()
+        await _close_quietly(resp)
         raise
 
 
@@ -377,16 +401,21 @@ async def _proxy_buffered(ep: Endpoint, path: str, headers: dict, body: bytes, m
         log.warning("upstream returned invalid JSON from %s (%s): %s", ep.base_url, request_context, reason)
         return None, reason
 
-    metrics.ttft_ms = elapsed * 1000
+    metrics.elapsed_ms = elapsed * 1000
     usage = data.get("usage")
+    tokens = None
     if usage:
         ct = usage.get("completion_tokens")
-        if ct is not None:
+        if ct is not None and elapsed > 0:
+            tokens = ct
             metrics.tokens_per_sec = ct / elapsed
 
-    log.info("%s TTFB %.0fms", ep.base_url, elapsed * 1000)
+    log.debug("req=%s %s TTFB %.0fms", metrics.req_id, ep.provider, elapsed * 1000)
 
     via = _openrouter_served_provider(data) if _openrouter_via(ep) else None
+    metrics.via = via or ""
+    metrics.tokens = tokens
+    metrics.status = "200"
     result = JSONResponse(content=data, status_code=resp.status_code)
     if via:
         result.headers["X-StableLLM-Via"] = via
@@ -519,14 +548,29 @@ def _strip_unsupported(body: dict, ep: Endpoint) -> dict:
     return _rewrite_model(base, ep)
 
 
-def _should_race(group: str) -> bool:
+def _should_race(group: str) -> tuple[bool, str]:
+    """(whether to race now, human-readable trigger reason)."""
     last_time = _group_last_race_time[group]
     count = _group_race_request_count[group]
     if last_time == 0.0:
-        return True
+        return True, "first request"
     if count >= config.SETTINGS.race_interval_requests:
-        return True
-    return time.monotonic() - last_time >= config.SETTINGS.race_interval_secs
+        return True, f"{count} requests since last race (>= {config.SETTINGS.race_interval_requests})"
+    if time.monotonic() - last_time >= config.SETTINGS.race_interval_secs:
+        return True, f"{config.SETTINGS.race_interval_secs}s since last race"
+    return False, ""
+
+
+def _endpoint_label(ep: Endpoint) -> str:
+    return ep.provider or ep.base_url
+
+
+def _pk_label(group: str, pk: tuple[str, str]) -> str:
+    """Display name for a (model, base_url) provider-group key."""
+    indices = _group_provider_groups.get(group, {}).get(pk, [])
+    if indices and indices[0] < len(config.ENDPOINTS):
+        return _endpoint_label(config.ENDPOINTS[indices[0]])
+    return pk[1]
 
 
 def _finish_race(race_times: dict[tuple[str, str], float], group: str):
@@ -537,13 +581,13 @@ def _finish_race(race_times: dict[tuple[str, str], float], group: str):
             new_order.append(k)
     _group_preferred_providers[group] = new_order
     log.info(
-        "race complete (group=%s): %s",
+        "race complete group=%s order=%s",
         group,
-        [(f"{k[1]} model={k[0]}", f"{v:.1f}s") for k, v in sorted(race_times.items(), key=lambda x: x[1])],
+        " ".join(f"{_pk_label(group, k)}({v:.1f}s)" for k, v in sorted(race_times.items(), key=lambda x: x[1])),
     )
 
 
-async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: str, client: str):
+async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: str, keyname: str, req_id: str, trigger: str):
     """Race one endpoint per provider group with real request. Returns response or None."""
     pg = _group_provider_groups[group]
 
@@ -555,7 +599,8 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                 break
 
     if len(candidates) <= 1:
-        return None
+        log.debug("req=%s race: skipped (need 2+ available candidates, have %d)", req_id, len(candidates))
+        return None, False
 
     # Reset race-cadence state on attempt so a failed race doesn't cause every
     # following request to retry the race against still-cooling-off endpoints.
@@ -564,12 +609,13 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
     _group_race_generation[group] += 1
     gen = _group_race_generation[group]
 
-    race_context = _request_context(path, body_dict, group)
-    log.info(
-        "race: starting with %d providers (%s): %s",
-        len(candidates),
-        race_context,
-        [f"{pk[1]} model={_effective_model(config.ENDPOINTS[idx], body_dict.get('model', ''))}" for pk, idx in candidates],
+    race_context = _request_context(body_dict, group, req_id)
+    log.debug(
+        "req=%s race: trigger=%s candidates=%s gen=%d",
+        req_id,
+        trigger,
+        [f"{_pk_label(group, pk)} model={_effective_model(config.ENDPOINTS[idx], body_dict.get('model', ''))}" for pk, idx in candidates],
+        gen,
     )
 
     race_times: dict[tuple[str, str], float] = {}
@@ -616,29 +662,28 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                     losers_to_drain.append((rpk, resp))
             except Exception as exc:  # noqa: BLE001 - a failed racer must not abort the request
                 race_state["failures"] += 1
-                _mark_down(idx, _exception_detail(exc), _request_context(path, body_dict, group, config.ENDPOINTS[idx]))
+                _mark_down(idx, _exception_detail(exc), _request_context(body_dict, group, req_id))
 
     if winner is None:
         for t in pending:
             t.cancel()
-        return None
+        return None, True
 
     win_pk, win_idx, win_resp = winner
     ep = config.ENDPOINTS[win_idx]
     model_name = _effective_model(ep, body_dict.get("model", ""))
-    log.info("race: first response from %s (model: %s) %.0fms", win_pk[1], model_name, (time.monotonic() - race_start) * 1000)
+    log.debug("req=%s race: winner %s (model=%s) %.0fms", req_id, _endpoint_label(ep), model_name, (time.monotonic() - race_start) * 1000)
     _stats["requests"][win_idx] += 1
 
-    global _last_endpoint_idx
-    if _last_endpoint_idx != win_idx:
-        log.info("using endpoint: %s (model: %s)", ep.base_url, model_name)
-        _last_endpoint_idx = win_idx
-
     race_metrics = requestlog.RequestMetrics(
-        api_key_id=client,
+        req_id=req_id,
+        keyname=keyname,
         model_requested=body_dict.get("model", "") if body_dict else "",
-        provider_served=win_pk[1],
+        provider_served=_endpoint_label(ep),
         model_served=model_name,
+        mode=config.MODE_RACE,
+        stream=is_streaming,
+        ttfb_ms=(time.monotonic() - race_start) * 1000,
     )
 
     async def _drain(pk, resp, idx=None):
@@ -647,10 +692,11 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                 pass
             await resp.aclose()
             race_times[pk] = time.monotonic() - race_start
+            log.debug("req=%s race: drain %s done %.1fs", req_id, _pk_label(group, pk), race_times[pk])
         except Exception as exc:  # noqa: BLE001 - drain failures are incidental
             race_state["failures"] += 1
             if idx is not None:
-                _mark_down(idx, _exception_detail(exc), _request_context(path, body_dict, group, config.ENDPOINTS[idx]))
+                _mark_down(idx, _exception_detail(exc), _request_context(body_dict, group, req_id))
         _maybe_finalize()
 
     async def _await_and_drain(task, pk, idx):
@@ -658,7 +704,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
             _, _, resp = await task
         except Exception as exc:  # noqa: BLE001 - a failed racer must not abort the request
             race_state["failures"] += 1
-            _mark_down(idx, _exception_detail(exc), _request_context(path, body_dict, group, config.ENDPOINTS[idx]))
+            _mark_down(idx, _exception_detail(exc), _request_context(body_dict, group, req_id))
             _maybe_finalize()
             return
         await _drain(pk, resp, idx)
@@ -692,22 +738,31 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                         break
             except StopAsyncIteration:
                 pass
-            except BaseException as exc:
-                # Winner stalled mid-priming (transport error or client cancel).
-                # Close it and fail the race so the caller falls back to
-                # sequential rather than 500-ing the client / leaking the conn.
+            except (asyncio.CancelledError, GeneratorExit):
+                # Request is dying (shutdown or client cancel): not the endpoint's
+                # fault, so no mark-down. This aborted row is the terminal line;
+                # the cancel propagates and no sequential fallback follows.
+                race_metrics.status = "aborted"
+                await asyncio.to_thread(requestlog.log_request, race_metrics)
+                await _close_quietly(win_resp)
+                raise
+            except BaseException as exc:  # noqa: BLE001 - any priming failure must fail the race, not the request
+                # Winner stalled mid-priming (transport error or similar). Close it
+                # and fail the race so the caller falls back to sequential rather
+                # than 500-ing the client / leaking the conn. No terminal row here:
+                # the sequential outcome owns it.
                 race_state["failures"] += 1
-                await win_resp.aclose()
                 _mark_down(win_idx, _exception_detail(exc), race_context)
+                await _close_quietly(win_resp)
                 _maybe_finalize()
-                if isinstance(exc, asyncio.CancelledError):
-                    raise
-                return None
+                return None, True
+        race_metrics.via = via or ""
 
         async def generate():
             t_first = None
             completion_tokens = None
             sse_buf = bytearray()
+            outcome = "200"
             try:
                 for chunk in primed:
                     ct = _extract_usage_from_sse(sse_buf, chunk)
@@ -724,27 +779,50 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                     if ct is not None:
                         completion_tokens = ct
                     yield chunk
-                if race_metrics.ttft_ms is not None and completion_tokens is not None:
-                    race_metrics.tokens_per_sec = completion_tokens / (time.monotonic() - t_first)
+            except (asyncio.CancelledError, GeneratorExit):
+                outcome = "aborted"
+                raise
+            except BaseException as exc:
+                outcome = "interrupted"
+                race_metrics.reason = _clip(_exception_detail(exc))
+                raise
             finally:
-                await win_resp.aclose()
+                if race_metrics.ttft_ms is not None and completion_tokens is not None and t_first is not None:
+                    duration = time.monotonic() - t_first
+                    if duration > 0:
+                        race_metrics.tokens_per_sec = completion_tokens / duration
+                race_metrics.tokens = completion_tokens
+                race_metrics.status = outcome
+                # Sync accounting first: a cancellation arriving during the awaits
+                # below must not skip race finalization.
                 race_times[win_pk] = time.monotonic() - race_start
                 _maybe_finalize()
                 await asyncio.to_thread(requestlog.log_request, race_metrics)
+                await _close_quietly(win_resp)
 
         result = _streaming_response(win_resp, generate())
         _stats["successes"][win_idx] += 1
         _set_meta_headers(result, provider=ep.provider, model=model_name, mode=config.MODE_RACE, group=group, via=via)
-        return result
+        return result, True
     else:
         chunks = []
         try:
             async for chunk in win_resp.aiter_bytes():
                 chunks.append(chunk)
-        finally:
-            await win_resp.aclose()
+        except httpx.TransportError as exc:
+            # Winner died mid-body; fail the race so the caller falls back to
+            # sequential. No terminal row: the sequential outcome owns it.
+            race_state["failures"] += 1
+            _mark_down(win_idx, _exception_detail(exc), race_context)
+            await _close_quietly(win_resp)
             race_times[win_pk] = time.monotonic() - race_start
             _maybe_finalize()
+            return None, True
+        await _close_quietly(win_resp)
+        race_times[win_pk] = time.monotonic() - race_start
+        _maybe_finalize()
+        elapsed = time.monotonic() - race_start
+        race_metrics.elapsed_ms = elapsed * 1000
         response_body = b"".join(chunks)
         try:
             data = json.loads(response_body)
@@ -753,21 +831,28 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
             detail = _body_snippet(response_body)
             if detail:
                 reason = f"{reason}: {detail}"
-            log.error("upstream returned invalid JSON from race winner %s (%s): %s", ep.base_url, race_context, reason)
-            return JSONResponse({"error": "upstream returned invalid JSON"}, status_code=502)
-        elapsed = time.monotonic() - race_start
-        race_metrics.ttft_ms = elapsed * 1000
+            race_metrics.status = "502"
+            race_metrics.reason = _clip(reason)
+            await asyncio.to_thread(requestlog.log_request, race_metrics)
+            return JSONResponse({"error": "upstream returned invalid JSON"}, status_code=502), True
         usage = data.get("usage")
+        tokens = None
         if usage:
             ct = usage.get("completion_tokens")
-            if ct is not None:
+            if ct is not None and elapsed > 0:
+                tokens = ct
                 race_metrics.tokens_per_sec = ct / elapsed
+        race_metrics.tokens = tokens
+        via = _openrouter_served_provider(data) if _openrouter_via(ep) else None
+        race_metrics.via = via or ""
+        race_metrics.status = "200"
         await asyncio.to_thread(requestlog.log_request, race_metrics)
         result = JSONResponse(content=data, status_code=win_resp.status_code)
-        via = _openrouter_served_provider(data) if _openrouter_via(ep) else None
+        if via:
+            result.headers["X-StableLLM-Via"] = via
         _stats["successes"][win_idx] += 1
         _set_meta_headers(result, provider=ep.provider, model=model_name, mode=config.MODE_RACE, group=group, via=via)
-        return result
+        return result, True
 
 
 @app.get("/health")
@@ -984,8 +1069,6 @@ def _reset_runtime_state():
     _stats["failures"].clear()
     _group_race_request_count.clear()
     _group_last_race_time.clear()
-    global _last_endpoint_idx
-    _last_endpoint_idx = None
 
 
 EDITOR_AUTH_DELAY_SECS = 0.5
@@ -1061,7 +1144,8 @@ async def config_save(request: Request, x_config_password: str | None = Header(N
 
 @app.post("/v1/{path:path}")
 async def proxy(request: Request, path: str, authorization: str | None = Header(None)):
-    client, auth_err = _authenticate(authorization)
+    req_id = secrets.token_hex(8)
+    keyname, auth_err = _authenticate(authorization, req_id)
     if auth_err:
         return auth_err
 
@@ -1092,24 +1176,32 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
 
     group_name = model.lower()
     if group_name not in config.GROUPS:
-        log.warning("unknown model for /v1/%s: requested_model=%r available=%s", path, model, sorted(config.GROUPS))
+        log.warning("req=%s unknown model: requested_model=%r available=%s", req_id, model, sorted(config.GROUPS))
         return JSONResponse({"error": f"unknown model: '{model}'"}, status_code=404)
 
     mode = mode_override or config.GROUPS[group_name].mode
 
-    log.info(
-        "-> /v1/%s model=%r group=%s mode=%s stream=%s client=%s",
-        path, model, group_name, mode, is_streaming, client or "-",
+    log.debug(
+        "req=%s -> model=%r group=%s mode=%s stream=%s keyname=%s",
+        req_id, model, group_name, mode, is_streaming, keyname or "-",
     )
 
+    dispatch_mode = mode
     if mode == config.MODE_RACE:
         _group_race_request_count[group_name] += 1
 
-        if _should_race(group_name):
-            result = await _race_request(path, body_dict, is_streaming, group_name, client)
+        should_race, trigger = _should_race(group_name)
+        if should_race:
+            result, raced = await _race_request(path, body_dict, is_streaming, group_name, keyname, req_id, trigger)
             if result is not None:
                 return result
-            log.warning("race failed (%s), falling back to sequential", _request_context(path, body_dict, group_name))
+            if raced:
+                dispatch_mode = "race-fallback"
+                log.warning("race failed (%s), falling back to sequential", _request_context(body_dict, group_name, req_id))
+            else:
+                dispatch_mode = "seq"
+        else:
+            dispatch_mode = "seq"
 
         pref = _group_preferred_providers[group_name]
         pg = _group_provider_groups[group_name]
@@ -1120,33 +1212,35 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         endpoint_order = config.GROUPS[group_name].endpoints
 
     last_failure = None
-    for idx in endpoint_order:
+    total = len(endpoint_order)
+    for attempt, idx in enumerate(endpoint_order, 1):
         ep = config.ENDPOINTS[idx]
         if not _is_available(idx):
-            log.info("skipping %s (cooling off)", ep.base_url)
+            log.debug("req=%s skipping %s (cooling off, %.0fs left)", req_id, ep.provider or ep.base_url, _cooloff_until[idx] - time.monotonic())
             continue
 
         _stats["requests"][idx] += 1
 
         stripped = _strip_unsupported(body_dict, ep)
         send_body = json.dumps(stripped).encode()
-        log.debug("-> %s body (keys): %s", ep.base_url, list(stripped.keys()))
-
-        headers = _build_upstream_headers(ep)
-        log.debug(
-            "-> %s headers: %s",
-            ep.base_url,
-            {k: v for k, v in headers.items() if k.lower() != "authorization"},
-        )
 
         client_model = body_dict.get("model", "")
         model_name = _effective_model(ep, client_model)
-        request_context = _request_context(path, body_dict, group_name, ep)
+        log.debug(
+            "req=%s attempt %d/%d -> %s model=%s body_keys=%s bytes=%d",
+            req_id, attempt, total, ep.provider or ep.base_url, model_name, list(stripped.keys()), len(send_body),
+        )
+
+        headers = _build_upstream_headers(ep)
+        request_context = _request_context(body_dict, group_name, req_id)
         metrics = requestlog.RequestMetrics(
-            api_key_id=client,
+            req_id=req_id,
+            keyname=keyname,
             model_requested=client_model,
-            provider_served=ep.base_url,
+            provider_served=ep.provider or ep.base_url,
             model_served=model_name,
+            mode=dispatch_mode,
+            stream=is_streaming,
         )
 
         try:
@@ -1157,10 +1251,6 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
 
             if result is not None:
                 _stats["successes"][idx] += 1
-                global _last_endpoint_idx
-                if _last_endpoint_idx != idx:
-                    log.info("using endpoint: %s (model: %s)", ep.base_url, model_name)
-                    _last_endpoint_idx = idx
                 _set_meta_headers(result, provider=ep.provider, model=model_name, mode=mode, group=group_name)
                 return result
 
@@ -1172,7 +1262,19 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             _mark_down(idx, reason, request_context)
             last_failure = reason
 
-    log.error("all endpoints failed (exhausted) for %s (last: %s)", _request_context(path, body_dict, group_name), last_failure)
+    if last_failure is None:
+        # Every endpoint was skipped (cooling off) -- nothing was actually tried.
+        last_failure = "no endpoints available (all cooling off)"
+    exhaustion = requestlog.RequestMetrics(
+        req_id=req_id,
+        keyname=keyname,
+        model_requested=model,
+        mode=dispatch_mode,
+        stream=is_streaming,
+        status="502",
+        reason=f"all endpoints failed (last: {_clip(last_failure)})",
+    )
+    await asyncio.to_thread(requestlog.log_request, exhaustion)
     return JSONResponse(
         {"error": f"all endpoints exhausted (last: {last_failure})"},
         status_code=502,
