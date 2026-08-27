@@ -1108,7 +1108,8 @@ async def stats(authorization: str | None = Header(None)):
             "preferred_providers": [{"model": m, "base_url": u} for m, u in _group_preferred_providers.get(name, [])],
             "requests_since_last_race": _group_race_request_count.get(name, 0),
         }
-    result["inflight"] = {f"{base_url} model={model!r}": n for (base_url, model), n in sorted(_inflight.items()) if n}
+    # No filter: a zero or negative row is exactly the accounting bug signal we want visible.
+    result["inflight"] = {f"{base_url} model={model!r}": n for (base_url, model), n in sorted(_inflight.items())}
     result["session_pins"] = len(_session_pins)
     return result
 
