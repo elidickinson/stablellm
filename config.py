@@ -19,6 +19,8 @@ class Provider:
     base_url: str
     api_key: str
     model: str = ""  # default model when group entry omits it
+    max_concurrency: int = 0  # per-(model) in-flight cap; 0 = unlimited
+    ttfb_deadline_secs: float = 0.0  # fail over if response headers don't arrive; 0 = disabled
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,8 @@ class Endpoint:
     model: str = ""  # empty → pass through client's model
     keep_reasoning: bool = False
     provider: str = ""
+    max_concurrency: int = 0
+    ttfb_deadline_secs: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -151,8 +155,28 @@ def _parse_providers(raw: object) -> dict[str, Provider]:
             base_url=str(entry["base_url"]).rstrip("/"),
             api_key=_env_substitute(str(entry["api_key"])),
             model=str(entry.get("model", "")),
+            max_concurrency=_opt_count(entry.get("max_concurrency"), "max_concurrency", 0),
+            ttfb_deadline_secs=_opt_secs(entry.get("ttfb_deadline_secs"), "ttfb_deadline_secs", 0.0),
         )
     return providers
+
+
+def _opt_count(value: object, key: str, default: int) -> int:
+    """Optional non-negative int (0 = unlimited); absent → default."""
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ConfigError(f"'{key}' must be a non-negative integer (0 = unlimited)")
+    return value
+
+
+def _opt_secs(value: object, key: str, default: float) -> float:
+    """Optional non-negative number of seconds (0 = disabled); absent → default."""
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ConfigError(f"'{key}' must be a non-negative number of seconds (0 = disabled)")
+    return float(value)
 
 
 def _meta_str(value: object, key: str) -> str:
@@ -281,6 +305,8 @@ def _parse_groups(raw: object, providers: dict[str, Provider]) -> tuple[dict[str
                 model=str(entry.get("model", prov.model)),
                 keep_reasoning="keep_reasoning" in flags,
                 provider=prov_lower,
+                max_concurrency=_opt_count(entry.get("max_concurrency"), "max_concurrency", prov.max_concurrency),
+                ttfb_deadline_secs=_opt_secs(entry.get("ttfb_deadline_secs"), "ttfb_deadline_secs", prov.ttfb_deadline_secs),
             ))
             indices.append(len(endpoints) - 1)
 

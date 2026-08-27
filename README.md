@@ -67,7 +67,10 @@ groups:
       - provider: openai
 ```
 
-**`providers`** — a registry of upstream API endpoints. Each has a `base_url` and `api_key`. Optionally set `model` here as a provider-wide default — used when a group entry omits `model`.
+**`providers`** — a registry of upstream API endpoints. Each has a `base_url` and `api_key`. Optionally set `model` here as a provider-wide default — used when a group entry omits `model`. Two optional per-provider settings, both inheritable to (and overridable on) individual group entries:
+
+- `max_concurrency` — maximum in-flight requests per model (0/unset = unlimited). When an endpoint is at its cap, routing skips it immediately instead of queueing behind providers like synthetic.new, which silently hold queued requests until a slot frees. Counted per `(provider, model)` across all groups. The slot is held until the response is fully consumed, including the whole lifetime of a stream.
+- `ttfb_deadline_secs` — fail over if response headers don't arrive within this many seconds (0/unset = disabled). Queued requests are indistinguishable from slow ones — providers withhold headers while a request waits for a slot, with no error and no keepalives — so this is the only externally visible tripwire for queueing the proxy can't see (e.g. another client sharing the same API key).
 
 **`groups`** — maps a request model name to a routing mode and an ordered list of upstream entries. Each group has:
 
@@ -76,6 +79,7 @@ groups:
   - `provider` — name from the providers section (required)
   - `model` — model name to send upstream. If omitted, falls back to the provider's `model` (if set), otherwise the client's requested model passes through unchanged.
   - `flags` — per-endpoint flags: `keep_reasoning` preserves `reasoning`/`reasoning_content`/`thinking` fields in messages (otherwise stripped).
+  - `max_concurrency` / `ttfb_deadline_secs` — per-endpoint overrides of the provider-level settings above.
 - `meta` — optional descriptive metadata published on `/v1/models` in OpenRouter's response shape. When set, the entry uses OpenRouter keys (`context_length`, `architecture`, `pricing`, `top_provider`, `reasoning`) instead of the minimal OpenAI shape. All fields optional. Fields:
   - `name` / `description`
   - `context` / `max_output` — window and max completion tokens (tokens)
@@ -105,6 +109,12 @@ The request's `model` field selects the group. Within that group, the routing mo
 - **`race`** — send the request to one endpoint per provider concurrently; the fastest response wins and becomes the preferred provider for subsequent requests. A re-race triggers when either `race_interval_requests` requests have passed or `race_interval_secs` seconds have elapsed since the last race (defaults: **25 requests** or **6 hours**). If the race fails, the proxy falls back to sequential.
 
 The client can override a group's mode with a `:race` or `:seq` suffix on the model name (e.g. `glm-4.7:race`).
+
+### Session pinning
+
+Sequential routing is sticky per conversation: the session key (the client's `user` field if set, else a hash of the first message) is pinned to the endpoint that served its previous request, and that endpoint is tried first for ~10 minutes after each use. When something forces a failover (failure, cooloff, concurrency cap), the session bounces once and then re-pins to the new endpoint instead of re-contesting the old one — keeping upstream prompt caches warm. Racing requests are exempt; they bounce by design.
+
+Pins are visible on `/stats` (`session_pins`, `inflight`) and are cleared on config reload.
 
 ## Response metadata
 

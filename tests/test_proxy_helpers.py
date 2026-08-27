@@ -248,3 +248,24 @@ def test_should_race_true_after_time_threshold(main_module):
     main_module._group_race_request_count["default"] = 0
     should, _ = main_module._should_race("default")
     assert should is True
+
+
+# --- _session_key ---
+
+
+def test_session_key_prefers_user_field(main_module):
+    body = {"user": "alice", "messages": [{"role": "user", "content": "hi"}]}
+    assert main_module._session_key(body) == "u:alice"
+
+
+def test_session_key_hashes_first_message_stably(main_module):
+    body = {"messages": [{"role": "system", "content": "sys"}, {"role": "user", "content": "q"}]}
+    key = main_module._session_key(body)
+    assert key.startswith("m:")
+    assert key == main_module._session_key(dict(reversed(list(body.items()))))
+    assert key != main_module._session_key({"messages": [{"role": "system", "content": "other"}]})
+
+
+def test_session_key_empty_without_usable_input(main_module):
+    assert main_module._session_key({}) == ""
+    assert main_module._session_key({"messages": []}) == ""

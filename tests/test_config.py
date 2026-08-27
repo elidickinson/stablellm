@@ -347,3 +347,47 @@ def test_meta_default_enabled_false_requires_efforts_is_config_error():
                 "supports_reasoning": True, "reasoning_default_enabled": False,
             }}},
         })
+
+
+# --- concurrency cap / ttfb deadline settings ---
+
+
+def test_concurrency_settings_default_off(make_config):
+    cfg = make_config(make_minimal())
+    assert cfg.ENDPOINTS[0].max_concurrency == 0
+    assert cfg.ENDPOINTS[0].ttfb_deadline_secs == 0.0
+
+
+def test_provider_concurrency_settings_inherited_by_endpoints(make_config):
+    cfg = make_config({
+        "providers": {"a": {"base_url": "https://a", "api_key": "k", "max_concurrency": 2, "ttfb_deadline_secs": 7.5}},
+        "groups": {"default": _group([{"provider": "a"}])},
+    })
+    assert cfg.ENDPOINTS[0].max_concurrency == 2
+    assert cfg.ENDPOINTS[0].ttfb_deadline_secs == 7.5
+
+
+def test_endpoint_concurrency_overrides_provider(make_config):
+    cfg = make_config({
+        "providers": {"a": {"base_url": "https://a", "api_key": "k", "max_concurrency": 2, "ttfb_deadline_secs": 2}},
+        "groups": {"default": _group([
+            {"provider": "a", "max_concurrency": 1},
+            {"provider": "a", "ttfb_deadline_secs": 0},
+        ])},
+    })
+    assert cfg.ENDPOINTS[0].max_concurrency == 1
+    assert cfg.ENDPOINTS[0].ttfb_deadline_secs == 2  # inherited
+    assert cfg.ENDPOINTS[1].max_concurrency == 2  # inherited
+    assert cfg.ENDPOINTS[1].ttfb_deadline_secs == 0.0  # explicit 0 disables
+
+
+def test_max_concurrency_must_be_nonneg_int_is_config_error():
+    raw = make_minimal({"a": {"base_url": "https://a", "api_key": "k", "max_concurrency": -1}})
+    with pytest.raises(ConfigError, match="max_concurrency"):
+        parse_config(raw)
+
+
+def test_ttfb_deadline_must_be_nonneg_number_is_config_error():
+    raw = make_minimal({"a": {"base_url": "https://a", "api_key": "k", "ttfb_deadline_secs": "soon"}})
+    with pytest.raises(ConfigError, match="ttfb_deadline_secs"):
+        parse_config(raw)

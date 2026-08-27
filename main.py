@@ -70,6 +70,21 @@ for noisy in ("uvicorn.access", "httpx", "httpcore", "asyncio"):
 # endpoint index -> timestamp when it becomes available again
 _cooloff_until: dict[int, float] = {}
 
+# (base_url, effective model) -> in-flight request count, for provider
+# concurrency caps. Keyed by model because providers like synthetic cap per
+# model, and across groups so shared provider+model pairs share one budget.
+# NOT cleared on config reload: keys survive index shifts, and in-flight
+# requests from the old config must release against the same counters.
+_inflight: dict[tuple[str, str], int] = defaultdict(int)
+
+# (group, session key) -> (endpoint index, last-used monotonic timestamp).
+# Keeps a session on the endpoint that last served it so upstream prompt
+# caches stay warm; the cap-skip may bounce a session once, and the pin then
+# follows it to the new endpoint instead of re-contesting the old one.
+_session_pins: dict[tuple[str, str], tuple[int, float]] = {}
+_PIN_TTL_SECS = 600.0
+_PIN_TABLE_MAX = 500
+
 # endpoint index -> stats
 _stats = {
     "requests": defaultdict(int),
@@ -182,6 +197,78 @@ def _is_available(idx: int) -> bool:
     return time.monotonic() >= _cooloff_until.get(idx, 0)
 
 
+def _at_cap(ep: Endpoint, model_name: str) -> bool:
+    return bool(ep.max_concurrency) and _inflight[(ep.base_url, model_name)] >= ep.max_concurrency
+
+
+def _try_acquire_slot(ep: Endpoint, model_name: str) -> bool:
+    """Non-blocking acquire of the endpoint's per-model concurrency slot."""
+    if not ep.max_concurrency:
+        return True
+    if _at_cap(ep, model_name):
+        return False
+    _inflight[(ep.base_url, model_name)] += 1
+    return True
+
+
+def _slot_releaser(ep: Endpoint, model_name: str):
+    """Idempotent release closure; safe to call from multiple exit paths.
+    Slots are held until the response is fully consumed (stream included)."""
+    released = False
+
+    def release():
+        nonlocal released
+        if released:
+            return
+        released = True
+        if ep.max_concurrency:
+            _inflight[(ep.base_url, model_name)] -= 1
+
+    return release
+
+
+def _session_key(body: dict) -> str:
+    """Stable per-conversation key for session pinning: the client-supplied
+    'user' field, else a hash of the first message (system prompt + opening
+    turn are stable across the requests of a session). Empty if derivable."""
+    user = body.get("user")
+    if isinstance(user, str) and user:
+        return "u:" + user
+    messages = body.get("messages")
+    if isinstance(messages, list) and messages:
+        try:
+            first = json.dumps(messages[0], sort_keys=True, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return ""
+        return "m:" + hashlib.sha256(first.encode()).hexdigest()[:16]
+    return ""
+
+
+def _pinned_endpoint(group: str, skey: str) -> int | None:
+    if not skey:
+        return None
+    entry = _session_pins.get((group, skey))
+    if entry is None:
+        return None
+    idx, ts = entry
+    if time.monotonic() - ts > _PIN_TTL_SECS:
+        del _session_pins[(group, skey)]
+        return None
+    return idx
+
+
+def _set_session_pin(group: str, skey: str, idx: int):
+    if not skey:
+        return
+    if len(_session_pins) >= _PIN_TABLE_MAX and (group, skey) not in _session_pins:
+        now = time.monotonic()
+        for k in [k for k, (_, ts) in _session_pins.items() if now - ts > _PIN_TTL_SECS]:
+            del _session_pins[k]
+        if len(_session_pins) >= _PIN_TABLE_MAX:
+            del _session_pins[min(_session_pins, key=lambda k: _session_pins[k][1])]
+    _session_pins[(group, skey)] = (idx, time.monotonic())
+
+
 def _mark_down(idx: int, reason: str, request_context: str = ""):
     cooloff = config.SETTINGS.cooloff_seconds
     _cooloff_until[idx] = time.monotonic() + cooloff
@@ -193,6 +280,21 @@ def _mark_down(idx: int, reason: str, request_context: str = ""):
 
 class UpstreamError(Exception):
     pass
+
+
+async def _send_upstream(req: httpx.Request, ep: Endpoint, *, stream: bool) -> httpx.Response:
+    """Send the request, honoring the endpoint's ttfb_deadline_secs.
+
+    A request queued behind a provider's concurrency limit is indistinguishable
+    from a slow one: the provider withholds response headers until a slot frees,
+    with no 429 and no keepalives. The header deadline is the only externally
+    visible tripwire for that state."""
+    if not ep.ttfb_deadline_secs:
+        return await http_client.send(req, stream=stream)
+    try:
+        return await asyncio.wait_for(http_client.send(req, stream=stream), ep.ttfb_deadline_secs)
+    except TimeoutError:
+        raise UpstreamError(f"no response headers within {ep.ttfb_deadline_secs:g}s") from None
 
 
 def _exception_detail(exc: BaseException) -> str:
@@ -290,12 +392,20 @@ def _extract_usage_from_sse(buffer: bytearray, chunk: bytes) -> int | None:
     return None
 
 
-async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, metrics, request_context: str):
-    """Stream response from upstream. Returns (StreamingResponse, None) or (None, reason)."""
+async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, metrics, request_context: str, on_done=None):
+    """Stream response from upstream. Returns (StreamingResponse, None) or (None, reason).
+
+    on_done (optional) fires once the stream has been fully consumed; every
+    earlier exit leaves cleanup to the caller."""
     url = f"{ep.base_url}/{path}"
     t0 = time.monotonic()
     req = http_client.build_request("POST", url, headers=headers, content=body)
-    resp = await http_client.send(req, stream=True)
+    try:
+        resp = await _send_upstream(req, ep, stream=True)
+    except UpstreamError as exc:
+        reason = _exception_detail(exc)
+        log.warning("upstream rejected streaming request to %s (%s): %s", ep.base_url, request_context, reason)
+        return None, reason
     ttfb = time.monotonic() - t0
     metrics.ttfb_ms = ttfb * 1000
 
@@ -367,6 +477,8 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
                         metrics.tokens_per_sec = completion_tokens / duration
                 metrics.tokens = completion_tokens
                 metrics.status = outcome
+                if on_done:
+                    on_done()
                 await asyncio.to_thread(requestlog.log_request, metrics)
                 await _close_quietly(resp)
 
@@ -383,19 +495,29 @@ async def _proxy_buffered(ep: Endpoint, path: str, headers: dict, body: bytes, m
     """Non-streaming: send request, return full response or (None, reason)."""
     url = f"{ep.base_url}/{path}"
     t0 = time.monotonic()
-    resp = await http_client.post(url, headers=headers, content=body)
-    elapsed = time.monotonic() - t0
-
-    if resp.status_code != 200:
-        reason = await _http_error_reason(resp)
+    req = http_client.build_request("POST", url, headers=headers, content=body)
+    try:
+        resp = await _send_upstream(req, ep, stream=True)
+    except UpstreamError as exc:
+        reason = _exception_detail(exc)
         log.warning("upstream rejected buffered request to %s (%s): %s", ep.base_url, request_context, reason)
         return None, reason
+    metrics.ttfb_ms = (time.monotonic() - t0) * 1000
+    try:
+        if resp.status_code != 200:
+            reason = await _http_error_reason(resp)
+            log.warning("upstream rejected buffered request to %s (%s): %s", ep.base_url, request_context, reason)
+            return None, reason
+        content = await resp.aread()
+    finally:
+        await _close_quietly(resp)
+    elapsed = time.monotonic() - t0
 
     try:
-        data = resp.json()
+        data = json.loads(content)
     except Exception as exc:  # noqa: BLE001 - upstream garbage must degrade, not crash
         reason = f"invalid JSON: {_exception_detail(exc)}"
-        detail = _body_snippet(resp.content)
+        detail = _body_snippet(content)
         if detail:
             reason = f"{reason}: {detail}"
         log.warning("upstream returned invalid JSON from %s (%s): %s", ep.base_url, request_context, reason)
@@ -594,7 +716,9 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
     candidates: list[tuple[tuple[str, str], int]] = []
     for key, indices in pg.items():
         for idx in indices:
-            if _is_available(idx):
+            ep = config.ENDPOINTS[idx]
+            model_name = _effective_model(ep, body_dict.get("model", ""))
+            if _is_available(idx) and not _at_cap(ep, model_name):
                 candidates.append((key, idx))
                 break
 
@@ -632,44 +756,62 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
 
     async def _send(pk: tuple, idx: int):
         ep = config.ENDPOINTS[idx]
-        headers = _build_upstream_headers(ep)
-        stripped = _strip_unsupported(body_dict, ep)
-        send_body = json.dumps(stripped).encode()
-        url = f"{ep.base_url}/{path}"
-        req = http_client.build_request("POST", url, headers=headers, content=send_body)
-        resp = await http_client.send(req, stream=True)
+        model_name = _effective_model(ep, body_dict.get("model", ""))
+        if not _try_acquire_slot(ep, model_name):
+            # Candidates were pre-checked; this can only happen if another
+            # route to the same (base_url, model) grabbed the slot meanwhile.
+            raise UpstreamError(f"concurrency cap {ep.max_concurrency} reached")
+        release = _slot_releaser(ep, model_name)
+        try:
+            headers = _build_upstream_headers(ep)
+            stripped = _strip_unsupported(body_dict, ep)
+            send_body = json.dumps(stripped).encode()
+            url = f"{ep.base_url}/{path}"
+            req = http_client.build_request("POST", url, headers=headers, content=send_body)
+            resp = await _send_upstream(req, ep, stream=True)
+        except BaseException:
+            release()
+            raise
         if resp.status_code != 200:
             reason = await _http_error_reason(resp)
-            await resp.aclose()
+            await _close_quietly(resp)
+            release()
             raise UpstreamError(reason)
-        return pk, idx, resp
+        return pk, idx, resp, release
 
     tasks = {asyncio.create_task(_send(pk, idx)): (pk, idx) for pk, idx in candidates}
 
     winner = None
-    losers_to_drain: list[tuple[tuple[str, str], httpx.Response]] = []
+    losers_to_drain: list[tuple] = []
     pending = set(tasks.keys())
 
-    while pending and winner is None:
-        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            pk, idx = tasks[task]
-            try:
-                rpk, ridx, resp = task.result()
-                if winner is None:
-                    winner = (rpk, ridx, resp)
-                else:
-                    losers_to_drain.append((rpk, resp))
-            except Exception as exc:  # noqa: BLE001 - a failed racer must not abort the request
-                race_state["failures"] += 1
-                _mark_down(idx, _exception_detail(exc), _request_context(body_dict, group, req_id))
+    try:
+        while pending and winner is None:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                pk, idx = tasks[task]
+                try:
+                    rpk, ridx, resp, release = task.result()
+                    if winner is None:
+                        winner = (rpk, ridx, resp, release)
+                    else:
+                        losers_to_drain.append((rpk, ridx, resp, release))
+                except Exception as exc:  # noqa: BLE001 - a failed racer must not abort the request
+                    race_state["failures"] += 1
+                    _mark_down(idx, _exception_detail(exc), _request_context(body_dict, group, req_id))
+    except BaseException:
+        # Request cancelled mid-race (client hangup): still-acquiring racers must
+        # release their concurrency slots, not leak them.
+        for t in pending:
+            t.cancel()
+        raise
 
     if winner is None:
         for t in pending:
             t.cancel()
         return None, True
 
-    win_pk, win_idx, win_resp = winner
+    win_pk, win_idx, win_resp, win_release = winner
     ep = config.ENDPOINTS[win_idx]
     model_name = _effective_model(ep, body_dict.get("model", ""))
     log.debug("req=%s race: winner %s (model=%s) %.0fms", req_id, _endpoint_label(ep), model_name, (time.monotonic() - race_start) * 1000)
@@ -686,36 +828,37 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         ttfb_ms=(time.monotonic() - race_start) * 1000,
     )
 
-    async def _drain(pk, resp, idx=None):
+    async def _drain(pk, resp, idx, release):
         try:
             async for _ in resp.aiter_bytes():
                 pass
-            await resp.aclose()
             race_times[pk] = time.monotonic() - race_start
             log.debug("req=%s race: drain %s done %.1fs", req_id, _pk_label(group, pk), race_times[pk])
         except Exception as exc:  # noqa: BLE001 - drain failures are incidental
             race_state["failures"] += 1
-            if idx is not None:
-                _mark_down(idx, _exception_detail(exc), _request_context(body_dict, group, req_id))
-        _maybe_finalize()
+            _mark_down(idx, _exception_detail(exc), _request_context(body_dict, group, req_id))
+        finally:
+            await _close_quietly(resp)
+            release()
+            _maybe_finalize()
 
     async def _await_and_drain(task, pk, idx):
         try:
-            _, _, resp = await task
+            _, _, resp, release = await task
         except Exception as exc:  # noqa: BLE001 - a failed racer must not abort the request
             race_state["failures"] += 1
             _mark_down(idx, _exception_detail(exc), _request_context(body_dict, group, req_id))
             _maybe_finalize()
             return
-        await _drain(pk, resp, idx)
+        await _drain(pk, resp, idx, release)
 
     def _bg(coro):
         t = asyncio.create_task(coro)
         _background_tasks.add(t)
         t.add_done_callback(_background_tasks.discard)
 
-    for pk, resp in losers_to_drain:
-        _bg(_drain(pk, resp))
+    for pk, idx, resp, release in losers_to_drain:
+        _bg(_drain(pk, resp, idx, release))
     for task in pending:
         pk, idx = tasks[task]
         _bg(_await_and_drain(task, pk, idx))
@@ -743,6 +886,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                 # fault, so no mark-down. This aborted row is the terminal line;
                 # the cancel propagates and no sequential fallback follows.
                 race_metrics.status = "aborted"
+                win_release()
                 await asyncio.to_thread(requestlog.log_request, race_metrics)
                 await _close_quietly(win_resp)
                 raise
@@ -753,6 +897,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                 # the sequential outcome owns it.
                 race_state["failures"] += 1
                 _mark_down(win_idx, _exception_detail(exc), race_context)
+                win_release()
                 await _close_quietly(win_resp)
                 _maybe_finalize()
                 return None, True
@@ -797,6 +942,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                 # below must not skip race finalization.
                 race_times[win_pk] = time.monotonic() - race_start
                 _maybe_finalize()
+                win_release()
                 await asyncio.to_thread(requestlog.log_request, race_metrics)
                 await _close_quietly(win_resp)
 
@@ -817,6 +963,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
             return None, True
         finally:
             await _close_quietly(win_resp)
+            win_release()
             race_times[win_pk] = time.monotonic() - race_start
             _maybe_finalize()
         elapsed = time.monotonic() - race_start
@@ -961,6 +1108,8 @@ async def stats(authorization: str | None = Header(None)):
             "preferred_providers": [{"model": m, "base_url": u} for m, u in _group_preferred_providers.get(name, [])],
             "requests_since_last_race": _group_race_request_count.get(name, 0),
         }
+    result["inflight"] = {f"{base_url} model={model!r}": n for (base_url, model), n in sorted(_inflight.items()) if n}
+    result["session_pins"] = len(_session_pins)
     return result
 
 
@@ -1067,6 +1216,7 @@ def _reset_runtime_state():
     _stats["failures"].clear()
     _group_race_request_count.clear()
     _group_last_race_time.clear()
+    _session_pins.clear()  # pin values are endpoint indices; stale after reload
 
 
 EDITOR_AUTH_DELAY_SECS = 0.5
@@ -1210,11 +1360,27 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         endpoint_order = config.GROUPS[group_name].endpoints
 
     last_failure = None
-    total = len(endpoint_order)
-    for attempt, idx in enumerate(endpoint_order, 1):
+    session_key = _session_key(body_dict)
+    order = list(endpoint_order)
+    pinned = _pinned_endpoint(group_name, session_key)
+    if pinned in order:
+        # Prefer the endpoint that served this session's previous request so
+        # upstream prompt caches stay warm.
+        order.remove(pinned)
+        order.insert(0, pinned)
+        log.debug("req=%s pinned session -> %s", req_id, _endpoint_label(config.ENDPOINTS[pinned]))
+    total = len(order)
+    for attempt, idx in enumerate(order, 1):
         ep = config.ENDPOINTS[idx]
         if not _is_available(idx):
             log.debug("req=%s skipping %s (cooling off, %.0fs left)", req_id, ep.provider or ep.base_url, _cooloff_until[idx] - time.monotonic())
+            continue
+
+        client_model = body_dict.get("model", "")
+        model_name = _effective_model(ep, client_model)
+
+        if not _try_acquire_slot(ep, model_name):
+            log.debug("req=%s skipping %s (model %r at concurrency cap %d)", req_id, ep.provider or ep.base_url, model_name, ep.max_concurrency)
             continue
 
         _stats["requests"][idx] += 1
@@ -1222,8 +1388,6 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         stripped = _strip_unsupported(body_dict, ep)
         send_body = json.dumps(stripped).encode()
 
-        client_model = body_dict.get("model", "")
-        model_name = _effective_model(ep, client_model)
         log.debug(
             "req=%s attempt %d/%d -> %s model=%s body_keys=%s bytes=%d",
             req_id, attempt, total, ep.provider or ep.base_url, model_name, list(stripped.keys()), len(send_body),
@@ -1241,14 +1405,21 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             stream=is_streaming,
         )
 
+        release = _slot_releaser(ep, model_name)
+        owns_release = True
         try:
             if is_streaming:
-                result, reason = await _proxy_stream(ep, path, headers, send_body, metrics, request_context)
+                result, reason = await _proxy_stream(ep, path, headers, send_body, metrics, request_context, on_done=release)
+                if result is not None:
+                    # Ownership moved to the response generator: the slot is
+                    # held until the client has consumed the whole stream.
+                    owns_release = False
             else:
                 result, reason = await _proxy_buffered(ep, path, headers, send_body, metrics, request_context)
 
             if result is not None:
                 _stats["successes"][idx] += 1
+                _set_session_pin(group_name, session_key, idx)
                 _set_meta_headers(result, provider=ep.provider, model=model_name, mode=mode, group=group_name)
                 return result
 
@@ -1259,6 +1430,9 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             reason = _exception_detail(exc)
             _mark_down(idx, reason, request_context)
             last_failure = reason
+        finally:
+            if owns_release:
+                release()
 
     if last_failure is None:
         # Every endpoint was skipped (cooling off) -- nothing was actually tried.

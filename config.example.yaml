@@ -33,6 +33,12 @@ providers:
   synthetic:
     base_url: https://api.synthetic.new/v1
     api_key: ${SYNTHETIC_API_KEY}
+    # Concurrency is capped per model upstream; queued requests silently wait
+    # (headers withheld, no error). At cap we skip to the next endpoint instead.
+    max_concurrency: 2
+    # Fail over if response headers don't arrive in time — the only way to
+    # detect queueing caused by traffic that doesn't go through this proxy.
+    # ttfb_deadline_secs: 15
 
 # Groups map a request model name to a routing mode and an ordered list of
 # (provider, model_override) endpoints. The client's 'model' field must match
@@ -73,3 +79,7 @@ groups:
         model: zai-glm-4.7
         flags: [keep_reasoning]
       - provider: openrouter
+        model: openai/gpt-4o-mini
+        # Per-endpoint overrides of provider-level settings:
+        # max_concurrency: 1
+        # ttfb_deadline_secs: 10
