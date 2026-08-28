@@ -397,3 +397,10 @@ def test_ttfb_deadline_nan_is_config_error():
     raw = make_minimal({"a": {"base_url": "https://a", "api_key": "k", "ttfb_deadline_secs": float("nan")}})
     with pytest.raises(ConfigError, match="ttfb_deadline_secs"):
         parse_config(raw)
+
+
+def test_cooloff_seconds_nan_is_config_error():
+    raw = make_minimal()
+    raw["settings"] = {"cooloff_seconds": float("nan")}
+    with pytest.raises(ConfigError, match="cooloff_seconds"):
+        parse_config(raw)

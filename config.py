@@ -335,8 +335,11 @@ def _parse_settings(raw: object) -> Settings:
     unknown = set(raw) - known
     if unknown:
         raise ConfigError(f"unknown settings keys: {', '.join(sorted(unknown))}")
+    cooloff = float(raw.get("cooloff_seconds", defaults.cooloff_seconds))
+    if not math.isfinite(cooloff) or cooloff < 0:
+        raise ConfigError("'cooloff_seconds' must be a non-negative number of seconds")
     return Settings(
-        cooloff_seconds=float(raw.get("cooloff_seconds", defaults.cooloff_seconds)),
+        cooloff_seconds=cooloff,
         race_interval_secs=int(raw.get("race_interval_secs", defaults.race_interval_secs)),
         race_interval_requests=int(raw.get("race_interval_requests", defaults.race_interval_requests)),
         log_level=str(raw.get("log_level", defaults.log_level)).upper(),

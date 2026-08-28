@@ -79,7 +79,7 @@ groups:
   - `provider` — name from the providers section (required)
   - `model` — model name to send upstream. If omitted, falls back to the provider's `model` (if set), otherwise the client's requested model passes through unchanged.
   - `flags` — per-endpoint flags: `keep_reasoning` preserves `reasoning`/`reasoning_content`/`thinking` fields in messages (otherwise stripped).
-  - `max_concurrency` / `ttfb_deadline_secs` — per-endpoint overrides of the provider-level settings above.
+  - `max_concurrency` / `ttfb_deadline_secs` — per-endpoint overrides of the provider-level settings above. Concurrency is counted per `(provider, model)` across all groups: entries sharing a provider+model share one counter, so give them the same (smallest) cap.
 - `meta` — optional descriptive metadata published on `/v1/models` in OpenRouter's response shape. When set, the entry uses OpenRouter keys (`context_length`, `architecture`, `pricing`, `top_provider`, `reasoning`) instead of the minimal OpenAI shape. All fields optional. Fields:
   - `name` / `description`
   - `context` / `max_output` — window and max completion tokens (tokens)
@@ -112,7 +112,7 @@ The client can override a group's mode with a `:race` or `:seq` suffix on the mo
 
 ### Session pinning
 
-Sequential routing is sticky per conversation: the session key (the client's `user` field if set, else a hash of the first message) is pinned to the endpoint that served its previous request, and that endpoint is tried first for ~10 minutes after each use. When something forces a failover (failure, cooloff, concurrency cap), the session bounces once and then re-pins to the new endpoint instead of re-contesting the old one — keeping upstream prompt caches warm. Racing requests are exempt; they bounce by design.
+Sequential routing is sticky per conversation: the session key (a hash of the client's `user` field, the first message, and the first user turn -- truncated so huge openers can't stall the proxy) is pinned to the endpoint that served its previous request, and that endpoint is tried first for ~10 minutes after each use. When something forces a failover (failure, cooloff, concurrency cap), the session bounces once and then re-pins to the new endpoint instead of re-contesting the old one — keeping upstream prompt caches warm. Racing requests are exempt; they bounce by design.
 
 Pins are visible on `/stats` (`session_pins`, `inflight`) and are cleared on config reload.
 

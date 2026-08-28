@@ -1303,14 +1303,17 @@ async def test_pin_header_states(proxy_app):
     assert resp.headers["x-stablellm-pin"] == "new; home=a"
     resp = await _post(app, body)
     assert resp.headers["x-stablellm-pin"] == "hit; home=a"
+    assert main._pin_promotions == 1  # counts served-by-home, not promotions
 
     # home cools off -> bounce to b, then the new home sticks
     main._cooloff_until[0] = time.monotonic() + 60
     resp = await _post(app, body)
     assert resp.headers["x-stablellm-pin"] == "bounce; home=a"
+    assert main._pin_promotions == 1  # a bounce is not a hit
     del main._cooloff_until[0]
     resp = await _post(app, body)
     assert resp.headers["x-stablellm-pin"] == "hit; home=b"
+    assert main._pin_promotions == 2
 
 
 @pytest.mark.asyncio
@@ -1390,5 +1393,98 @@ async def test_race_cancel_during_winner_read_releases_slot(proxy_app):
     await asyncio.gather(*tuple(main._background_tasks), return_exceptions=True)
 
     assert winner.closed
+    assert main._inflight[("https://a.test", "ma")] == 0
+    assert main._inflight[("https://b.test", "mb")] == 0
+
+
+# --- qwen review regressions ---
+
+
+@pytest.mark.asyncio
+async def test_stale_pin_index_is_dropped_not_crashed(proxy_app):
+    """A request in flight during a reload can write a pin to an index that no
+    longer exists; later requests must route normally, not IndexError."""
+    def handler(req):
+        return _ok_response()
+
+    app, calls, main = proxy_app(
+        {
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k"},
+                "b": {"base_url": "https://b.test", "api_key": "k"},
+            },
+            "groups": {"default": {"endpoints": [{"provider": "a"}, {"provider": "b"}]}},
+        },
+        handler,
+    )
+    body = {"model": "default", "messages": [{"role": "user", "content": "hi"}]}
+    skey = main._session_key(body)
+    main._session_pins[("default", skey)] = (999, time.monotonic())  # out of range
+
+    resp = await _post(app, body)
+    assert resp.status_code == 200
+    assert [c[0] for c in calls] == ["https://a.test"]
+    assert main._session_pins[("default", skey)][0] == 0  # re-pinned to the real head
+
+
+@pytest.mark.asyncio
+async def test_race_cancel_after_racer_completes_releases_slot(proxy_app, monkeypatch):
+    """A cancel landing in the instant a racer completed (asyncio.wait raised
+    without delivering it) must still release the completed racer's slot."""
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self):
+            self.closed = False
+
+        async def aiter_bytes(self):
+            yield b"partial"
+
+        async def aclose(self):
+            self.closed = True
+
+    responses = []
+
+    class FakeClient:
+        def build_request(self, _method, url, **_kwargs):
+            return url
+
+        async def send(self, url, **_kwargs):
+            r = FakeResponse()
+            responses.append((url.split("/")[2], r))
+            await asyncio.sleep(0)
+            return r
+
+    _app, _calls, main = proxy_app(
+        {
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k", "max_concurrency": 1},
+                "b": {"base_url": "https://b.test", "api_key": "k", "max_concurrency": 1},
+            },
+            "groups": {"fast": {"mode": "race", "endpoints": [
+                {"provider": "a", "model": "ma"},
+                {"provider": "b", "model": "mb"},
+            ]}},
+        },
+        lambda _req: _ok_response(),
+    )
+    main.http_client = FakeClient()
+
+    real_wait = asyncio.wait
+
+    async def flaky_wait(fs, **kwargs):
+        await real_wait(fs, return_when=asyncio.FIRST_COMPLETED)
+        raise asyncio.CancelledError  # cancel swallowed the completed racer
+
+    monkeypatch.setattr(main.asyncio, "wait", flaky_wait)
+
+    with pytest.raises(asyncio.CancelledError):
+        await main._race_request(
+            "chat/completions", {"model": "fast", "messages": []}, False,
+            "fast", "", "req-test", "test",
+        )
+    await asyncio.gather(*tuple(main._background_tasks), return_exceptions=True)
+
+    assert all(r.closed for _host, r in responses)
     assert main._inflight[("https://a.test", "ma")] == 0
     assert main._inflight[("https://b.test", "mb")] == 0

@@ -9,6 +9,7 @@ import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from decimal import Decimal
+from itertools import count
 from pathlib import Path
 from typing import ClassVar
 from urllib.parse import unquote, urlparse
@@ -122,7 +123,8 @@ _group_provider_groups: dict[str, dict[tuple[str, str], list[int]]] = {}
 _group_preferred_providers: dict[str, list[tuple[str, str]]] = {}
 _group_race_request_count: dict[str, int] = defaultdict(int)
 _group_last_race_time: dict[str, float] = defaultdict(float)
-_group_race_generation: dict[str, int] = defaultdict(int)
+_group_race_generation: dict[str, int] = {}  # group -> id of its latest race
+_race_ids = count(1)  # process-wide monotonic: never reused, even across reloads
 
 
 def _build_provider_groups():
@@ -259,7 +261,7 @@ def _session_key(body: dict) -> str:
     parts = []
     user = body.get("user")
     if isinstance(user, str) and user:
-        parts.append(user)
+        parts.append(user[:_HASH_STR_CAP])
     messages = body.get("messages")
     if isinstance(messages, list) and messages:
         picks = [messages[0]]
@@ -289,6 +291,11 @@ def _pinned_endpoint(group: str, skey: str) -> int | None:
         return None
     idx, ts = entry
     if time.monotonic() - ts > _PIN_TTL_SECS:
+        del _session_pins[(group, skey)]
+        return None
+    if idx >= len(config.ENDPOINTS):
+        # A pre-reload request wrote its (now stale) endpoint index after the
+        # reload's pin clear; routing on it would raise IndexError.
         del _session_pins[(group, skey)]
         return None
     return idx
@@ -785,8 +792,8 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
     # following request to retry the race against still-cooling-off endpoints.
     _group_race_request_count[group] = 0
     _group_last_race_time[group] = time.monotonic()
-    _group_race_generation[group] += 1
-    gen = _group_race_generation[group]
+    gen = next(_race_ids)
+    _group_race_generation[group] = gen
 
     race_context = _request_context(body_dict, group, req_id)
     log.debug(
@@ -804,10 +811,22 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
     def _maybe_finalize():
         # Skip if a newer race for this group has already started; otherwise late
         # background drains from this race could clobber the newer race's order.
-        if _group_race_generation[group] != gen:
+        # Race ids are monotonic process-wide, so a drain from a pre-reload race
+        # can never match a post-reload race's id.
+        if _group_race_generation.get(group) != gen:
             return
         if len(race_times) + race_state["failures"] >= len(candidates):
             _finish_race(race_times, group)
+
+    async def _abandon(resp, release):
+        """Consume an orphaned racer response: release its slot, drop the conn."""
+        release()
+        await _close_quietly(resp)
+
+    def _bg(coro):
+        t = asyncio.create_task(coro)
+        _background_tasks.add(t)
+        t.add_done_callback(_background_tasks.discard)
 
     async def _send(pk: tuple, idx: int):
         ep = config.ENDPOINTS[idx]
@@ -859,10 +878,20 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                     race_state["failures"] += 1
                     _mark_down(idx, _exception_detail(exc), _request_context(body_dict, group, req_id))
     except BaseException:
-        # Request cancelled mid-race (client hangup): still-acquiring racers must
-        # release their concurrency slots, not leak them.
+        # Request cancelled mid-race (client hangup). Cancel still-acquiring
+        # racers, and harvest any that completed in the same instant asyncio.wait
+        # raised -- their release would otherwise never run. (A completed task's
+        # result that was never delivered is invisible to the done/pending sets.)
         for t in pending:
             t.cancel()
+        for t, (pk, idx) in tasks.items():
+            if t.done() and not t.cancelled():
+                try:
+                    _, _, resp, release = t.result()
+                except Exception as exc:  # noqa: BLE001 - _send released internally
+                    log.debug("req=%s race harvest: %s", req_id, _exception_detail(exc))
+                    continue
+                _bg(_abandon(resp, release))
         raise
 
     if winner is None:
@@ -917,11 +946,6 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
             _maybe_finalize()
             return
         await _drain(pk, resp, idx, release)
-
-    def _bg(coro):
-        t = asyncio.create_task(coro)
-        _background_tasks.add(t)
-        t.add_done_callback(_background_tasks.discard)
 
     for pk, idx, resp, release in losers_to_drain:
         _bg(_drain(pk, resp, idx, release))
@@ -1293,7 +1317,8 @@ def _reset_runtime_state():
     _stats["failures"].clear()
     _group_race_request_count.clear()
     _group_last_race_time.clear()
-    _group_race_generation.clear()  # invalidate in-flight races from the old config
+    # _group_race_generation is intentionally NOT reset: monotonic race ids are
+    # what lets late drains from pre-reload races be recognized as stale.
     _session_pins.clear()  # pin values are endpoint indices; stale after reload
     global _pin_promotions
     _pin_promotions = 0
@@ -1446,11 +1471,10 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
     pinned = _pinned_endpoint(group_name, session_key)
     had_pin = pinned is not None
     pin_home = _endpoint_label(config.ENDPOINTS[pinned]) if had_pin else ""
+    global _pin_promotions
     if pinned in order:
         # Prefer the endpoint that served this session's previous request so
         # upstream prompt caches stay warm.
-        global _pin_promotions
-        _pin_promotions += 1
         order.remove(pinned)
         order.insert(0, pinned)
         log.debug("req=%s pinned session -> %s", req_id, _endpoint_label(config.ENDPOINTS[pinned]))
@@ -1507,6 +1531,8 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
                 _set_session_pin(group_name, session_key, idx)
                 if had_pin:
                     pin = f"{'hit' if idx == pinned else 'bounce'}; home={pin_home}"
+                    if idx == pinned:
+                        _pin_promotions += 1
                 elif session_key:
                     pin = f"new; home={_endpoint_label(ep)}"
                 else:
@@ -1527,7 +1553,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
 
     if last_failure is None:
         # Every endpoint was skipped (cooling off) -- nothing was actually tried.
-        last_failure = "no endpoints available (all cooling off)"
+        last_failure = "no endpoints available (all cooling off or at concurrency cap)"
     exhaustion = requestlog.RequestMetrics(
         req_id=req_id,
         keyname=keyname,
