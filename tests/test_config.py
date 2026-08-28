@@ -391,3 +391,9 @@ def test_ttfb_deadline_must_be_nonneg_number_is_config_error():
     raw = make_minimal({"a": {"base_url": "https://a", "api_key": "k", "ttfb_deadline_secs": "soon"}})
     with pytest.raises(ConfigError, match="ttfb_deadline_secs"):
         parse_config(raw)
+
+
+def test_ttfb_deadline_nan_is_config_error():
+    raw = make_minimal({"a": {"base_url": "https://a", "api_key": "k", "ttfb_deadline_secs": float("nan")}})
+    with pytest.raises(ConfigError, match="ttfb_deadline_secs"):
+        parse_config(raw)

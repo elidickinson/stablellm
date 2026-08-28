@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import math
 import os
 import re
 import sys
@@ -174,7 +175,9 @@ def _opt_secs(value: object, key: str, default: float) -> float:
     """Optional non-negative number of seconds (0 = disabled); absent → default."""
     if value is None:
         return default
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+    # isfinite: yaml .nan/.inf pass the < 0 check and would silently break
+    # every request to the endpoint (asyncio.wait_for(nan) fires instantly).
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
         raise ConfigError(f"'{key}' must be a non-negative number of seconds (0 = disabled)")
     return float(value)
 

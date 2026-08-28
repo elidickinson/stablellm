@@ -85,6 +85,20 @@ _session_pins: dict[tuple[str, str], tuple[int, float]] = {}
 _PIN_TTL_SECS = 600.0
 _PIN_TABLE_MAX = 500
 _HASH_CAP = 65536  # serialized bytes of a message fed to the session-key hash
+_HASH_STR_CAP = 8192  # per-string cap, applied BEFORE serialization so huge strings don't stall the loop
+
+
+def _hash_shrink(obj, depth=0):
+    """Bound serialization cost: truncate strings and lists before dumping."""
+    if depth > 8:
+        return "..."
+    if isinstance(obj, str):
+        return obj[:_HASH_STR_CAP]
+    if isinstance(obj, dict):
+        return {k: _hash_shrink(v, depth + 1) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_hash_shrink(v, depth + 1) for v in obj[:64]]
+    return obj
 
 # Times the seq loop routed a request to its pinned endpoint; zero would mean
 # pinning never engages (e.g. clients with per-turn-volatile system prompts).
@@ -240,7 +254,8 @@ def _session_key(body: dict) -> str:
     stable within a session but distinct across a client's concurrent
     sessions: the 'user' field, the first message (usually the system prompt),
     and the first user turn (the opening instruction). Everything is hashed;
-    large messages are truncated so hashing never stalls the event loop."""
+    large values are truncated before serialization so hashing never stalls
+    the event loop."""
     parts = []
     user = body.get("user")
     if isinstance(user, str) and user:
@@ -254,13 +269,16 @@ def _session_key(body: dict) -> str:
                 break
         for msg in picks:
             try:
-                serialized = json.dumps(msg, sort_keys=True, ensure_ascii=False)
+                serialized = json.dumps(_hash_shrink(msg), sort_keys=True, ensure_ascii=False)
             except (TypeError, ValueError):
                 return ""
             parts.append(serialized[:_HASH_CAP])
     if not parts:
         return ""
-    return "m:" + hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
+    # errors=replace: malformed client JSON can carry lone surrogates, which
+    # strict utf-8 encoding would reject; replacement is deterministic so the
+    # key stays stable.
+    return "m:" + hashlib.sha256("\n".join(parts).encode(errors="replace")).hexdigest()[:16]
 
 
 def _pinned_endpoint(group: str, skey: str) -> int | None:
@@ -299,6 +317,12 @@ def _mark_down(idx: int, reason: str, request_context: str = ""):
 
 class UpstreamError(Exception):
     pass
+
+
+class CapReached(UpstreamError):
+    """A race racer lost the (provider, model) slot between candidate
+    pre-check and send. Not an endpoint failure: the endpoint is healthy, so
+    it must not be marked down."""
 
 
 async def _send_upstream(req: httpx.Request, ep: Endpoint, *, stream: bool) -> httpx.Response:
@@ -791,7 +815,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         if not _try_acquire_slot(ep, model_name):
             # Candidates were pre-checked; this can only happen if another
             # route to the same (base_url, model) grabbed the slot meanwhile.
-            raise UpstreamError(f"concurrency cap {ep.max_concurrency} reached")
+            raise CapReached(f"concurrency cap {ep.max_concurrency} reached")
         release = _slot_releaser(ep, model_name)
         try:
             headers = _build_upstream_headers(ep)
@@ -827,6 +851,10 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                         winner = (rpk, ridx, resp, release)
                     else:
                         losers_to_drain.append((rpk, ridx, resp, release))
+                except CapReached as exc:
+                    # Healthy endpoint, merely full: skip the mark-down.
+                    race_state["failures"] += 1
+                    log.debug("req=%s race: %s", req_id, exc)
                 except Exception as exc:  # noqa: BLE001 - a failed racer must not abort the request
                     race_state["failures"] += 1
                     _mark_down(idx, _exception_detail(exc), _request_context(body_dict, group, req_id))
@@ -869,13 +897,20 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
             race_state["failures"] += 1
             _mark_down(idx, _exception_detail(exc), _request_context(body_dict, group, req_id))
         finally:
-            await _close_quietly(resp)
+            # Sync accounting before the close await: a cancellation arriving
+            # during _close_quietly must not skip the slot release.
             release()
             _maybe_finalize()
+            await _close_quietly(resp)
 
     async def _await_and_drain(task, pk, idx):
         try:
             _, _, resp, release = await task
+        except CapReached as exc:
+            race_state["failures"] += 1
+            log.debug("req=%s race: %s", req_id, exc)
+            _maybe_finalize()
+            return
         except Exception as exc:  # noqa: BLE001 - a failed racer must not abort the request
             race_state["failures"] += 1
             _mark_down(idx, _exception_detail(exc), _request_context(body_dict, group, req_id))
@@ -1000,10 +1035,12 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
             _mark_down(win_idx, _exception_detail(exc), race_context)
             return None, True
         finally:
-            await _close_quietly(win_resp)
+            # Sync accounting before the close await: a cancellation arriving
+            # during _close_quietly must not skip the slot release.
             win_release()
             race_times[win_pk] = time.monotonic() - race_start
             _maybe_finalize()
+            await _close_quietly(win_resp)
         elapsed = time.monotonic() - race_start
         race_metrics.elapsed_ms = elapsed * 1000
         response_body = b"".join(chunks)
@@ -1256,6 +1293,7 @@ def _reset_runtime_state():
     _stats["failures"].clear()
     _group_race_request_count.clear()
     _group_last_race_time.clear()
+    _group_race_generation.clear()  # invalidate in-flight races from the old config
     _session_pins.clear()  # pin values are endpoint indices; stale after reload
     global _pin_promotions
     _pin_promotions = 0

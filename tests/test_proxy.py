@@ -1333,3 +1333,62 @@ async def test_pin_header_none_for_race_and_sessionless(proxy_app):
 
     resp = await _post(app, {"model": "default", "messages": []})
     assert resp.headers["x-stablellm-pin"] == "none"  # no session derivable
+
+
+@pytest.mark.asyncio
+async def test_race_cancel_during_winner_read_releases_slot(proxy_app):
+    """Cancellation arriving during winner body read (or the close that
+    follows it) must still release the race winner's concurrency slot."""
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, cancelled=False):
+            self.cancelled = cancelled
+            self.closed = False
+
+        async def aiter_bytes(self):
+            yield b"partial"
+            if self.cancelled:
+                raise asyncio.CancelledError
+
+        async def aclose(self):
+            self.closed = True
+
+    winner = FakeResponse(cancelled=True)
+    loser = FakeResponse()
+
+    class FakeClient:
+        def build_request(self, _method, url, **_kwargs):
+            return url
+
+        async def send(self, url, **_kwargs):
+            if url.startswith("https://a.test/"):
+                return winner
+            await asyncio.sleep(0.01)
+            return loser
+
+    _app, _calls, main = proxy_app(
+        {
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k", "max_concurrency": 1},
+                "b": {"base_url": "https://b.test", "api_key": "k", "max_concurrency": 1},
+            },
+            "groups": {"fast": {"mode": "race", "endpoints": [
+                {"provider": "a", "model": "ma"},
+                {"provider": "b", "model": "mb"},
+            ]}},
+        },
+        lambda _req: _ok_response(),
+    )
+    main.http_client = FakeClient()
+
+    with pytest.raises(asyncio.CancelledError):
+        await main._race_request(
+            "chat/completions", {"model": "fast", "messages": []}, False,
+            "fast", "", "req-test", "test",
+        )
+    await asyncio.gather(*tuple(main._background_tasks), return_exceptions=True)
+
+    assert winner.closed
+    assert main._inflight[("https://a.test", "ma")] == 0
+    assert main._inflight[("https://b.test", "mb")] == 0

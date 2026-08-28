@@ -280,3 +280,25 @@ def test_session_key_empty_without_usable_input(main_module):
     assert main_module._session_key({}) == ""
     assert main_module._session_key({"messages": []}) == ""
     assert main_module._session_key({"user": "alice"}) != ""  # user alone still pins
+
+
+# --- session key robustness ---
+
+
+def test_session_key_survives_lone_surrogates(main_module):
+    """Malformed client JSON can carry unpaired surrogates; strict utf-8
+    encoding would crash every request for that session."""
+    body = {"messages": [{"role": "user", "content": "bad \ud800 escape"}]}
+    k1 = main_module._session_key(body)
+    assert k1.startswith("m:")
+    assert k1 == main_module._session_key(body)
+    assert main_module._session_key({"user": "\udfff", "messages": []}) != ""
+
+
+def test_session_key_truncates_huge_strings_before_serializing(main_module):
+    """Content differences beyond the hash cap must not change the key
+    (that's what keeps serialization cost bounded)."""
+    base = "x" * 100_000
+    a = {"messages": [{"role": "user", "content": base + "-A"}]}
+    b = {"messages": [{"role": "user", "content": base + "-B"}]}
+    assert main_module._session_key(a) == main_module._session_key(b)
