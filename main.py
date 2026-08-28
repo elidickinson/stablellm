@@ -181,6 +181,7 @@ app.add_middleware(
         "X-StableLLM-Mode",
         "X-StableLLM-Group",
         "X-StableLLM-Via",
+        "X-StableLLM-Pin",
     ],
 )
 
@@ -630,13 +631,15 @@ def _streaming_response(resp: httpx.Response, generator) -> StreamingResponse:
     )
 
 
-def _set_meta_headers(response, *, provider: str, model: str, mode: str, group: str, via: str | None = None):
+def _set_meta_headers(response, *, provider: str, model: str, mode: str, group: str, via: str | None = None, pin: str = ""):
     response.headers["X-StableLLM-Provider"] = provider
     response.headers["X-StableLLM-Model"] = model
     response.headers["X-StableLLM-Mode"] = mode
     response.headers["X-StableLLM-Group"] = group
     if via:
         response.headers["X-StableLLM-Via"] = via
+    if pin:
+        response.headers["X-StableLLM-Pin"] = pin
 
 
 # Only pass these known-supported params to upstream
@@ -1381,6 +1384,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         if should_race:
             result, raced = await _race_request(path, body_dict, is_streaming, group_name, keyname, req_id, trigger)
             if result is not None:
+                result.headers["X-StableLLM-Pin"] = "none"  # races ignore pins by design
                 return result
             if raced:
                 dispatch_mode = "race-fallback"
@@ -1402,6 +1406,8 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
     session_key = _session_key(body_dict)
     order = list(endpoint_order)
     pinned = _pinned_endpoint(group_name, session_key)
+    had_pin = pinned is not None
+    pin_home = _endpoint_label(config.ENDPOINTS[pinned]) if had_pin else ""
     if pinned in order:
         # Prefer the endpoint that served this session's previous request so
         # upstream prompt caches stay warm.
@@ -1461,7 +1467,13 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             if result is not None:
                 _stats["successes"][idx] += 1
                 _set_session_pin(group_name, session_key, idx)
-                _set_meta_headers(result, provider=ep.provider, model=model_name, mode=mode, group=group_name)
+                if had_pin:
+                    pin = f"{'hit' if idx == pinned else 'bounce'}; home={pin_home}"
+                elif session_key:
+                    pin = f"new; home={_endpoint_label(ep)}"
+                else:
+                    pin = "none"
+                _set_meta_headers(result, provider=ep.provider, model=model_name, mode=mode, group=group_name, pin=pin)
                 return result
 
             _mark_down(idx, reason, request_context)

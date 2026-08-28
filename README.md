@@ -127,6 +127,7 @@ Every proxied response includes headers telling the client which upstream actual
 | `X-StableLLM-Mode` | `race` | Routing mode used (`seq` or `race`) |
 | `X-StableLLM-Group` | `glm-4.7` | Group the request resolved to |
 | `X-StableLLM-Via` | `OpenAI` | Sub-provider that served the request — only present when routing through OpenRouter (see below) |
+| `X-StableLLM-Pin` | `hit; home=synthetic` | Session pin state: `hit` (served by the session's pinned endpoint), `bounce` (pinned endpoint unavailable — served and re-pinned elsewhere; this turn is a cache miss), `new` (first request of a session), `none` (races / no derivable session) |
 
 Headers are present on both streaming and non-streaming responses. They are exposed via CORS so browser clients can read them.
 

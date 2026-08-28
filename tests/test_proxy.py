@@ -1277,3 +1277,59 @@ async def test_stream_slot_released_when_client_never_iterates(proxy_app):
     assert result is not None
     await result.body_iterator.aclose()  # starlette drops it without iterating
     assert main._inflight[("https://a.test", "m")] == 0
+
+
+# --- pin metadata header ---
+
+
+@pytest.mark.asyncio
+async def test_pin_header_states(proxy_app):
+    def handler(req):
+        return _ok_response()
+
+    app, _calls, main = proxy_app(
+        {
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k"},
+                "b": {"base_url": "https://b.test", "api_key": "k"},
+            },
+            "groups": {"default": {"endpoints": [{"provider": "a"}, {"provider": "b"}]}},
+        },
+        handler,
+    )
+    body = {"model": "default", "messages": [{"role": "user", "content": "hi"}]}
+
+    resp = await _post(app, body)
+    assert resp.headers["x-stablellm-pin"] == "new; home=a"
+    resp = await _post(app, body)
+    assert resp.headers["x-stablellm-pin"] == "hit; home=a"
+
+    # home cools off -> bounce to b, then the new home sticks
+    main._cooloff_until[0] = time.monotonic() + 60
+    resp = await _post(app, body)
+    assert resp.headers["x-stablellm-pin"] == "bounce; home=a"
+    del main._cooloff_until[0]
+    resp = await _post(app, body)
+    assert resp.headers["x-stablellm-pin"] == "hit; home=b"
+
+
+@pytest.mark.asyncio
+async def test_pin_header_none_for_race_and_sessionless(proxy_app):
+    def handler(req):
+        return _ok_response()
+
+    app, _calls, _main = proxy_app(
+        {
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k"},
+                "b": {"base_url": "https://b.test", "api_key": "k"},
+            },
+            "groups": {"default": {"mode": "race", "endpoints": [{"provider": "a"}, {"provider": "b"}]}},
+        },
+        handler,
+    )
+    resp = await _post(app, {"model": "default", "messages": [{"role": "user", "content": "hi"}]})
+    assert resp.headers["x-stablellm-pin"] == "none"  # race
+
+    resp = await _post(app, {"model": "default", "messages": []})
+    assert resp.headers["x-stablellm-pin"] == "none"  # no session derivable
