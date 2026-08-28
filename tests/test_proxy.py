@@ -1210,8 +1210,8 @@ async def test_session_pin_keeps_session_on_bounced_endpoint(proxy_app):
 
     # expiring the pin returns the first session to configured order
     skey = main._session_key(body)
-    idx, ts = main._session_pins[("default", skey)]
-    main._session_pins[("default", skey)] = (idx, ts - main._PIN_TTL_SECS - 1)
+    idx, home, ts = main._session_pins[("default", skey)]
+    main._session_pins[("default", skey)] = (idx, home, ts - main._PIN_TTL_SECS - 1)
     calls.clear()
     resp = await _post(app, body)
     assert resp.status_code == 200
@@ -1419,7 +1419,7 @@ async def test_stale_pin_index_is_dropped_not_crashed(proxy_app):
     )
     body = {"model": "default", "messages": [{"role": "user", "content": "hi"}]}
     skey = main._session_key(body)
-    main._session_pins[("default", skey)] = (999, time.monotonic())  # out of range
+    main._session_pins[("default", skey)] = (999, "a", time.monotonic())  # out of range
 
     resp = await _post(app, body)
     assert resp.status_code == 200
@@ -1488,3 +1488,50 @@ async def test_race_cancel_after_racer_completes_releases_slot(proxy_app, monkey
     assert all(r.closed for _host, r in responses)
     assert main._inflight[("https://a.test", "ma")] == 0
     assert main._inflight[("https://b.test", "mb")] == 0
+
+
+@pytest.mark.asyncio
+async def test_reload_clears_race_generation(proxy_app):
+    """A pre-reload race's late drain must not pass _maybe_finalize's guard
+    after the reload (the gen counter is cleared). Regression: monotonic ids
+    alone don't invalidate; the clear is what does."""
+    _app, _calls, main = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"default": {"endpoints": [{"provider": "a"}]}},
+        },
+        lambda _req: _ok_response(),
+    )
+    main._group_race_generation["default"] = 7
+    main._reset_runtime_state()
+    assert "default" not in main._group_race_generation
+
+
+@pytest.mark.asyncio
+async def test_stale_pin_with_mismatched_home_label_is_dropped(proxy_app):
+    """A pin whose index now names a different provider (in range, wrong
+    home) is dropped so the header stays truthful, not served as a stale hit."""
+    def handler(req):
+        return _ok_response()
+
+    app, calls, main = proxy_app(
+        {
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k"},
+                "b": {"base_url": "https://b.test", "api_key": "k"},
+            },
+            "groups": {"default": {"endpoints": [{"provider": "a"}, {"provider": "b"}]}},
+        },
+        handler,
+    )
+    body = {"model": "default", "messages": [{"role": "user", "content": "hi"}]}
+    skey = main._session_key(body)
+    # Pin points at index 1 but remembers home "a"; index 1 is actually "b".
+    main._session_pins[("default", skey)] = (1, "a", time.monotonic())
+
+    resp = await _post(app, body)
+    assert resp.status_code == 200
+    # The stale pin was dropped, so the request used configured order (a), not
+    # the mislabeled home (b).
+    assert [c[0] for c in calls] == ["https://a.test"]
+    assert resp.headers["x-stablellm-pin"] == "new; home=a"

@@ -101,8 +101,9 @@ def _hash_shrink(obj, depth=0):
         return [_hash_shrink(v, depth + 1) for v in obj[:64]]
     return obj
 
-# Times the seq loop routed a request to its pinned endpoint; zero would mean
-# pinning never engages (e.g. clients with per-turn-volatile system prompts).
+# Times a request was served by its session's pinned endpoint. Zero means
+# pinning never engages (per-turn-volatile system prompts) OR the pinned home
+# is persistently unavailable (constant bounces).
 _pin_promotions = 0
 
 # endpoint index -> stats
@@ -283,22 +284,22 @@ def _session_key(body: dict) -> str:
     return "m:" + hashlib.sha256("\n".join(parts).encode(errors="replace")).hexdigest()[:16]
 
 
-def _pinned_endpoint(group: str, skey: str) -> int | None:
+def _pinned_endpoint(group: str, skey: str) -> tuple[int, str] | None:
     if not skey:
         return None
     entry = _session_pins.get((group, skey))
     if entry is None:
         return None
-    idx, ts = entry
+    idx, home, ts = entry
     if time.monotonic() - ts > _PIN_TTL_SECS:
         del _session_pins[(group, skey)]
         return None
-    if idx >= len(config.ENDPOINTS):
-        # A pre-reload request wrote its (now stale) endpoint index after the
-        # reload's pin clear; routing on it would raise IndexError.
+    if idx >= len(config.ENDPOINTS) or _endpoint_label(config.ENDPOINTS[idx]) != home:
+        # Stale after a reload: the index is gone, or it now names a different
+        # provider than the one that actually served this session.
         del _session_pins[(group, skey)]
         return None
-    return idx
+    return idx, home
 
 
 def _set_session_pin(group: str, skey: str, idx: int):
@@ -306,11 +307,11 @@ def _set_session_pin(group: str, skey: str, idx: int):
         return
     if len(_session_pins) >= _PIN_TABLE_MAX and (group, skey) not in _session_pins:
         now = time.monotonic()
-        for k in [k for k, (_, ts) in _session_pins.items() if now - ts > _PIN_TTL_SECS]:
+        for k in [k for k, (_, _, ts) in _session_pins.items() if now - ts > _PIN_TTL_SECS]:
             del _session_pins[k]
         if len(_session_pins) >= _PIN_TABLE_MAX:
-            del _session_pins[min(_session_pins, key=lambda k: _session_pins[k][1])]
-    _session_pins[(group, skey)] = (idx, time.monotonic())
+            del _session_pins[min(_session_pins, key=lambda k: _session_pins[k][2])]
+    _session_pins[(group, skey)] = (idx, _endpoint_label(config.ENDPOINTS[idx]), time.monotonic())
 
 
 def _mark_down(idx: int, reason: str, request_context: str = ""):
@@ -474,24 +475,22 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
         byte_iter = resp.aiter_bytes()
         primed: list[bytes] = []
         via = None
-        # Always prime at least one chunk (more for OpenRouter via-detection):
-        # an async generator that is never started does not run its finally —
-        # not on aclose, not on GC — so starting generate() below before the
-        # response is returned is what guarantees the slot release fires even
-        # if the client disconnects before Starlette iterates the stream.
-        try:
-            while len(primed) < (8 if want_via else 1):
-                chunk = await byte_iter.__anext__()
-                if metrics.ttft_ms is None:
-                    metrics.ttft_ms = (time.monotonic() - t0) * 1000
-                    log.debug("req=%s %s TTFT %.0fms (TTFB %.0fms)", metrics.req_id, ep.provider, metrics.ttft_ms, ttfb * 1000)
-                primed.append(chunk)
-                if want_via:
+        # OpenRouter tags every chunk with the serving sub-provider; prime up
+        # to 8 chunks to find it. (The placeholder yield + __anext__ below arms
+        # the generator's finally without any priming for other providers.)
+        if want_via:
+            try:
+                while len(primed) < 8:
+                    chunk = await byte_iter.__anext__()
+                    if metrics.ttft_ms is None:
+                        metrics.ttft_ms = (time.monotonic() - t0) * 1000
+                        log.debug("req=%s %s TTFT %.0fms (TTFB %.0fms)", metrics.req_id, ep.provider, metrics.ttft_ms, ttfb * 1000)
+                    primed.append(chunk)
                     via = _provider_from_sse(chunk)
                     if via:
                         break
-        except StopAsyncIteration:
-            pass
+            except StopAsyncIteration:
+                pass
         metrics.via = via or ""
 
         async def generate():
@@ -959,40 +958,38 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         byte_iter = win_resp.aiter_bytes()
         primed: list[bytes] = []
         via = None
-        # Prime unconditionally: same never-started-generator slot leak as the
-        # seq path if the response is dropped before iteration begins.
-        try:
-            while len(primed) < (8 if want_via else 1):
-                chunk = await byte_iter.__anext__()
-                if race_metrics.ttft_ms is None:
-                    race_metrics.ttft_ms = (time.monotonic() - t0_race) * 1000
-                primed.append(chunk)
-                if want_via:
+        if want_via:
+            try:
+                while len(primed) < 8:
+                    chunk = await byte_iter.__anext__()
+                    if race_metrics.ttft_ms is None:
+                        race_metrics.ttft_ms = (time.monotonic() - t0_race) * 1000
+                    primed.append(chunk)
                     via = _provider_from_sse(chunk)
                     if via:
                         break
-        except StopAsyncIteration:
-            pass
-        except (asyncio.CancelledError, GeneratorExit):
-            # Request is dying (shutdown or client cancel): not the endpoint's
-            # fault, so no mark-down. This aborted row is the terminal line;
-            # the cancel propagates and no sequential fallback follows.
-            race_metrics.status = "aborted"
-            win_release()
-            await asyncio.to_thread(requestlog.log_request, race_metrics)
-            await _close_quietly(win_resp)
-            raise
-        except BaseException as exc:  # noqa: BLE001 - any priming failure must fail the race, not the request
-            # Winner stalled mid-priming (transport error or similar). Close it
-            # and fail the race so the caller falls back to sequential rather
-            # than 500-ing the client / leaking the conn. No terminal row here:
-            # the sequential outcome owns it.
-            race_state["failures"] += 1
-            _mark_down(win_idx, _exception_detail(exc), race_context)
-            win_release()
-            await _close_quietly(win_resp)
-            _maybe_finalize()
-            return None, True
+            except StopAsyncIteration:
+                pass
+            except (asyncio.CancelledError, GeneratorExit):
+                # Request is dying (shutdown or client cancel): not the endpoint's
+                # fault, so no mark-down. This aborted row is the terminal line;
+                # the cancel propagates and no sequential fallback follows.
+                race_metrics.status = "aborted"
+                win_release()
+                await asyncio.to_thread(requestlog.log_request, race_metrics)
+                await _close_quietly(win_resp)
+                raise
+            except BaseException as exc:  # noqa: BLE001 - any priming failure must fail the race, not the request
+                # Winner stalled mid-priming (transport error or similar). Close it
+                # and fail the race so the caller falls back to sequential rather
+                # than 500-ing the client / leaking the conn. No terminal row here:
+                # the sequential outcome owns it.
+                race_state["failures"] += 1
+                _mark_down(win_idx, _exception_detail(exc), race_context)
+                win_release()
+                await _close_quietly(win_resp)
+                _maybe_finalize()
+                return None, True
         race_metrics.via = via or ""
 
         async def generate():
@@ -1317,8 +1314,10 @@ def _reset_runtime_state():
     _stats["failures"].clear()
     _group_race_request_count.clear()
     _group_last_race_time.clear()
-    # _group_race_generation is intentionally NOT reset: monotonic race ids are
-    # what lets late drains from pre-reload races be recognized as stale.
+    # Clearing race generations invalidates late drains from pre-reload races
+    # (the guard is equality); ids stay monotonic so post-reload races can't
+    # collide with pre-reload ones either. Both halves are required.
+    _group_race_generation.clear()
     _session_pins.clear()  # pin values are endpoint indices; stale after reload
     global _pin_promotions
     _pin_promotions = 0
@@ -1470,14 +1469,14 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
     order = list(endpoint_order)
     pinned = _pinned_endpoint(group_name, session_key)
     had_pin = pinned is not None
-    pin_home = _endpoint_label(config.ENDPOINTS[pinned]) if had_pin else ""
+    pinned_idx, pin_home = pinned if pinned else (None, "")
     global _pin_promotions
-    if pinned in order:
+    if pinned_idx in order:
         # Prefer the endpoint that served this session's previous request so
         # upstream prompt caches stay warm.
-        order.remove(pinned)
-        order.insert(0, pinned)
-        log.debug("req=%s pinned session -> %s", req_id, _endpoint_label(config.ENDPOINTS[pinned]))
+        order.remove(pinned_idx)
+        order.insert(0, pinned_idx)
+        log.debug("req=%s pinned session -> %s", req_id, pin_home)
     total = len(order)
     for attempt, idx in enumerate(order, 1):
         ep = config.ENDPOINTS[idx]
@@ -1530,8 +1529,8 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
                 _stats["successes"][idx] += 1
                 _set_session_pin(group_name, session_key, idx)
                 if had_pin:
-                    pin = f"{'hit' if idx == pinned else 'bounce'}; home={pin_home}"
-                    if idx == pinned:
+                    pin = f"{'hit' if idx == pinned_idx else 'bounce'}; home={pin_home}"
+                    if idx == pinned_idx:
                         _pin_promotions += 1
                 elif session_key:
                     pin = f"new; home={_endpoint_label(ep)}"
