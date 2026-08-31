@@ -163,6 +163,20 @@ def test_strip_unsupported_forwards_top_level_reasoning_param(main_module):
     assert "reasoning" not in out["messages"][0]
 
 
+def test_strip_unsupported_injects_routing_as_provider(main_module):
+    from config import Endpoint
+    ep = Endpoint(base_url="x", api_key="k", model="m", routing={"sort": "throughput"})
+    out = main_module._strip_unsupported({"messages": []}, ep)
+    assert out["provider"] == {"sort": "throughput"}
+
+
+def test_strip_unsupported_no_provider_without_routing(main_module):
+    from config import Endpoint
+    ep = Endpoint(base_url="x", api_key="k", model="m")
+    out = main_module._strip_unsupported({"messages": []}, ep)
+    assert "provider" not in out
+
+
 def test_usd_per_token_precision(main_module):
     assert main_module._usd_per_token(1.0) == "0.000001"
     assert main_module._usd_per_token(0.15) == "0.00000015"

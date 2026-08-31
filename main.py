@@ -730,6 +730,8 @@ def _strip_unsupported(body: dict, ep: Endpoint) -> dict:
     base = {k: v for k, v in body.items() if k in SUPPORTED_PARAMS}
     if not ep.keep_reasoning and "messages" in base:
         base["messages"] = _strip_message_reasoning(base["messages"])
+    if ep.routing is not None:
+        base["provider"] = {**ep.routing}  # OpenRouter provider-selection params
     return _rewrite_model(base, ep)
 
 

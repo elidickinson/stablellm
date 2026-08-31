@@ -1,3 +1,5 @@
+import datetime
+
 import pytest
 
 from config import MODE_RACE, MODE_SEQ, ConfigError, parse_config
@@ -403,4 +405,45 @@ def test_cooloff_seconds_nan_is_config_error():
     raw = make_minimal()
     raw["settings"] = {"cooloff_seconds": float("nan")}
     with pytest.raises(ConfigError, match="cooloff_seconds"):
+        parse_config(raw)
+
+
+# --- routing passthrough (OpenRouter provider selection) ---
+
+
+def test_routing_defaults_to_none(make_config):
+    cfg = make_config(make_minimal())
+    assert cfg.ENDPOINTS[0].routing is None
+
+
+def test_provider_routing_inherited_by_endpoints(make_config):
+    cfg = make_config({
+        "providers": {"a": {"base_url": "https://a", "api_key": "k", "routing": {"sort": "throughput"}}},
+        "groups": {"default": _group([{"provider": "a"}])},
+    })
+    assert cfg.ENDPOINTS[0].routing == {"sort": "throughput"}
+
+
+def test_endpoint_routing_overrides_provider(make_config):
+    cfg = make_config({
+        "providers": {"a": {"base_url": "https://a", "api_key": "k", "routing": {"sort": "throughput"}}},
+        "groups": {"default": _group([
+            {"provider": "a", "routing": {"order": ["deepinfra"]}},
+            {"provider": "a"},
+        ])},
+    })
+    assert cfg.ENDPOINTS[0].routing == {"order": ["deepinfra"]}
+    assert cfg.ENDPOINTS[1].routing == {"sort": "throughput"}  # inherited
+
+
+def test_routing_must_be_mapping_is_config_error():
+    raw = make_minimal({"a": {"base_url": "https://a", "api_key": "k", "routing": ["sort"]}})
+    with pytest.raises(ConfigError, match="routing"):
+        parse_config(raw)
+
+
+def test_routing_must_be_json_serializable_is_config_error():
+    raw = make_minimal({"a": {"base_url": "https://a", "api_key": "k",
+                              "routing": {"on": datetime.date(2025, 1, 1)}}})
+    with pytest.raises(ConfigError, match="routing"):
         parse_config(raw)

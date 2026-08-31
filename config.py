@@ -1,4 +1,5 @@
 import hashlib
+import json
 import logging
 import math
 import os
@@ -22,6 +23,7 @@ class Provider:
     model: str = ""  # default model when group entry omits it
     max_concurrency: int = 0  # per-(model) in-flight cap; 0 = unlimited
     ttfb_deadline_secs: float = 0.0  # fail over if response headers don't arrive; 0 = disabled
+    routing: dict | None = None  # passthrough sent as OpenRouter's `provider` body object
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,7 @@ class Endpoint:
     provider: str = ""
     max_concurrency: int = 0
     ttfb_deadline_secs: float = 0.0
+    routing: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -158,6 +161,7 @@ def _parse_providers(raw: object) -> dict[str, Provider]:
             model=str(entry.get("model", "")),
             max_concurrency=_opt_count(entry.get("max_concurrency"), "max_concurrency", 0),
             ttfb_deadline_secs=_opt_secs(entry.get("ttfb_deadline_secs"), "ttfb_deadline_secs", 0.0),
+            routing=_opt_mapping(entry.get("routing"), "routing"),
         )
     return providers
 
@@ -168,6 +172,21 @@ def _opt_count(value: object, key: str, default: int) -> int:
         return default
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ConfigError(f"'{key}' must be a non-negative integer (0 = unlimited)")
+    return value
+
+
+def _opt_mapping(value: object, key: str) -> dict | None:
+    """Optional passthrough mapping (forwarded verbatim upstream); absent → None."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ConfigError(f"'{key}' must be a mapping")
+    # yaml can produce types json.dumps rejects (dates, sets); catch at parse
+    # time instead of failing every request to the endpoint.
+    try:
+        json.dumps(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"'{key}' must be JSON-serializable: {exc}") from exc
     return value
 
 
@@ -302,6 +321,10 @@ def _parse_groups(raw: object, providers: dict[str, Provider]) -> tuple[dict[str
             if not isinstance(flags, list):
                 raise ConfigError(f"entry {i} in group '{group_name}': 'flags' must be a list")
 
+            routing = _opt_mapping(entry.get("routing"), "routing")
+            if routing is None:
+                routing = prov.routing
+
             endpoints.append(Endpoint(
                 base_url=prov.base_url,
                 api_key=prov.api_key,
@@ -310,6 +333,7 @@ def _parse_groups(raw: object, providers: dict[str, Provider]) -> tuple[dict[str
                 provider=prov_lower,
                 max_concurrency=_opt_count(entry.get("max_concurrency"), "max_concurrency", prov.max_concurrency),
                 ttfb_deadline_secs=_opt_secs(entry.get("ttfb_deadline_secs"), "ttfb_deadline_secs", prov.ttfb_deadline_secs),
+                routing=routing,
             ))
             indices.append(len(endpoints) - 1)
 

@@ -80,6 +80,12 @@ groups:
         flags: [keep_reasoning]
       - provider: openrouter
         model: openai/gpt-4o-mini
+        # Per-endpoint OpenRouter routing params, injected as the request's
+        # `provider` object: https://openrouter.ai/docs/guides/routing/provider-selection
+        # (also settable provider-wide). E.g.:
+        # routing:
+        #   sort: throughput
+        #   allow_fallbacks: false
         # Per-endpoint overrides of provider-level settings:
         # max_concurrency: 1
         # ttfb_deadline_secs: 10
