@@ -183,9 +183,9 @@ async def test_all_endpoints_cooling_off_returns_502(proxy_app):
 
 
 @pytest.mark.asyncio
-async def test_race_group_without_raceable_providers_dispatches_seq(proxy_app, capsys):
-    """A race group with a single available provider runs sequentially: no
-    'race failed' warning, and the summary shows the actual dispatch mode."""
+async def test_race_group_without_raceable_providers_keeps_race_mode(proxy_app, capsys):
+    """A race group with one available provider uses its preferred order
+    without claiming that the group's routing mode changed to sequential."""
     app, _calls, _ = proxy_app(
         {
             "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
@@ -195,11 +195,11 @@ async def test_race_group_without_raceable_providers_dispatches_seq(proxy_app, c
     )
     resp = await _post(app, {"model": "default", "messages": []})
     assert resp.status_code == 200
+    assert resp.headers["x-stablellm-mode"] == "race"
 
     logged = capsys.readouterr().err
     assert "race failed" not in logged
-    assert "mode=seq" in logged
-    assert "mode=race" not in logged
+    assert "mode=seq" not in logged
 
 
 @pytest.mark.asyncio
@@ -505,6 +505,53 @@ async def test_fastest_is_an_alias_for_race(proxy_app):
     assert resp.status_code == 200
     assert resp.json()["who"] == "b"
     assert {c[0] for c in calls} == {"https://a.test", "https://b.test"}
+
+
+@pytest.mark.asyncio
+async def test_streaming_race_publishes_winner_for_next_request(proxy_app, monkeypatch):
+    """A completed streaming race must update the order used between races."""
+    delays = {"a.test": 0.04, "b.test": 0.0, "c.test": 0.02}
+    sse_body = b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+
+    async def handler(req):
+        await asyncio.sleep(delays[req.url.host])
+        return httpx.Response(200, content=sse_body, headers={"content-type": "text/event-stream"})
+
+    cfg = {
+        "providers": {
+            name: {"base_url": f"https://{name}.test", "api_key": "k"}
+            for name in "abc"
+        },
+        "groups": {"fast": {"mode": "race", "endpoints": [
+            {"provider": name, "model": f"m{name}"} for name in "abc"
+        ]}},
+    }
+    app, calls, main = proxy_app(cfg, handler)
+    body = {"model": "fast", "stream": True, "messages": []}
+    finish_calls = []
+    real_finish_race = main._finish_race
+
+    def finish_race(*args, **kwargs):
+        finish_calls.append((args, kwargs))
+        return real_finish_race(*args, **kwargs)
+
+    monkeypatch.setattr(main, "_finish_race", finish_race)
+
+    response = await _post(app, body)
+    assert response.status_code == 200
+    await asyncio.gather(*tuple(main._background_tasks), return_exceptions=False)
+    assert len(finish_calls) == 1
+    assert finish_calls[0][1]["accounted"] == 3
+    assert finish_calls[0][1]["total"] == 3
+    assert [main._pk_label("fast", key) for key in main._group_preferred_providers["fast"]] == ["b", "c", "a"]
+
+    # The next request is between race intervals, so it uses the preferred
+    # order without starting another race and retains race mode.
+    calls.clear()
+    response = await _post(app, body)
+    assert response.status_code == 200
+    assert response.headers["x-stablellm-mode"] == "race"
+    assert [call[0] for call in calls] == ["https://b.test"]
 
 
 @pytest.mark.asyncio

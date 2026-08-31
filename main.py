@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from decimal import Decimal
 from itertools import count
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar, Final
 from urllib.parse import unquote, urlparse
 
 import httpx
@@ -82,7 +82,7 @@ _inflight: dict[tuple[str, str], int] = defaultdict(int)
 # Keeps a session on the endpoint that last served it so upstream prompt
 # caches stay warm; the cap-skip may bounce a session once, and the pin then
 # follows it to the new endpoint instead of re-contesting the old one.
-_session_pins: dict[tuple[str, str], tuple[int, float]] = {}
+_session_pins: dict[tuple[str, str], tuple[int, str, float]] = {}
 _PIN_TABLE_MAX = 500
 _HASH_CAP = 65536  # serialized bytes of a message fed to the session-key hash
 _HASH_STR_CAP = 8192  # per-string cap, applied BEFORE serialization so huge strings don't stall the loop
@@ -541,9 +541,9 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
 
         # Start the generator so its finally (and the slot release) is armed
         # before anything can drop the response un-iterated.
-        gen = generate()
-        await gen.__anext__()
-        result = _streaming_response(resp, gen)
+        response_generator = generate()
+        await response_generator.__anext__()
+        result = _streaming_response(resp, response_generator)
         if via:
             result.headers["X-StableLLM-Via"] = via
         return result, None
@@ -760,17 +760,32 @@ def _pk_label(group: str, pk: tuple[str, str]) -> str:
     return pk[1]
 
 
-def _finish_race(race_times: dict[tuple[str, str], float], group: str):
-    sorted_keys = sorted(race_times, key=race_times.get)
+def _finish_race(
+    race_times: dict[tuple[str, str], float],
+    group: str,
+    *,
+    req_id: str = "-",
+    generation: int | None = None,
+    accounted: int | None = None,
+    total: int | None = None,
+):
+    sorted_keys = sorted(race_times, key=lambda key: race_times[key])
     new_order = list(sorted_keys)
     for k in _group_provider_groups[group]:
         if k not in race_times:
             new_order.append(k)
     _group_preferred_providers[group] = new_order
+    accounting = f"{accounted}/{total}" if accounted is not None and total is not None else "-"
     log.info(
-        "race complete group=%s order=%s",
+        "req=%s race complete group=%s generation=%s accounted=%s order=%s",
+        req_id,
         group,
-        " ".join(f"{_pk_label(group, k)}({v:.1f}s)" for k, v in sorted(race_times.items(), key=lambda x: x[1])),
+        generation if generation is not None else "-",
+        accounting,
+        " ".join(
+            f"{_pk_label(group, k)} model={k[0] or '-'}({v:.1f}s)"
+            for k, v in sorted(race_times.items(), key=lambda item: item[1])
+        ),
     )
 
 
@@ -795,31 +810,52 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
     # following request to retry the race against still-cooling-off endpoints.
     _group_race_request_count[group] = 0
     _group_last_race_time[group] = time.monotonic()
-    gen = next(_race_ids)
-    _group_race_generation[group] = gen
+    # Keep the race generation separate from the response generator below.
+    # The finalization closure captures this value while background drains run.
+    race_generation: Final[int] = next(_race_ids)
+    _group_race_generation[group] = race_generation
 
     race_context = _request_context(body_dict, group, req_id)
     log.debug(
-        "req=%s race: trigger=%s candidates=%s gen=%d",
+        "req=%s race: trigger=%s candidates=%s generation=%d",
         req_id,
         trigger,
         [f"{_pk_label(group, pk)} model={_effective_model(config.ENDPOINTS[idx], body_dict.get('model', ''))}" for pk, idx in candidates],
-        gen,
+        race_generation,
     )
 
     race_times: dict[tuple[str, str], float] = {}
     race_start = time.monotonic()
     race_state = {"failures": 0}
+    race_finished = False
 
     def _maybe_finalize():
+        nonlocal race_finished
         # Skip if a newer race for this group has already started; otherwise late
         # background drains from this race could clobber the newer race's order.
         # Race ids are monotonic process-wide, so a drain from a pre-reload race
         # can never match a post-reload race's id.
-        if _group_race_generation.get(group) != gen:
+        current_generation = _group_race_generation.get(group)
+        if current_generation != race_generation:
+            log.debug(
+                "req=%s race: ignoring stale finalization generation=%d current=%s",
+                req_id,
+                race_generation,
+                current_generation if current_generation is not None else "-",
+            )
             return
-        if len(race_times) + race_state["failures"] >= len(candidates):
-            _finish_race(race_times, group)
+        accounted = len(race_times) + race_state["failures"]
+        if race_finished or accounted < len(candidates):
+            return
+        race_finished = True
+        _finish_race(
+            race_times,
+            group,
+            req_id=req_id,
+            generation=race_generation,
+            accounted=accounted,
+            total=len(candidates),
+        )
 
     async def _abandon(resp, release):
         """Consume an orphaned racer response: release its slot, drop the conn."""
@@ -876,10 +912,25 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                 except CapReached as exc:
                     # Healthy endpoint, merely full: skip the mark-down.
                     race_state["failures"] += 1
-                    log.debug("req=%s race: %s", req_id, exc)
+                    log.debug(
+                        "req=%s race: %s accounted=%d/%d",
+                        req_id,
+                        exc,
+                        len(race_times) + race_state["failures"],
+                        len(candidates),
+                    )
                 except Exception as exc:  # noqa: BLE001 - a failed racer must not abort the request
                     race_state["failures"] += 1
                     _mark_down(idx, _exception_detail(exc), _request_context(body_dict, group, req_id))
+                    log.debug(
+                        "req=%s race: candidate %s model=%s failed accounted=%d/%d: %s",
+                        req_id,
+                        _pk_label(group, pk),
+                        pk[0] or "-",
+                        len(race_times) + race_state["failures"],
+                        len(candidates),
+                        _exception_detail(exc),
+                    )
     except BaseException:
         # Request cancelled mid-race (client hangup). Cancel still-acquiring
         # racers, and harvest any that completed in the same instant asyncio.wait
@@ -905,7 +956,14 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
     win_pk, win_idx, win_resp, win_release = winner
     ep = config.ENDPOINTS[win_idx]
     model_name = _effective_model(ep, body_dict.get("model", ""))
-    log.debug("req=%s race: winner %s (model=%s) %.0fms", req_id, _endpoint_label(ep), model_name, (time.monotonic() - race_start) * 1000)
+    log.debug(
+        "req=%s race: winner %s (model=%s) ttfb=%.0fms; draining %d other candidate(s)",
+        req_id,
+        _endpoint_label(ep),
+        model_name,
+        (time.monotonic() - race_start) * 1000,
+        len(candidates) - 1,
+    )
     _stats["requests"][win_idx] += 1
 
     race_metrics = requestlog.RequestMetrics(
@@ -919,15 +977,34 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         ttfb_ms=(time.monotonic() - race_start) * 1000,
     )
 
+    # TODO: Bound loser drains so a never-ending stream cannot hold race
+    # finalization and stale the preferred order indefinitely.
     async def _drain(pk, resp, idx, release):
         try:
             async for _ in resp.aiter_bytes():
                 pass
             race_times[pk] = time.monotonic() - race_start
-            log.debug("req=%s race: drain %s done %.1fs", req_id, _pk_label(group, pk), race_times[pk])
+            log.debug(
+                "req=%s race: drain %s model=%s done %.1fs accounted=%d/%d",
+                req_id,
+                _pk_label(group, pk),
+                pk[0] or "-",
+                race_times[pk],
+                len(race_times) + race_state["failures"],
+                len(candidates),
+            )
         except Exception as exc:  # noqa: BLE001 - drain failures are incidental
             race_state["failures"] += 1
             _mark_down(idx, _exception_detail(exc), _request_context(body_dict, group, req_id))
+            log.debug(
+                "req=%s race: drain %s model=%s failed accounted=%d/%d: %s",
+                req_id,
+                _pk_label(group, pk),
+                pk[0] or "-",
+                len(race_times) + race_state["failures"],
+                len(candidates),
+                _exception_detail(exc),
+            )
         finally:
             # Sync accounting before the close await: a cancellation arriving
             # during _close_quietly must not skip the slot release.
@@ -940,12 +1017,27 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
             _, _, resp, release = await task
         except CapReached as exc:
             race_state["failures"] += 1
-            log.debug("req=%s race: %s", req_id, exc)
+            log.debug(
+                "req=%s race: %s accounted=%d/%d",
+                req_id,
+                exc,
+                len(race_times) + race_state["failures"],
+                len(candidates),
+            )
             _maybe_finalize()
             return
         except Exception as exc:  # noqa: BLE001 - a failed racer must not abort the request
             race_state["failures"] += 1
             _mark_down(idx, _exception_detail(exc), _request_context(body_dict, group, req_id))
+            log.debug(
+                "req=%s race: candidate %s model=%s failed accounted=%d/%d: %s",
+                req_id,
+                _pk_label(group, pk),
+                pk[0] or "-",
+                len(race_times) + race_state["failures"],
+                len(candidates),
+                _exception_detail(exc),
+            )
             _maybe_finalize()
             return
         await _drain(pk, resp, idx, release)
@@ -1042,9 +1134,9 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
 
         # Start the generator so its finally (and win_release) is armed before
         # anything can drop the response un-iterated.
-        gen = generate()
-        await gen.__anext__()
-        result = _streaming_response(win_resp, gen)
+        response_generator = generate()
+        await response_generator.__anext__()
+        result = _streaming_response(win_resp, response_generator)
         _stats["successes"][win_idx] += 1
         _set_meta_headers(result, provider=ep.provider, model=model_name, mode=config.MODE_RACE, group=group, via=via)
         return result, True
@@ -1092,12 +1184,12 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         race_metrics.via = via or ""
         race_metrics.status = "200"
         await asyncio.to_thread(requestlog.log_request, race_metrics)
-        result = JSONResponse(content=data, status_code=win_resp.status_code)
+        buffered_result = JSONResponse(content=data, status_code=win_resp.status_code)
         if via:
-            result.headers["X-StableLLM-Via"] = via
+            buffered_result.headers["X-StableLLM-Via"] = via
         _stats["successes"][win_idx] += 1
-        _set_meta_headers(result, provider=ep.provider, model=model_name, mode=config.MODE_RACE, group=group, via=via)
-        return result, True
+        _set_meta_headers(buffered_result, provider=ep.provider, model=model_name, mode=config.MODE_RACE, group=group, via=via)
+        return buffered_result, True
 
 
 @app.get("/health")
@@ -1191,7 +1283,7 @@ async def stats(authorization: str | None = Header(None)):
     _, auth_err = _authenticate(authorization)
     if auth_err:
         return auth_err
-    result = {"endpoints": []}
+    result: dict[str, Any] = {"endpoints": []}
     for idx, ep in enumerate(config.ENDPOINTS):
         result["endpoints"].append({
             "index": idx,
@@ -1438,11 +1530,10 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
     mode = mode_override or config.GROUPS[group_name].mode
 
     log.debug(
-        "req=%s -> model=%r group=%s mode=%s stream=%s keyname=%s",
+        "req=%s -> model=%r group=%s configured_mode=%s stream=%s keyname=%s",
         req_id, model, group_name, mode, is_streaming, keyname or "-",
     )
 
-    dispatch_mode = mode
     if mode == config.MODE_RACE:
         _group_race_request_count[group_name] += 1
 
@@ -1453,12 +1544,25 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
                 result.headers["X-StableLLM-Pin"] = "none"  # races ignore pins by design
                 return result
             if raced:
-                dispatch_mode = "race-fallback"
-                log.warning("race failed (%s), falling back to sequential", _request_context(body_dict, group_name, req_id))
+                log.warning(
+                    "req=%s race failed group=%s model=%r stream=%s; falling back to preferred order",
+                    req_id,
+                    group_name,
+                    model,
+                    is_streaming,
+                )
             else:
-                dispatch_mode = "seq"
+                log.debug("req=%s race: skipped; using preferred order", req_id)
         else:
-            dispatch_mode = "seq"
+            age = time.monotonic() - _group_last_race_time[group_name]
+            log.debug(
+                "req=%s race: deferred; using preferred order requests_since_last=%d/%d age=%.0fs/%ss",
+                req_id,
+                _group_race_request_count[group_name],
+                config.SETTINGS.race_interval_requests,
+                age,
+                config.SETTINGS.race_interval_secs,
+            )
 
         pref = _group_preferred_providers[group_name]
         pg = _group_provider_groups[group_name]
@@ -1513,7 +1617,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             model_requested=client_model,
             provider_served=ep.provider or ep.base_url,
             model_served=model_name,
-            mode=dispatch_mode,
+            mode=mode,
             stream=is_streaming,
         )
 
@@ -1543,6 +1647,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
                 _set_meta_headers(result, provider=ep.provider, model=model_name, mode=mode, group=group_name, pin=pin)
                 return result
 
+            assert reason is not None
             _mark_down(idx, reason, request_context)
             last_failure = reason
 
@@ -1561,7 +1666,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         req_id=req_id,
         keyname=keyname,
         model_requested=model,
-        mode=dispatch_mode,
+        mode=mode,
         stream=is_streaming,
         status="502",
         reason=f"all endpoints failed (last: {_clip(last_failure)})",
