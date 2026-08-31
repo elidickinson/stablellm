@@ -1209,9 +1209,11 @@ async def test_session_pin_keeps_session_on_bounced_endpoint(proxy_app):
     assert [c[0] for c in calls] == ["https://a.test"]
 
     # expiring the pin returns the first session to configured order
+    import config
+
     skey = main._session_key(body)
     idx, home, ts = main._session_pins[("default", skey)]
-    main._session_pins[("default", skey)] = (idx, home, ts - main._PIN_TTL_SECS - 1)
+    main._session_pins[("default", skey)] = (idx, home, ts - config.SETTINGS.session_pin_ttl_secs - 1)
     calls.clear()
     resp = await _post(app, body)
     assert resp.status_code == 200

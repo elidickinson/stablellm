@@ -39,6 +39,7 @@ settings:
   cooloff_seconds: 30          # how long a failing endpoint is skipped
   race_interval_secs: 21600    # 6h — time between races (per group)
   race_interval_requests: 25   # request count between races (per group)
+  session_pin_ttl_secs: 900    # 15m — how long an idle session stays pinned to its endpoint
   log_level: INFO
 
 providers:
@@ -113,7 +114,7 @@ The client can override a group's mode with a `:race` or `:seq` suffix on the mo
 
 ### Session pinning
 
-Sequential routing is sticky per conversation: the session key (a hash of the client's `user` field, the first message, and the first user turn -- truncated so huge openers can't stall the proxy) is pinned to the endpoint that served its previous request, and that endpoint is tried first for ~10 minutes after each use. When something forces a failover (failure, cooloff, concurrency cap), the session bounces once and then re-pins to the new endpoint instead of re-contesting the old one — keeping upstream prompt caches warm. Racing requests are exempt; they bounce by design.
+Sequential routing is sticky per conversation: the session key (a hash of the client's `user` field, the first message, and the first user turn -- truncated so huge openers can't stall the proxy) is pinned to the endpoint that served its previous request, and that endpoint is tried first for `session_pin_ttl_secs` (default 15 minutes) after each use. When something forces a failover (failure, cooloff, concurrency cap), the session bounces once and then re-pins to the new endpoint instead of re-contesting the old one — keeping upstream prompt caches warm. Racing requests are exempt; they bounce by design.
 
 Pins are visible on `/stats` (`session_pins`, `inflight`) and are cleared on config reload.
 

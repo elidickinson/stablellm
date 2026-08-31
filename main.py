@@ -83,7 +83,6 @@ _inflight: dict[tuple[str, str], int] = defaultdict(int)
 # caches stay warm; the cap-skip may bounce a session once, and the pin then
 # follows it to the new endpoint instead of re-contesting the old one.
 _session_pins: dict[tuple[str, str], tuple[int, float]] = {}
-_PIN_TTL_SECS = 600.0
 _PIN_TABLE_MAX = 500
 _HASH_CAP = 65536  # serialized bytes of a message fed to the session-key hash
 _HASH_STR_CAP = 8192  # per-string cap, applied BEFORE serialization so huge strings don't stall the loop
@@ -291,7 +290,7 @@ def _pinned_endpoint(group: str, skey: str) -> tuple[int, str] | None:
     if entry is None:
         return None
     idx, home, ts = entry
-    if time.monotonic() - ts > _PIN_TTL_SECS:
+    if time.monotonic() - ts > config.SETTINGS.session_pin_ttl_secs:
         del _session_pins[(group, skey)]
         return None
     if idx >= len(config.ENDPOINTS) or _endpoint_label(config.ENDPOINTS[idx]) != home:
@@ -307,7 +306,8 @@ def _set_session_pin(group: str, skey: str, idx: int):
         return
     if len(_session_pins) >= _PIN_TABLE_MAX and (group, skey) not in _session_pins:
         now = time.monotonic()
-        for k in [k for k, (_, _, ts) in _session_pins.items() if now - ts > _PIN_TTL_SECS]:
+        ttl = config.SETTINGS.session_pin_ttl_secs
+        for k in [k for k, (_, _, ts) in _session_pins.items() if now - ts > ttl]:
             del _session_pins[k]
         if len(_session_pins) >= _PIN_TABLE_MAX:
             del _session_pins[min(_session_pins, key=lambda k: _session_pins[k][2])]
