@@ -400,6 +400,8 @@ def _request_context(body: dict, group: str = "", req_id: str = "") -> str:
     parts = [f"req={req_id or '-'}"]
     if group:
         parts.append(f"group={group!r}")
+    if model := body.get("model"):
+        parts.append(f"model={model!r}")
     parts.append(f"stream={bool(body.get('stream', False))}")
     messages = body.get("messages")
     if isinstance(messages, list):
