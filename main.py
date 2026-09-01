@@ -760,6 +760,10 @@ def _pk_label(group: str, pk: tuple[str, str]) -> str:
     return pk[1]
 
 
+_RACE_DRAIN_GRACE_RATIO = 0.5
+_RACE_DRAIN_MIN_GRACE_SECS = 1.0
+
+
 def _finish_race(
     race_times: dict[tuple[str, str], float],
     group: str,
@@ -826,8 +830,49 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
 
     race_times: dict[tuple[str, str], float] = {}
     race_start = time.monotonic()
+    race_loop = asyncio.get_running_loop()
+    race_deadline = race_loop.time() + config.SETTINGS.race_settle_timeout_secs
+    race_fastest_secs: float | None = None
+    race_timeouts: set[asyncio.Timeout] = set()
     race_state = {"failures": 0}
     race_finished = False
+
+    def _new_race_timeout() -> asyncio.Timeout:
+        timeout = asyncio.timeout_at(race_deadline)
+        race_timeouts.add(timeout)
+        return timeout
+
+    def _note_first_finish(elapsed: float):
+        nonlocal race_deadline, race_fastest_secs
+        if race_fastest_secs is not None:
+            return
+        race_fastest_secs = elapsed
+        grace = max(elapsed * _RACE_DRAIN_GRACE_RATIO, _RACE_DRAIN_MIN_GRACE_SECS)
+        race_deadline = min(race_deadline, race_loop.time() + grace)
+        for timeout in tuple(race_timeouts):
+            try:
+                timeout.reschedule(race_deadline)
+            except RuntimeError:
+                # The timeout is already expiring; its owner will account it.
+                race_timeouts.discard(timeout)
+        log.debug(
+            "req=%s race: fastest complete %.1fs; loser deadline in %.1fs",
+            req_id,
+            elapsed,
+            max(0.0, race_deadline - race_loop.time()),
+        )
+
+    def _record_race_timeout(pk: tuple[str, str]):
+        race_state["failures"] += 1
+        log.debug(
+            "req=%s race: candidate %s model=%s exceeded drain budget at %.1fs accounted=%d/%d",
+            req_id,
+            _pk_label(group, pk),
+            pk[0] or "-",
+            time.monotonic() - race_start,
+            len(race_times) + race_state["failures"],
+            len(candidates),
+        )
 
     def _maybe_finalize():
         nonlocal race_finished
@@ -977,13 +1022,16 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         ttfb_ms=(time.monotonic() - race_start) * 1000,
     )
 
-    # TODO: Bound loser drains so a never-ending stream cannot hold race
-    # finalization and stale the preferred order indefinitely.
-    async def _drain(pk, resp, idx, release):
-        try:
+    async def _drain(pk, resp, idx, release, timeout: asyncio.Timeout | None = None):
+        owns_timeout = timeout is None
+        if timeout is None:
+            timeout = _new_race_timeout()
+
+        async def _consume():
             async for _ in resp.aiter_bytes():
                 pass
             race_times[pk] = time.monotonic() - race_start
+            _note_first_finish(race_times[pk])
             log.debug(
                 "req=%s race: drain %s model=%s done %.1fs accounted=%d/%d",
                 req_id,
@@ -993,6 +1041,15 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                 len(race_times) + race_state["failures"],
                 len(candidates),
             )
+
+        try:
+            if owns_timeout:
+                async with timeout:
+                    await _consume()
+            else:
+                await _consume()
+        except TimeoutError:
+            _record_race_timeout(pk)
         except Exception as exc:  # noqa: BLE001 - drain failures are incidental
             race_state["failures"] += 1
             _mark_down(idx, _exception_detail(exc), _request_context(body_dict, group, req_id))
@@ -1006,6 +1063,8 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                 _exception_detail(exc),
             )
         finally:
+            if owns_timeout:
+                race_timeouts.discard(timeout)
             # Sync accounting before the close await: a cancellation arriving
             # during _close_quietly must not skip the slot release.
             release()
@@ -1013,34 +1072,55 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
             await _close_quietly(resp)
 
     async def _await_and_drain(task, pk, idx):
+        timeout = _new_race_timeout()
+        response_claimed = False
         try:
-            _, _, resp, release = await task
-        except CapReached as exc:
-            race_state["failures"] += 1
-            log.debug(
-                "req=%s race: %s accounted=%d/%d",
-                req_id,
-                exc,
-                len(race_times) + race_state["failures"],
-                len(candidates),
-            )
+            async with timeout:
+                try:
+                    _, _, resp, release = await task
+                    response_claimed = True
+                except CapReached as exc:
+                    race_state["failures"] += 1
+                    log.debug(
+                        "req=%s race: %s accounted=%d/%d",
+                        req_id,
+                        exc,
+                        len(race_times) + race_state["failures"],
+                        len(candidates),
+                    )
+                    _maybe_finalize()
+                    return
+                except Exception as exc:  # noqa: BLE001 - a failed racer must not abort the request
+                    race_state["failures"] += 1
+                    _mark_down(idx, _exception_detail(exc), _request_context(body_dict, group, req_id))
+                    log.debug(
+                        "req=%s race: candidate %s model=%s failed accounted=%d/%d: %s",
+                        req_id,
+                        _pk_label(group, pk),
+                        pk[0] or "-",
+                        len(race_times) + race_state["failures"],
+                        len(candidates),
+                        _exception_detail(exc),
+                    )
+                    _maybe_finalize()
+                    return
+                await _drain(pk, resp, idx, release, timeout)
+        except TimeoutError:
+            if not response_claimed:
+                if not task.done():
+                    task.cancel()
+                try:
+                    _, _, resp, release = await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:  # noqa: BLE001 - retrieve a timed-out task's exception during cleanup
+                    log.debug("req=%s race: timed-out candidate cleanup: %s", req_id, _exception_detail(exc))
+                else:
+                    await _abandon(resp, release)
+            _record_race_timeout(pk)
             _maybe_finalize()
-            return
-        except Exception as exc:  # noqa: BLE001 - a failed racer must not abort the request
-            race_state["failures"] += 1
-            _mark_down(idx, _exception_detail(exc), _request_context(body_dict, group, req_id))
-            log.debug(
-                "req=%s race: candidate %s model=%s failed accounted=%d/%d: %s",
-                req_id,
-                _pk_label(group, pk),
-                pk[0] or "-",
-                len(race_times) + race_state["failures"],
-                len(candidates),
-                _exception_detail(exc),
-            )
-            _maybe_finalize()
-            return
-        await _drain(pk, resp, idx, release)
+        finally:
+            race_timeouts.discard(timeout)
 
     for pk, idx, resp, release in losers_to_drain:
         _bg(_drain(pk, resp, idx, release))
@@ -1127,6 +1207,8 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                 # Sync accounting first: a cancellation arriving during the awaits
                 # below must not skip race finalization.
                 race_times[win_pk] = time.monotonic() - race_start
+                if outcome == "200":
+                    _note_first_finish(race_times[win_pk])
                 _maybe_finalize()
                 win_release()
                 await asyncio.to_thread(requestlog.log_request, race_metrics)
@@ -1142,9 +1224,11 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         return result, True
     else:
         chunks = []
+        winner_body_completed = False
         try:
             async for chunk in win_resp.aiter_bytes():
                 chunks.append(chunk)
+            winner_body_completed = True
         except httpx.TransportError as exc:
             # Winner died mid-body; fail the race so the caller falls back to
             # sequential. No terminal row: the sequential outcome owns it.
@@ -1156,6 +1240,8 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
             # during _close_quietly must not skip the slot release.
             win_release()
             race_times[win_pk] = time.monotonic() - race_start
+            if winner_body_completed:
+                _note_first_finish(race_times[win_pk])
             _maybe_finalize()
             await _close_quietly(win_resp)
         elapsed = time.monotonic() - race_start

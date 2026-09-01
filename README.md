@@ -39,6 +39,7 @@ settings:
   cooloff_seconds: 30          # how long a failing endpoint is skipped
   race_interval_secs: 21600    # 6h — time between races (per group)
   race_interval_requests: 25   # request count between races (per group)
+  race_settle_timeout_secs: 120  # hard cap for loser/header accounting from race start; must be > 0
   session_pin_ttl_secs: 900    # 15m — how long an idle session stays pinned to its endpoint
   log_level: INFO
 
@@ -108,7 +109,7 @@ POST to `/v1/chat/completions` (or any path) like the OpenAI API. Every request 
 The request's `model` field selects the group. Within that group, the routing mode determines how endpoints are dispatched:
 
 - **`seq`** (default) — try endpoints in order. A failing endpoint cools off for `cooloff_seconds` before being retried. If all endpoints fail, the request returns a 502.
-- **`race`** — send the request to one endpoint per provider concurrently; the first response wins for the current request. The remaining responses are drained in the background, and once all candidate outcomes are accounted for their completion times update the preferred provider order. A re-race triggers when either `race_interval_requests` requests have passed or `race_interval_secs` seconds have elapsed since the last race (defaults: **25 requests** or **6 hours**). Between races, requests stay in `race` mode and use the current preferred order with normal failover. If a race fails, the proxy also falls back to that preferred order.
+- **`race`** — send the request to one endpoint per provider concurrently; the first response wins for the current request. The remaining responses are drained in the background, and once all candidate outcomes are accounted for their completion times update the preferred provider order. A re-race triggers when either `race_interval_requests` requests have passed or `race_interval_secs` seconds have elapsed since the last race (defaults: **25 requests** or **6 hours**). Between races, requests stay in `race` mode and use the current preferred order with normal failover. If a race fails, the proxy also falls back to that preferred order. Before any complete response anchors the budget, and for candidates still waiting for headers, `race_settle_timeout_secs` from race start is the hard cap. After the first complete response, an unfinished loser gets up to 50% of that response's elapsed time, with a 1-second minimum, subject to the same cap; it is moved to the end of the preferred order without being marked down.
 
 The client can override a group's mode with a `:race` or `:seq` suffix on the model name (e.g. `glm-4.7:race`).
 

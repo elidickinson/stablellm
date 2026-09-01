@@ -6,6 +6,7 @@ settings:
   cooloff_seconds: 30
   race_interval_secs: 21600  # 6h
   race_interval_requests: 25
+  race_settle_timeout_secs: 120  # hard cap for race loser/header accounting; must be > 0
   log_level: INFO
 
 # Provider registry — just base_url + api_key, no model info.

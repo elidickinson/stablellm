@@ -555,6 +555,108 @@ async def test_streaming_race_publishes_winner_for_next_request(proxy_app, monke
 
 
 @pytest.mark.asyncio
+async def test_race_bounds_never_ending_loser(proxy_app, monkeypatch):
+    """A loser that keeps streaming is timed out and still finalizes the race."""
+    class EndlessStream(httpx.AsyncByteStream):
+        def __init__(self):
+            self.closed = False
+
+        async def __aiter__(self):
+            while True:
+                await asyncio.sleep(0.001)
+                yield b": keepalive\\n\\n"
+
+        async def aclose(self):
+            self.closed = True
+
+    loser_stream = EndlessStream()
+
+    async def handler(req):
+        if req.url.host == "b.test":
+            await asyncio.sleep(0.01)
+            return httpx.Response(200, stream=loser_stream)
+        return _ok_response()
+
+    cfg = {
+        "settings": {"race_settle_timeout_secs": 0.2},
+        "providers": {
+            "a": {"base_url": "https://a.test", "api_key": "k"},
+            "b": {"base_url": "https://b.test", "api_key": "k"},
+        },
+        "groups": {"fast": {"mode": "race", "endpoints": [
+            {"provider": "a", "model": "ma"},
+            {"provider": "b", "model": "mb"},
+        ]}},
+    }
+    app, calls, main = proxy_app(cfg, handler)
+    monkeypatch.setattr(main, "_RACE_DRAIN_MIN_GRACE_SECS", 0.02)
+
+    finish_calls = []
+    real_finish_race = main._finish_race
+
+    def finish_race(*args, **kwargs):
+        finish_calls.append((args, kwargs))
+        return real_finish_race(*args, **kwargs)
+
+    monkeypatch.setattr(main, "_finish_race", finish_race)
+
+    response = await _post(app, {"model": "fast", "messages": []})
+    assert response.status_code == 200
+    await asyncio.gather(*tuple(main._background_tasks), return_exceptions=False)
+
+    assert [call[0] for call in calls] == ["https://a.test", "https://b.test"]
+    assert len(finish_calls) == 1
+    assert finish_calls[0][1]["accounted"] == 2
+    assert finish_calls[0][1]["total"] == 2
+    assert [main._pk_label("fast", key) for key in main._group_preferred_providers["fast"]] == ["a", "b"]
+    assert loser_stream.closed
+    assert not main._cooloff_until
+    assert not main._inflight
+
+
+@pytest.mark.asyncio
+async def test_race_bounds_loser_waiting_for_headers(proxy_app, monkeypatch):
+    """A loser that never returns headers is timed out and accounted."""
+    async def handler(req):
+        if req.url.host == "b.test":
+            await asyncio.sleep(10)
+        return _ok_response()
+
+    cfg = {
+        "settings": {"race_settle_timeout_secs": 0.02},
+        "providers": {
+            "a": {"base_url": "https://a.test", "api_key": "k", "max_concurrency": 1},
+            "b": {"base_url": "https://b.test", "api_key": "k", "max_concurrency": 1},
+        },
+        "groups": {"fast": {"mode": "race", "endpoints": [
+            {"provider": "a", "model": "ma"},
+            {"provider": "b", "model": "mb"},
+        ]}},
+    }
+    app, calls, main = proxy_app(cfg, handler)
+
+    finish_calls = []
+    real_finish_race = main._finish_race
+
+    def finish_race(*args, **kwargs):
+        finish_calls.append((args, kwargs))
+        return real_finish_race(*args, **kwargs)
+
+    monkeypatch.setattr(main, "_finish_race", finish_race)
+
+    response = await _post(app, {"model": "fast", "messages": []})
+    assert response.status_code == 200
+    await asyncio.gather(*tuple(main._background_tasks), return_exceptions=False)
+
+    assert {call[0] for call in calls} == {"https://a.test", "https://b.test"}
+    assert len(finish_calls) == 1
+    assert finish_calls[0][1]["accounted"] == 2
+    assert finish_calls[0][1]["total"] == 2
+    assert all(value == 0 for value in main._inflight.values())
+    assert not main._cooloff_until
+
+
+@pytest.mark.asyncio
 async def test_group_mode_race_triggers_race_without_suffix(proxy_app):
     """When the group itself declares mode: race, requests race by default."""
     cfg = {

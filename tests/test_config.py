@@ -120,12 +120,18 @@ def test_missing_env_var_warns_and_preserves_placeholder(monkeypatch, caplog):
 
 def test_settings_loaded_from_yaml(make_config):
     cfg = make_config({
-        "settings": {"cooloff_seconds": 5, "race_interval_requests": 100, "log_level": "debug"},
+        "settings": {
+            "cooloff_seconds": 5,
+            "race_interval_requests": 100,
+            "race_settle_timeout_secs": 7.5,
+            "log_level": "debug",
+        },
         "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
         "groups": {"default": _group([{"provider": "a"}])},
     })
     assert cfg.SETTINGS.cooloff_seconds == 5
     assert cfg.SETTINGS.race_interval_requests == 100
+    assert cfg.SETTINGS.race_settle_timeout_secs == 7.5
     assert cfg.SETTINGS.log_level == "DEBUG"
 
 
@@ -405,6 +411,13 @@ def test_cooloff_seconds_nan_is_config_error():
     raw = make_minimal()
     raw["settings"] = {"cooloff_seconds": float("nan")}
     with pytest.raises(ConfigError, match="cooloff_seconds"):
+        parse_config(raw)
+
+
+def test_race_settle_timeout_must_be_positive():
+    raw = make_minimal()
+    raw["settings"] = {"race_settle_timeout_secs": 0}
+    with pytest.raises(ConfigError, match="race_settle_timeout_secs"):
         parse_config(raw)
 
 

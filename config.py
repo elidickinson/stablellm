@@ -80,6 +80,7 @@ class Settings:
     cooloff_seconds: float = 30.0
     race_interval_secs: int = 6 * 3600
     race_interval_requests: int = 25
+    race_settle_timeout_secs: float = 120.0
     session_pin_ttl_secs: float = 15 * 60
     log_level: str = "INFO"
 
@@ -363,6 +364,13 @@ def _parse_settings(raw: object) -> Settings:
     cooloff = float(raw.get("cooloff_seconds", defaults.cooloff_seconds))
     if not math.isfinite(cooloff) or cooloff < 0:
         raise ConfigError("'cooloff_seconds' must be a non-negative number of seconds")
+    race_settle_timeout = _opt_secs(
+        raw.get("race_settle_timeout_secs"),
+        "race_settle_timeout_secs",
+        defaults.race_settle_timeout_secs,
+    )
+    if race_settle_timeout == 0:
+        raise ConfigError("'race_settle_timeout_secs' must be greater than 0")
     pin_ttl = float(raw.get("session_pin_ttl_secs", defaults.session_pin_ttl_secs))
     if not math.isfinite(pin_ttl) or pin_ttl < 0:
         raise ConfigError("'session_pin_ttl_secs' must be a non-negative number of seconds")
@@ -370,6 +378,7 @@ def _parse_settings(raw: object) -> Settings:
         cooloff_seconds=cooloff,
         race_interval_secs=int(raw.get("race_interval_secs", defaults.race_interval_secs)),
         race_interval_requests=int(raw.get("race_interval_requests", defaults.race_interval_requests)),
+        race_settle_timeout_secs=race_settle_timeout,
         session_pin_ttl_secs=pin_ttl,
         log_level=str(raw.get("log_level", defaults.log_level)).upper(),
     )
