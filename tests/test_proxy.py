@@ -811,7 +811,7 @@ async def test_race_buffered_drain_closes_response_on_cancellation(proxy_app):
     with pytest.raises(asyncio.CancelledError):
         await main._race_request(
             "chat/completions", {"model": "fast", "messages": []}, False,
-            "fast", "", "req-test", "test",
+            "fast", "", "req-test", "test", "",
         )
 
     assert winner.closed
@@ -1468,11 +1468,11 @@ async def test_pin_header_states(proxy_app):
 
 
 @pytest.mark.asyncio
-async def test_pin_header_none_for_race_and_sessionless(proxy_app):
+async def test_race_pins_winner_and_skips_pinned_sessions(proxy_app):
     def handler(req):
         return _ok_response()
 
-    app, _calls, _main = proxy_app(
+    app, calls, main = proxy_app(
         {
             "providers": {
                 "a": {"base_url": "https://a.test", "api_key": "k"},
@@ -1482,8 +1482,18 @@ async def test_pin_header_none_for_race_and_sessionless(proxy_app):
         },
         handler,
     )
-    resp = await _post(app, {"model": "default", "messages": [{"role": "user", "content": "hi"}]})
-    assert resp.headers["x-stablellm-pin"] == "none"  # race
+    body = {"model": "default", "messages": [{"role": "user", "content": "hi"}]}
+
+    resp = await _post(app, body)
+    assert resp.headers["x-stablellm-pin"] == "new; home=a"
+    assert len(calls) == 2  # raced both providers
+
+    # Cadence is ripe again, but the session is pinned: no race, stays home.
+    calls.clear()
+    main._group_race_request_count["default"] = 9999
+    resp = await _post(app, body)
+    assert resp.headers["x-stablellm-pin"] == "hit; home=a"
+    assert [c[0] for c in calls] == ["https://a.test"]  # no fan-out
 
     resp = await _post(app, {"model": "default", "messages": []})
     assert resp.headers["x-stablellm-pin"] == "none"  # no session derivable
@@ -1539,7 +1549,7 @@ async def test_race_cancel_during_winner_read_releases_slot(proxy_app):
     with pytest.raises(asyncio.CancelledError):
         await main._race_request(
             "chat/completions", {"model": "fast", "messages": []}, False,
-            "fast", "", "req-test", "test",
+            "fast", "", "req-test", "test", "",
         )
     await asyncio.gather(*tuple(main._background_tasks), return_exceptions=True)
 
@@ -1632,7 +1642,7 @@ async def test_race_cancel_after_racer_completes_releases_slot(proxy_app, monkey
     with pytest.raises(asyncio.CancelledError):
         await main._race_request(
             "chat/completions", {"model": "fast", "messages": []}, False,
-            "fast", "", "req-test", "test",
+            "fast", "", "req-test", "test", "",
         )
     await asyncio.gather(*tuple(main._background_tasks), return_exceptions=True)
 

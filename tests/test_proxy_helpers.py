@@ -212,7 +212,7 @@ def test_strip_unsupported_keeps_reasoning_when_flag_set(main_module):
 def test_should_race_true_on_first_call(main_module):
     main_module._group_last_race_time.clear()
     main_module._group_race_request_count.clear()
-    should, trigger = main_module._should_race("default")
+    should, trigger = main_module._should_race("default", False)
     assert should is True
     assert trigger == "first request"
 
@@ -221,7 +221,7 @@ def test_should_race_false_when_within_cadence(main_module):
     import time
     main_module._group_last_race_time["default"] = time.monotonic()
     main_module._group_race_request_count["default"] = 0
-    should, _ = main_module._should_race("default")
+    should, _ = main_module._should_race("default", False)
     assert should is False
 
 
@@ -229,7 +229,7 @@ def test_should_race_true_after_request_threshold(main_module):
     import time
     main_module._group_last_race_time["default"] = time.monotonic()
     main_module._group_race_request_count["default"] = 9999
-    should, _ = main_module._should_race("default")
+    should, _ = main_module._should_race("default", False)
     assert should is True
 
 
@@ -260,7 +260,7 @@ def test_should_race_true_after_time_threshold(main_module):
     import config
     main_module._group_last_race_time["default"] = time.monotonic() - (config.SETTINGS.race_interval_secs + 1)
     main_module._group_race_request_count["default"] = 0
-    should, _ = main_module._should_race("default")
+    should, _ = main_module._should_race("default", False)
     assert should is True
 
 

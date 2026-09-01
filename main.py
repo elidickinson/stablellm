@@ -735,8 +735,14 @@ def _strip_unsupported(body: dict, ep: Endpoint) -> dict:
     return _rewrite_model(base, ep)
 
 
-def _should_race(group: str) -> tuple[bool, str]:
-    """(whether to race now, human-readable trigger reason)."""
+def _should_race(group: str, is_pinned: bool) -> tuple[bool, str]:
+    """(whether to race now, human-readable trigger reason).
+
+    A pinned session is never raced: it has a warm upstream prompt cache on its
+    home endpoint and a race would move it off. Fresh sessions have nothing to
+    lose, so a ripe cadence waits for one."""
+    if is_pinned:
+        return False, ""
     last_time = _group_last_race_time[group]
     count = _group_race_request_count[group]
     if last_time == 0.0:
@@ -793,7 +799,7 @@ def _finish_race(
     )
 
 
-async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: str, keyname: str, req_id: str, trigger: str):
+async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: str, keyname: str, req_id: str, trigger: str, session_key: str):
     """Race one endpoint per provider group with real request. Returns response or None."""
     pg = _group_provider_groups[group]
 
@@ -1001,6 +1007,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
     win_pk, win_idx, win_resp, win_release = winner
     ep = config.ENDPOINTS[win_idx]
     model_name = _effective_model(ep, body_dict.get("model", ""))
+    race_pin = f"new; home={_endpoint_label(ep)}" if session_key else "none"
     log.debug(
         "req=%s race: winner %s (model=%s) ttfb=%.0fms; draining %d other candidate(s)",
         req_id,
@@ -1220,7 +1227,8 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         await response_generator.__anext__()
         result = _streaming_response(win_resp, response_generator)
         _stats["successes"][win_idx] += 1
-        _set_meta_headers(result, provider=ep.provider, model=model_name, mode=config.MODE_RACE, group=group, via=via)
+        _set_session_pin(group, session_key, win_idx)
+        _set_meta_headers(result, provider=ep.provider, model=model_name, mode=config.MODE_RACE, group=group, via=via, pin=race_pin)
         return result, True
     else:
         chunks = []
@@ -1274,7 +1282,8 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         if via:
             buffered_result.headers["X-StableLLM-Via"] = via
         _stats["successes"][win_idx] += 1
-        _set_meta_headers(buffered_result, provider=ep.provider, model=model_name, mode=config.MODE_RACE, group=group, via=via)
+        _set_session_pin(group, session_key, win_idx)
+        _set_meta_headers(buffered_result, provider=ep.provider, model=model_name, mode=config.MODE_RACE, group=group, via=via, pin=race_pin)
         return buffered_result, True
 
 
@@ -1620,14 +1629,16 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         req_id, model, group_name, mode, is_streaming, keyname or "-",
     )
 
+    session_key = _session_key(body_dict)
+    pinned = _pinned_endpoint(group_name, session_key)
+
     if mode == config.MODE_RACE:
         _group_race_request_count[group_name] += 1
 
-        should_race, trigger = _should_race(group_name)
+        should_race, trigger = _should_race(group_name, pinned is not None)
         if should_race:
-            result, raced = await _race_request(path, body_dict, is_streaming, group_name, keyname, req_id, trigger)
+            result, raced = await _race_request(path, body_dict, is_streaming, group_name, keyname, req_id, trigger, session_key)
             if result is not None:
-                result.headers["X-StableLLM-Pin"] = "none"  # races ignore pins by design
                 return result
             if raced:
                 log.warning(
@@ -1642,8 +1653,9 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         else:
             age = time.monotonic() - _group_last_race_time[group_name]
             log.debug(
-                "req=%s race: deferred; using preferred order requests_since_last=%d/%d age=%.0fs/%ss",
+                "req=%s race: deferred; using preferred order pinned=%s requests_since_last=%d/%d age=%.0fs/%ss",
                 req_id,
+                pinned[1] if pinned else "-",
                 _group_race_request_count[group_name],
                 config.SETTINGS.race_interval_requests,
                 age,
@@ -1659,9 +1671,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         endpoint_order = config.GROUPS[group_name].endpoints
 
     last_failure = None
-    session_key = _session_key(body_dict)
     order = list(endpoint_order)
-    pinned = _pinned_endpoint(group_name, session_key)
     had_pin = pinned is not None
     pinned_idx, pin_home = pinned if pinned else (None, "")
     global _pin_promotions
