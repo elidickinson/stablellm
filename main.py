@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from decimal import Decimal
 from itertools import count
 from pathlib import Path
-from typing import Any, ClassVar, Final
+from typing import ClassVar, Final
 from urllib.parse import unquote, urlparse
 
 import httpx
@@ -215,8 +215,16 @@ async def _limit_body_size(request: Request, call_next):
     return await call_next(request)
 
 
+# Providers manually disabled from the dashboard. Keyed by provider name (not
+# endpoint index) so it survives config reloads; pruned to configured names on
+# reload. Affects routing of new requests only; in-flight requests finish.
+_manual_down: set[str] = set()
+# Last failure reason per endpoint index, surfaced on the dashboard.
+_last_failure: dict[int, str] = {}
+
+
 def _is_available(idx: int) -> bool:
-    return time.monotonic() >= _cooloff_until.get(idx, 0)
+    return time.monotonic() >= _cooloff_until.get(idx, 0) and config.ENDPOINTS[idx].provider not in _manual_down
 
 
 def _at_cap(ep: Endpoint, model_name: str) -> bool:
@@ -315,6 +323,7 @@ def _set_session_pin(group: str, skey: str, idx: int):
 
 
 def _mark_down(idx: int, reason: str, request_context: str = ""):
+    _last_failure[idx] = _clip(reason)
     cooloff = config.SETTINGS.cooloff_seconds
     _cooloff_until[idx] = time.monotonic() + cooloff
     _stats["failures"][idx] += 1
@@ -1373,33 +1382,117 @@ async def list_models(authorization: str | None = Header(None)):
     }
 
 
-@app.get("/stats")
-async def stats(authorization: str | None = Header(None)):
-    _, auth_err = _authenticate(authorization)
-    if auth_err:
-        return auth_err
-    result: dict[str, Any] = {"endpoints": []}
+def _merged_state_rows() -> list[dict]:
+    """Endpoint entries merged into one row per (base_url, model).
+
+    Counters and cooloffs are per endpoint entry (summed / worst-of here);
+    inflight and max_concurrency are already per (base_url, model)."""
+    entry_groups: dict[int, str] = {}
+    for gname, g in config.GROUPS.items():
+        for i in g.endpoints:
+            entry_groups.setdefault(i, gname)
+    rows: dict[tuple[str, str], dict] = {}
+    now = time.monotonic()
     for idx, ep in enumerate(config.ENDPOINTS):
-        result["endpoints"].append({
-            "index": idx,
-            "model": ep.model or "(none)",
-            "requests": _stats["requests"].get(idx, 0),
-            "successes": _stats["successes"].get(idx, 0),
-            "failures": _stats["failures"].get(idx, 0),
-        })
-    result["groups"] = {}
+        key = (ep.base_url, ep.model)
+        row = rows.get(key)
+        if row is None:
+            if ep.model:
+                inflight = _inflight.get(key, 0)
+            else:
+                # Passthrough endpoints forward the client's model, so their
+                # inflight keys are (base_url, <client model>); sum the base_url.
+                inflight = sum(n for (base, _), n in _inflight.items() if base == ep.base_url)
+            row = {
+                "provider": ep.provider,
+                "base_url": ep.base_url,
+                "model": ep.model or "(passthrough)",
+                "groups": [],
+                "state": "up",
+                "cooloff_secs_left": 0.0,
+                "last_error": "",
+                "inflight": inflight,
+                "max_concurrency": 0,
+                "requests": 0,
+                "successes": 0,
+                "failures": 0,
+            }
+            rows[key] = row
+        row["groups"].append(entry_groups.get(idx, "?"))
+        row["max_concurrency"] = max(row["max_concurrency"], ep.max_concurrency)
+        row["requests"] += _stats["requests"].get(idx, 0)
+        row["successes"] += _stats["successes"].get(idx, 0)
+        row["failures"] += _stats["failures"].get(idx, 0)
+        row["last_error"] = row["last_error"] or _last_failure.get(idx, "")
+        if ep.provider in _manual_down:
+            row["state"] = "down"
+        elif now < _cooloff_until.get(idx, 0) and row["state"] != "down":
+            row["state"] = "cooling"
+            row["cooloff_secs_left"] = max(row["cooloff_secs_left"], _cooloff_until[idx] - now)
+    return sorted(rows.values(), key=lambda r: (r["provider"], r["model"]))
+
+
+@app.get("/dashboard/api/state")
+async def dashboard_state(x_config_password: str | None = Header(None)):
+    err = await _editor_auth(x_config_password)
+    if err:
+        return err
+    groups = {}
     for name, group in config.GROUPS.items():
-        result["groups"][name] = {
-            "endpoints": group.endpoints,
+        groups[name] = {
             "mode": group.mode,
+            "endpoints": [f"{config.ENDPOINTS[i].provider}/{config.ENDPOINTS[i].model or '(passthrough)'}" for i in group.endpoints],
             "preferred_providers": [{"model": m, "base_url": u} for m, u in _group_preferred_providers.get(name, [])],
             "requests_since_last_race": _group_race_request_count.get(name, 0),
         }
-    # No filter: a zero or negative row is exactly the accounting bug signal we want visible.
-    result["inflight"] = {f"{base_url} model={model!r}": n for (base_url, model), n in sorted(_inflight.items())}
-    result["session_pins"] = len(_session_pins)
-    result["session_pin_hits"] = _pin_promotions
-    return result
+    return {
+        "rows": _merged_state_rows(),
+        "groups": groups,
+        "manual_down": sorted(_manual_down),
+        "session_pins": len(_session_pins),
+        "session_pin_hits": _pin_promotions,
+    }
+
+
+@app.get("/dashboard/api/history")
+async def dashboard_history(x_config_password: str | None = Header(None)):
+    err = await _editor_auth(x_config_password)
+    if err:
+        return err
+    recent = await asyncio.to_thread(requestlog.recent_requests, 50)
+    summary = await asyncio.to_thread(requestlog.window_summary)
+    return {"requests": recent, "summary": summary}
+
+
+async def _dashboard_set_down(provider: str, down: bool, x_config_password: str | None):
+    err = await _editor_auth(x_config_password)
+    if err:
+        return err
+    name = provider.lower()  # provider names are lowercased at parse time
+    if name not in {ep.provider for ep in config.ENDPOINTS}:
+        return PlainTextResponse(f"unknown provider {name!r}", status_code=404)
+    if down:
+        _manual_down.add(name)
+    else:
+        _manual_down.discard(name)
+    return {"provider": name, "down": name in _manual_down}
+
+
+@app.post("/dashboard/api/down/{provider}")
+async def dashboard_mark_down(provider: str, x_config_password: str | None = Header(None)):
+    return await _dashboard_set_down(provider, True, x_config_password)
+
+
+@app.post("/dashboard/api/up/{provider}")
+async def dashboard_mark_up(provider: str, x_config_password: str | None = Header(None)):
+    return await _dashboard_set_down(provider, False, x_config_password)
+
+
+@app.get("/dashboard")
+async def dashboard_page():
+    if not config.CONFIG_EDITOR_PASSWORD:
+        return PlainTextResponse("not found", status_code=404)
+    return HTMLResponse(DASHBOARD_HTML)
 
 
 CONFIG_EDITOR_HTML = """<!DOCTYPE html>
@@ -1497,6 +1590,205 @@ pw.addEventListener('keydown', e => { if (e.key === 'Enter') loadConfig(); });
 """
 
 
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html>
+<head>
+<title>stablellm dashboard</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; background: #1e1e1e; color: #ccc; margin: 0; padding: 20px; }
+  h1 { font-size: 1.1em; margin: 0 0 12px; font-weight: 500; }
+  h2 { font-size: 0.9em; margin: 18px 0 6px; font-weight: 500; color: #999; }
+  .bar { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
+  input[type=password] { background: #2d2d2d; color: #ccc; border: 1px solid #444; padding: 6px 10px; font-family: monospace; border-radius: 3px; }
+  input[type=password]:focus { outline: none; border-color: #0e639c; }
+  button { background: #0e639c; color: white; border: none; padding: 4px 12px; cursor: pointer; font-size: 12px; border-radius: 3px; }
+  button:hover { background: #1177bb; }
+  table { border-collapse: collapse; font-size: 12.5px; width: 100%; }
+  th { text-align: left; color: #777; font-weight: 500; padding: 3px 10px 3px 0; border-bottom: 1px solid #333; }
+  td { padding: 4px 10px 4px 0; border-bottom: 1px solid #2a2a2a; vertical-align: top; }
+  td.num, th.num { text-align: right; font-family: monospace; }
+  .mono { font-family: monospace; }
+  .pill { font-weight: 600; }
+  .up { color: #7cc87c; } .cooling { color: #e5c07b; } .down { color: #e06c75; }
+  .hot { color: #e06c75; font-weight: 600; }
+  .ok { color: #7cc87c; } .warn { color: #e5c07b; } .err { color: #e06c75; }
+  .dim { color: #666; }
+  #status { margin-top: 10px; padding: 8px 12px; border-radius: 3px; min-height: 1.2em; font-family: monospace; font-size: 12px; }
+  #status.err { background: #5a1d1d; color: #f5a5a5; }
+  .hint { color: #666; font-size: 12px; }
+  details { margin-top: 14px; font-size: 12px; color: #888; }
+  summary { cursor: pointer; }
+</style>
+</head>
+<body>
+<h1>stablellm dashboard</h1>
+<div class="bar">
+  <input type="password" id="pw" placeholder="password" autofocus>
+  <button id="load">Load</button>
+  <span id="updated" class="dim"></span>
+  <span class="hint">manual down survives config reload, not restarts</span>
+</div>
+<div id="content" style="display:none">
+  <h2>providers</h2>
+  <table id="providers"></table>
+  <h2>endpoints (provider / model)</h2>
+  <table id="endpoints"></table>
+  <h2>recent requests</h2>
+  <table id="reqs"></table>
+  <details><summary>groups / race state</summary><div id="groups"></div></details>
+</div>
+<div id="status" class="dim">Enter password and click Load</div>
+<script>
+const $ = id => document.getElementById(id);
+let pw = '', stateData = null, historyData = null, stateTimer = null, histTimer = null, paintTimer = null;
+
+function setStatus(text, cls) { const s = $('status'); s.textContent = text; s.className = cls || 'dim'; }
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: { 'X-Config-Password': pw, ...(opts.headers || {}) } });
+  if (r.status === 401) { setStatus('unauthorized: wrong password', 'err'); throw new Error('unauthorized'); }
+  if (!r.ok) throw new Error(path + ' -> HTTP ' + r.status);
+  return r.json();
+}
+
+function el(tag, text, cls) { const n = document.createElement(tag); if (text !== null && text !== undefined) n.textContent = text; if (cls) n.className = cls; return n; }
+
+function pill(state, secsLeft) {
+  if (state === 'down') return el('span', '\u25cf DOWN', 'pill down');
+  if (state === 'cooling') return el('span', '\u25d0 ' + Math.max(0, secsLeft).toFixed(0) + 's', 'pill cooling');
+  return el('span', '\u25cf UP', 'pill up');
+}
+
+function fmtMs(v) { return v == null ? '\u2013' : (v / 1000).toFixed(1) + 's'; }
+function fmtTps(v) { return v == null ? '\u2013' : v.toFixed(1) + '/s'; }
+
+function renderProviders() {
+  if (!stateData) return;
+  const t = $('providers'); t.textContent = '';
+  const byProv = {};
+  for (const r of stateData.rows) {
+    const p = byProv[r.provider] || (byProv[r.provider] = { state: 'up', secs: 0, err: '' });
+    if (r.state === 'down') p.state = 'down';
+    else if (r.state === 'cooling' && p.state !== 'down') { p.state = 'cooling'; p.secs = Math.max(p.secs, r.secsLeft); }
+    p.err = p.err || r.last_error;
+  }
+  const head = el('tr'); for (const h of ['provider', 'state', 'last error', '']) head.appendChild(el('th', h));
+  t.appendChild(head);
+  for (const [prov, p] of Object.entries(byProv).sort()) {
+    const tr = el('tr');
+    tr.appendChild(el('td', prov, 'mono'));
+    tr.appendChild(el('td')).appendChild(pill(p.state, p.secs));
+    tr.appendChild(el('td', p.err, 'err'));
+    const act = el('td');
+    const btn = el('button', p.state === 'down' ? 'bring up' : 'mark down');
+    btn.addEventListener('click', async () => {
+      try { await api('/dashboard/api/' + (p.state === 'down' ? 'up/' : 'down/') + prov, { method: 'POST' }); await refreshState(); }
+      catch (e) { setStatus(String(e), 'err'); }
+    });
+    act.appendChild(btn); tr.appendChild(act);
+    t.appendChild(tr);
+  }
+}
+
+function renderEndpoints() {
+  if (!stateData || !historyData) return;
+  const t = $('endpoints'); t.textContent = '';
+  const head = el('tr');
+  for (const [h, cls] of [['provider / model'], ['groups'], ['inflight', 'num'], ['r/s/f', 'num'], ['15m \u00b7 1h \u00b7 24h (reqs \u00b7 ttft \u00b7 tok/s)']])
+    head.appendChild(Object.assign(el('th', h), cls ? { className: cls } : {}));
+  t.appendChild(head);
+  for (const r of stateData.rows) {
+    const tr = el('tr');
+    tr.appendChild(el('td', r.provider + '  ' + r.model, 'mono'));
+    tr.appendChild(el('td', [...new Set(r.groups)].join(', ')));
+    const capped = r.max_concurrency > 0 && r.inflight >= r.max_concurrency;
+    tr.appendChild(el('td', r.inflight + '/' + (r.max_concurrency > 0 ? r.max_concurrency : '\u2013'), 'num mono' + (capped ? ' hot' : '')));
+    tr.appendChild(el('td', r.requests + '/' + r.successes + '/' + r.failures, 'num mono'));
+    const s = historyData.summary[r.provider + '|' + r.model];
+    const cell = el('td', null, 'mono');
+    if (!s) { cell.appendChild(el('span', '\u2013', 'dim')); }
+    else for (const label of ['15m', '1h', '24h']) {
+      cell.appendChild(el('div', label + '  ' + (s.reqs[label] || 0) + ' \u00b7 ' + fmtMs(s.ttft_ms[label]) + ' \u00b7 ' + fmtTps(s.tok_s[label])));
+    }
+    tr.appendChild(cell);
+    t.appendChild(tr);
+  }
+}
+
+function renderReqs() {
+  if (!historyData) return;
+  const t = $('reqs'); t.textContent = '';
+  const head = el('tr');
+  for (const [h, cls] of [['time'], ['client'], ['group'], ['served by'], ['mode'], ['status'], ['ttft', 'num'], ['tok/s', 'num'], ['reason']])
+    head.appendChild(Object.assign(el('th', h), cls ? { className: cls } : {}));
+  t.appendChild(head);
+  for (const r of historyData.requests) {
+    const tr = el('tr');
+    const cls = r.status === '200' ? 'ok' : (r.status === 'aborted' ? 'warn' : 'err');
+    tr.appendChild(el('td', new Date(r.ts * 1000).toLocaleTimeString(), 'mono'));
+    tr.appendChild(el('td', r.client || '\u2013'));
+    tr.appendChild(el('td', r.group, 'mono'));
+    tr.appendChild(el('td', (r.provider || '\u2013') + ' ' + (r.model || ''), 'mono'));
+    tr.appendChild(el('td', r.mode || ''));
+    tr.appendChild(el('td', r.status, cls));
+    tr.appendChild(el('td', r.ttft_ms == null ? '\u2013' : (r.ttft_ms / 1000).toFixed(1) + 's', 'num mono'));
+    tr.appendChild(el('td', r.tokens_per_sec == null ? '\u2013' : r.tokens_per_sec.toFixed(1), 'num mono'));
+    tr.appendChild(el('td', r.reason || '', r.reason ? 'err' : ''));
+    t.appendChild(tr);
+  }
+}
+
+function renderGroups() {
+  if (!stateData) return;
+  const d = $('groups'); d.textContent = '';
+  for (const [name, g] of Object.entries(stateData.groups)) {
+    const line = name + ' [' + g.mode + ']  ' + g.endpoints.join(' > ')
+      + '   preferred: ' + (g.preferred_providers.map(p => p.model + '@' + p.base_url.replace('https://', '')).join(', ') || '(none)')
+      + '   reqs since race: ' + g.requests_since_last_race;
+    d.appendChild(el('div', line, 'mono'));
+  }
+  d.appendChild(el('div', 'session pins: ' + stateData.session_pins + ' \u00b7 pin hits: ' + stateData.session_pin_hits));
+}
+
+// Endpoints store wall-clock deadlines so the countdown ticks between polls.
+function captureDeadlines() {
+  for (const r of stateData.rows) r.secsLeft = r.cooloff_secs_left;
+  stateData.fetchedAt = Date.now();
+}
+
+function paint() {
+  if (!stateData) return;
+  const drift = (Date.now() - stateData.fetchedAt) / 1000;
+  for (const r of stateData.rows) if (r.state === 'cooling') r.secsLeft = Math.max(0, r.cooloff_secs_left - drift);
+  renderProviders(); renderEndpoints(); renderReqs(); renderGroups();
+  $('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
+}
+
+async function refreshState() { stateData = await api('/dashboard/api/state'); captureDeadlines(); }
+async function refreshHistory() { historyData = await api('/dashboard/api/history'); }
+
+async function start() {
+  pw = $('pw').value;
+  try {
+    await Promise.all([refreshState(), refreshHistory()]);
+  } catch (e) { if (e.message !== 'unauthorized') setStatus(String(e), 'err'); return; }
+  $('content').style.display = '';
+  setStatus('');
+  clearInterval(stateTimer); clearInterval(histTimer); clearInterval(paintTimer);
+  paint();
+  stateTimer = setInterval(() => refreshState().catch(e => setStatus(String(e), 'err')), 1000);
+  histTimer = setInterval(() => refreshHistory().catch(e => setStatus(String(e), 'err')), 3000);
+  paintTimer = setInterval(paint, 500);
+}
+
+$('load').addEventListener('click', start);
+$('pw').addEventListener('keydown', e => { if (e.key === 'Enter') start(); });
+</script>
+</body>
+</html>
+"""
+
+
 def _reset_runtime_state():
     """Clear stats/cooloff/race state. Endpoint indices may have shifted after reload."""
     _cooloff_until.clear()
@@ -1512,6 +1804,10 @@ def _reset_runtime_state():
     _session_pins.clear()  # pin values are endpoint indices; stale after reload
     global _pin_promotions
     _pin_promotions = 0
+    _last_failure.clear()  # keyed by endpoint index; stale after reload
+    # Manual downs are name-keyed and survive reloads, but a provider that no
+    # longer exists must not stay disabled invisibly.
+    _manual_down.intersection_update(ep.provider for ep in config.ENDPOINTS)
 
 
 EDITOR_AUTH_DELAY_SECS = 0.5
@@ -1520,11 +1816,11 @@ EDITOR_AUTH_DELAY_SECS = 0.5
 async def _editor_auth(password: str | None) -> PlainTextResponse | None:
     if not config.CONFIG_EDITOR_PASSWORD:
         return PlainTextResponse("not found", status_code=404)
-    # Constant delay applied to both success and failure to slow brute-force
-    # and avoid leaking timing info about which side of the compare differed.
+    # Constant-time compare; the delay runs only on failure to slow brute-force
+    # without taxing every successful call (the dashboard polls at 1s).
     ok = bool(password) and hmac.compare_digest(password, config.CONFIG_EDITOR_PASSWORD)
-    await asyncio.sleep(EDITOR_AUTH_DELAY_SECS)
     if not ok:
+        await asyncio.sleep(EDITOR_AUTH_DELAY_SECS)
         return PlainTextResponse("unauthorized", status_code=401)
     return None
 
@@ -1685,7 +1981,11 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
     for attempt, idx in enumerate(order, 1):
         ep = config.ENDPOINTS[idx]
         if not _is_available(idx):
-            log.debug("req=%s skipping %s (cooling off, %.0fs left)", req_id, ep.provider or ep.base_url, _cooloff_until[idx] - time.monotonic())
+            if ep.provider in _manual_down:
+                why = "manually disabled via dashboard"
+            else:
+                why = f"cooling off, {_cooloff_until.get(idx, 0) - time.monotonic():.0f}s left"
+            log.debug("req=%s skipping %s (%s)", req_id, ep.provider or ep.base_url, why)
             continue
 
         client_model = body_dict.get("model", "")
@@ -1757,7 +2057,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
 
     if last_failure is None:
         # Every endpoint was skipped (cooling off) -- nothing was actually tried.
-        last_failure = "no endpoints available (all cooling off or at concurrency cap)"
+        last_failure = "no endpoints available (all cooling off, manually disabled, or at concurrency cap)"
     exhaustion = requestlog.RequestMetrics(
         req_id=req_id,
         keyname=keyname,

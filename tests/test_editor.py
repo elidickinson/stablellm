@@ -1,4 +1,6 @@
+import sqlite3
 import sys
+import time
 
 import httpx
 import pytest
@@ -46,7 +48,7 @@ async def _post(app, path, body, headers=None):
 @pytest.mark.asyncio
 async def test_editor_returns_404_when_password_not_set(app_factory):
     app, _ = app_factory(password=None)
-    for path in ("/config/editor", "/config/api/content"):
+    for path in ("/config/editor", "/config/api/content", "/dashboard", "/dashboard/api/state"):
         resp = await _get(app, path)
         assert resp.status_code == 404
 
@@ -54,12 +56,113 @@ async def test_editor_returns_404_when_password_not_set(app_factory):
 @pytest.mark.asyncio
 async def test_editor_unauthorized_without_password_header(app_factory):
     app, _ = app_factory(password="secret")
-    resp = await _get(app, "/config/api/content")
-    assert resp.status_code == 401
+    for path in ("/config/api/content", "/dashboard/api/state", "/dashboard/api/history"):
+        resp = await _get(app, path)
+        assert resp.status_code == 401
+
+
+# --- dashboard: state ---
+
+MULTI_PROVIDER_CONFIG = {
+    "providers": {
+        "a": {"base_url": "https://a.test", "api_key": "k"},
+        "b": {"base_url": "https://b.test", "api_key": "k"},
+    },
+    "groups": {
+        "one": {"endpoints": [{"provider": "a"}, {"provider": "b"}]},
+        "two": {"endpoints": [{"provider": "a"}]},
+    },
+}
 
 
 @pytest.mark.asyncio
-async def test_editor_auth_applies_constant_delay(app_factory):
+async def test_dashboard_state_merges_shared_endpoints(app_factory):
+    app, _ = app_factory(password="secret", content=MULTI_PROVIDER_CONFIG)
+    m = sys.modules["main"]
+    m._stats["requests"][0] = 5
+    m._stats["successes"][0] = 4
+    m._stats["failures"][0] = 1
+    m._last_failure[0] = "HTTP 503: upstream died"
+
+    resp = await _get(app, "/dashboard/api/state", {"X-Config-Password": "secret"})
+    assert resp.status_code == 200
+    rows = {r["provider"]: r for r in resp.json()["rows"]}
+    # Provider a appears in two groups but is one merged row.
+    assert set(rows["a"]["groups"]) == {"one", "two"}
+    assert rows["a"]["requests"] == 5
+    assert rows["a"]["failures"] == 1
+    assert rows["a"]["last_error"] == "HTTP 503: upstream died"
+    assert rows["a"]["state"] == "up"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_manual_down_up_and_state(app_factory):
+    app, _ = app_factory(password="secret", content=MULTI_PROVIDER_CONFIG)
+    hdr = {"X-Config-Password": "secret"}
+
+    resp = await _post(app, "/dashboard/api/down/a", None, hdr)
+    assert resp.status_code == 200
+    assert resp.json() == {"provider": "a", "down": True}
+
+    state = (await _get(app, "/dashboard/api/state", hdr)).json()
+    assert state["manual_down"] == ["a"]
+    row = next(r for r in state["rows"] if r["provider"] == "a")
+    assert row["state"] == "down"
+
+    # Unknown provider names are rejected, not silently ignored.
+    resp = await _post(app, "/dashboard/api/down/nope", None, hdr)
+    assert resp.status_code == 404
+
+    resp = await _post(app, "/dashboard/api/up/a", None, hdr)
+    assert resp.json() == {"provider": "a", "down": False}
+    state = (await _get(app, "/dashboard/api/state", hdr)).json()
+    assert state["manual_down"] == []
+
+
+# --- dashboard: history ---
+
+@pytest.mark.asyncio
+async def test_dashboard_history_reads_request_log(app_factory, monkeypatch, tmp_path):
+    app, _ = app_factory(password="secret")
+    m = sys.modules["main"]
+    db = tmp_path / "req.db"
+    monkeypatch.setattr(m.requestlog, "DB_PATH", db)
+    m.requestlog.init()
+
+    m.requestlog.log_request(m.requestlog.RequestMetrics(
+        req_id="r1", keyname="esd", model_requested="kimi", provider_served="syn",
+        model_served="K", mode="seq", status="200", ttft_ms=1000.0, tokens_per_sec=50.0))
+    now = time.time()
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO requests (timestamp, status, provider_served, model_served, ttft_ms) "
+        "VALUES (?, '200', 'syn', 'K', 3000.0)", (now - 7200,))  # outside 15m window
+    conn.execute(
+        "INSERT INTO requests (timestamp, status, provider_served, model_served) "
+        "VALUES (?, '502', 'syn', 'K')", (now - 10,))  # recent, no ttft
+    conn.execute(
+        "INSERT INTO requests (timestamp, status, provider_served) "
+        "VALUES (?, '502', '')", (now - 10,))  # exhaustion row: no provider
+    conn.commit()
+    conn.close()
+
+    resp = await _get(app, "/dashboard/api/history", {"X-Config-Password": "secret"})
+    assert resp.status_code == 200
+    data = resp.json()
+    r1 = next(r for r in data["requests"] if r["req_id"] == "r1")
+    assert r1["mode"] == "seq"
+
+    summary = data["summary"]
+    assert set(summary) == {"syn|K"}  # empty-provider exhaustion rows excluded
+    s = summary["syn|K"]
+    assert s["reqs"]["15m"] == 2  # recent 200 + 502; 1h-old row excluded
+    assert s["reqs"]["24h"] == 3
+    assert s["ttft_ms"]["15m"] == 1000.0  # 200-only avg: 502's NULL ttft excluded
+    assert s["ttft_ms"]["24h"] == 2000.0  # (1000 + 3000) / 2
+
+
+@pytest.mark.asyncio
+async def test_editor_auth_applies_delay_on_failure_only(app_factory):
     import time
     app, _ = app_factory(password="secret")
     import main
@@ -75,8 +178,8 @@ async def test_editor_auth_applies_constant_delay(app_factory):
 
     assert bad.status_code == 401 and good.status_code == 200
     assert bad_elapsed >= 0.1
-    assert good_elapsed >= 0.1
-    assert abs(bad_elapsed - good_elapsed) < 0.05
+    # The delay only guards failures; the dashboard polls successes at 1s.
+    assert good_elapsed < 0.1
 
 
 @pytest.mark.asyncio

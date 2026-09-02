@@ -25,14 +25,24 @@ _NEW_COLUMNS = {
     "ttfb_ms": "REAL",
     "elapsed_ms": "REAL",
     "tokens": "INTEGER",
+    "mode": "TEXT",
 }
+
+# Aggregation windows for window_summary(): label -> seconds.
+WINDOWS = (("15m", 900), ("1h", 3600), ("24h", 86400))
+
+
+def _connect():
+    # timeout = busy_timeout for concurrent writers/readers (log_request runs
+    # in a worker thread while the dashboard reads on the event loop's threads).
+    return sqlite3.connect(DB_PATH, timeout=5)
 
 
 def init():
     if DB_PATH is None:
         return
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS requests (
@@ -50,6 +60,7 @@ def init():
     for col, ddl in _NEW_COLUMNS.items():
         if col not in existing:
             conn.execute(f"ALTER TABLE requests ADD COLUMN {col} {ddl}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(timestamp)")
     conn.commit()
     conn.close()
 
@@ -115,11 +126,11 @@ def log_request(m: RequestMetrics):
 
     if DB_PATH is None:
         return
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     conn.execute(
         "INSERT INTO requests (timestamp, api_key_id, req_id, status, reason, model_requested, "
-        "provider_served, model_served, ttfb_ms, ttft_ms, elapsed_ms, tokens, tokens_per_sec) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "provider_served, model_served, mode, ttfb_ms, ttft_ms, elapsed_ms, tokens, tokens_per_sec) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             time.time(),
             m.keyname or None,
@@ -129,6 +140,7 @@ def log_request(m: RequestMetrics):
             m.model_requested,
             m.provider_served,
             m.model_served,
+            m.mode or None,
             m.ttfb_ms,
             m.ttft_ms,
             m.elapsed_ms,
@@ -138,3 +150,71 @@ def log_request(m: RequestMetrics):
     )
     conn.commit()
     conn.close()
+
+
+def recent_requests(limit: int = 50) -> list[dict]:
+    """Newest terminal requests for the dashboard feed, newest first."""
+    if DB_PATH is None:
+        return []
+    try:
+        conn = _connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, timestamp, api_key_id, req_id, status, reason, model_requested, "
+                "provider_served, model_served, mode, ttft_ms, elapsed_ms, tokens, tokens_per_sec "
+                "FROM requests ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return []
+    keys = ("id", "ts", "client", "req_id", "status", "reason", "group", "provider", "model", "mode",
+            "ttft_ms", "elapsed_ms", "tokens", "tokens_per_sec")
+    return [dict(zip(keys, row)) for row in rows]
+
+
+def window_summary() -> dict[str, dict]:
+    """Per (provider, model) request counts and 200-only avg ttft / tok/s per window.
+
+    One pass with conditional aggregates; empty provider_served (all-endpoints-
+    exhausted rows) is excluded. Shape:
+    {"provider|model": {"reqs": {label: n}, "ttft_ms": {label: avg}, "tok_s": {label: avg}}}
+    where avg is None when no 200 rows fell in the window. ttft/tok_s only have
+    values for streaming requests that produced usage (or tokens)."""
+    if DB_PATH is None:
+        return {}
+    now = time.time()
+    col_bits, params = [], []
+    for _, secs in WINDOWS:
+        col_bits.append(
+            "SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END), "
+            "AVG(CASE WHEN timestamp >= ? AND status = '200' THEN ttft_ms END), "
+            "AVG(CASE WHEN timestamp >= ? AND status = '200' THEN tokens_per_sec END)"
+        )
+        params += [now - secs] * 3
+    params.append(now - WINDOWS[-1][1])
+    sql = (
+        "SELECT provider_served, model_served, " + ", ".join(col_bits) +
+        " FROM requests WHERE timestamp >= ? AND provider_served != '' "
+        "GROUP BY provider_served, model_served"
+    )
+    try:
+        conn = _connect()
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {}
+    out = {}
+    for row in rows:
+        provider, model, vals = row[0], row[1], row[2:]
+        entry: dict[str, dict] = {"reqs": {}, "ttft_ms": {}, "tok_s": {}}
+        for i, (label, _) in enumerate(WINDOWS):
+            n, ttft, tps = vals[i * 3], vals[i * 3 + 1], vals[i * 3 + 2]
+            entry["reqs"][label] = n or 0
+            entry["ttft_ms"][label] = round(ttft, 1) if ttft is not None else None
+            entry["tok_s"][label] = round(tps, 1) if tps is not None else None
+        out[f"{provider}|{model}"] = entry
+    return out

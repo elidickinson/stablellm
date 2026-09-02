@@ -347,29 +347,34 @@ async def test_streaming_failover_emits_single_terminal_row(proxy_app, monkeypat
     assert [m.status for m in rows] == ["200"]
 
 
-# --- /stats ---
+# --- dashboard: manual down affects routing ---
 
 @pytest.mark.asyncio
-async def test_stats_reflects_request_counts(proxy_app):
+async def test_manual_down_reroutes_to_next_provider(proxy_app):
     def handler(req):
+        assert req.url.host == "b.test"  # a is manually down
         return _ok_response()
 
-    app, _calls, _ = proxy_app(
+    app, calls, m = proxy_app(
         {
-            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
-            "groups": {"default": {"endpoints": [{"provider": "a"}]}},
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k"},
+                "b": {"base_url": "https://b.test", "api_key": "k"},
+            },
+            "groups": {"default": {"endpoints": [{"provider": "a"}, {"provider": "b"}]}},
         },
         handler,
     )
-    await _post(app, {"model": "default", "messages": []})
-    await _post(app, {"model": "default", "messages": []})
-
-    resp = await _get(app, "/stats")
+    m._manual_down.add("a")
+    resp = await _post(app, {"model": "default", "messages": []})
     assert resp.status_code == 200
-    data = resp.json()
-    assert data["endpoints"][0]["requests"] == 2
-    assert data["endpoints"][0]["successes"] == 2
-    assert data["endpoints"][0]["failures"] == 0
+    assert {c[0] for c in calls} == {"https://b.test"}
+
+    # Provider names are pruned on reload so a renamed config can't leave a
+    # provider silently disabled.
+    m._manual_down.add("ghost-provider")
+    m._reset_runtime_state()
+    assert m._manual_down == {"a"}
 
 
 # --- middleware: body size + auth + invalid path ---

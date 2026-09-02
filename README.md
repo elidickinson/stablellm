@@ -119,7 +119,7 @@ Order-based routing is sticky per conversation: the session key (a hash of the c
 
 A race would move a session off its home endpoint and throw away that warm cache, so races only run for unpinned sessions: a ripe race cadence waits for a new session (or one whose pin has expired) rather than firing at whoever asks next. A fresh session has no cache to lose, and the race winner becomes its pin. Clients whose system prompt changes every turn yield no stable session key, so they are always unpinned and race on cadence alone.
 
-Pins are visible on `/stats` (`session_pins`, `inflight`) and are cleared on config reload.
+Pins are visible on `/dashboard` (`session_pins`) and are cleared on config reload.
 
 ## Response metadata
 
@@ -140,9 +140,11 @@ Headers are present on both streaming and non-streaming responses. They are expo
 
 **Unknown request parameters** (not in the supported set) are silently stripped per-endpoint before forwarding. This lets providers with different capabilities share the same request body.
 
-## Inspect
+## Dashboard
 
-`GET /stats` — per-endpoint request/success/failure counts and per-group preferred provider order (which provider won the last race). Requires a client key when `API_KEY` is set.
+`/dashboard` is a web UI gated by `CONFIG_EDITOR_PASSWORD` (the same password as the config editor). It shows one merged row per provider+model across groups -- state (up / cooling / manually down), in-flight vs cap, request/success/failure counters, and 15m/1h/24h request counts plus avg TTFT and tok/s computed from the request log -- along with a feed of recent requests and per-group race order. Each provider has a **mark down / bring up** button: a manual down pulls every group entry for that provider out of routing (new requests only; in-flight requests finish). Manual downs survive config reloads but not restarts.
+
+Backing JSON, same auth: `GET /dashboard/api/state` and `GET /dashboard/api/history`. The request-log-backed views are empty unless `REQUEST_LOG_DB` is set.
 
 ## Deploy on Dokploy
 
