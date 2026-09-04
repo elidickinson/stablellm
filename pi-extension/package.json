@@ -1,0 +1,14 @@
+{
+  "name": "pi-stablellm",
+  "version": "0.1.0",
+  "description": "Dynamic StableLLM provider for Pi",
+  "keywords": ["pi-package", "pi", "stablellm", "provider"],
+  "license": "MIT",
+  "type": "module",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "scripts": {
+    "test": "node --test *.test.ts"
+  }
+}

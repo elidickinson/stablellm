@@ -94,6 +94,8 @@ groups:
   - `reasoning_default` — default effort (must be one of `reasoning_efforts`; defaults to the first entry, or `"high"` when no efforts are declared)
   - `reasoning_default_enabled` — whether reasoning is on by default (omitted unless set)
 
+`GET /v1/models` also publishes each group's `default_mode` (`seq` or `race`) so clients can expose routing variants without reading the server configuration.
+
 **Group names match the client's `model` field case-insensitively.** `glm-4.7` matches `model: GLM-4.7`. Separators are not normalized, so `gpt-4.1` and `gpt_4_1` are distinct.
 
 ## Run
@@ -101,6 +103,10 @@ groups:
 ```
 uv run uvicorn main:app --host $HOST --port $PORT
 ```
+
+## Pi provider extension
+
+[`pi-extension/`](pi-extension/) discovers this server's model groups, registers them as the `stablellm` provider, adds `:race` variants where useful, and displays the upstream route used for the last response. It has no built-in server address; configure one through `/login stablellm` or `STABLELLM_BASE_URL`. See [the extension README](pi-extension/README.md) for installation and authentication.
 
 POST to `/v1/chat/completions` (or any path) like the OpenAI API. Every request must include a `model` field whose value matches a configured group name; otherwise the proxy returns 404.
 

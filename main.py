@@ -1375,6 +1375,7 @@ async def list_models(authorization: str | None = Header(None)):
                 "object": "model",
                 "created": 0,
                 "owned_by": "stablellm",
+                "default_mode": group.mode,
                 **(_serialize_meta(group.meta) if group.meta else {}),
             }
             for name, group in config.GROUPS.items()

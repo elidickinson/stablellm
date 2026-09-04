@@ -1117,6 +1117,7 @@ async def test_models_endpoint_includes_meta(proxy_app, monkeypatch):
     m = data[0]
     assert m["id"] == "m1"
     assert m["object"] == "model"  # OpenAI keys stay even in OpenRouter shape
+    assert m["default_mode"] == "seq"
     assert m["context_length"] == 100000
     assert m["architecture"] == {
         "input_modalities": ["text", "image"],
@@ -1150,7 +1151,7 @@ async def test_models_endpoint_partial_meta_has_no_null(proxy_app, monkeypatch):
     assert resp.status_code == 200
     assert resp.json()["data"][0] == {
         "id": "only", "object": "model", "created": 0, "owned_by": "stablellm",
-        "name": "Only",
+        "default_mode": "seq", "name": "Only",
         "architecture": {
             "input_modalities": ["text"], "output_modalities": ["text"], "modality": "text->text",
         },
@@ -1186,7 +1187,22 @@ async def test_models_endpoint_without_meta_is_minimal(proxy_app, monkeypatch):
     )
     resp = await _get(app, "/v1/models", headers={"Authorization": "Bearer secret-proxy-key"})
     m = resp.json()["data"][0]
-    assert m == {"id": "plain", "object": "model", "created": 0, "owned_by": "stablellm"}
+    assert m == {
+        "id": "plain", "object": "model", "created": 0, "owned_by": "stablellm", "default_mode": "seq",
+    }
+
+
+@pytest.mark.asyncio
+async def test_models_endpoint_reports_race_default(proxy_app):
+    app, _, _ = proxy_app(
+        {
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"fast": {"mode": "race", "endpoints": [{"provider": "a"}]}},
+        },
+        lambda r: _ok_response(),
+    )
+    resp = await _get(app, "/v1/models")
+    assert resp.json()["data"][0]["default_mode"] == "race"
 
 
 @pytest.mark.asyncio
