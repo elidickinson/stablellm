@@ -22,6 +22,18 @@ export STABLELLM_API_KEY=...
 
 Pi stores credentials entered through `/login` in its normal `auth.json`. The stored server URL and key each take precedence over `STABLELLM_BASE_URL` / `STABLELLM_API_KEY`; run `/login stablellm` again to point at a different server. The key is optional — a server with no API keys configured ignores it.
 
+Scripted setup can skip the login prompts and write the same credential into `~/.pi/agent/auth.json` directly, with the URL in the credential's `env` object. Pi rewrites that file as a whole, so edit it while Pi is not running. Omit `key` for a server with no API keys.
+
+```json
+{
+  "stablellm": {
+    "type": "api_key",
+    "key": "...",
+    "env": { "STABLELLM_BASE_URL": "https://stablellm.example.com/v1" }
+  }
+}
+```
+
 ## Install
 
 Add the package directory to Pi's `settings.json`:
