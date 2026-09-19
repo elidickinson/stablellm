@@ -54,9 +54,14 @@ def proxy_app(monkeypatch, tmp_path):
     return build
 
 
-async def _post(app, body, headers=None, path="/v1/chat/completions"):
+async def _post(app, body, headers=None, path="/v1/chat/completions", follow_redirects=True):
+    """POST like a capable OpenAI client: follow the race handshake 307."""
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
-        return await c.post(path, json=body, headers=headers or {})
+        return await c.post(path, json=body, headers=headers or {}, follow_redirects=follow_redirects)
+
+
+async def _post_once(app, body, headers=None, path="/v1/chat/completions"):
+    return await _post(app, body, headers=headers, path=path, follow_redirects=False)
 
 
 async def _get(app, path, headers=None):
@@ -472,6 +477,288 @@ async def test_unknown_model_returns_404(proxy_app):
     assert resp.status_code == 404
 
 
+# --- race handshake (307 redirect to the marked request) ---
+
+
+@pytest.mark.asyncio
+async def test_race_redirect_handshake_shape(proxy_app):
+    """An eligible unmarked race POST redirects to the same path marked, with
+    the pending/candidate headers, without touching upstream or the cadence."""
+    app, calls, main = proxy_app(_TWO_PROVIDER_RACE_CFG, _race_winner_handler)
+    resp = await _post_once(app, {"model": "fast:race", "messages": []}, path="/v1/chat/completions?keep=1&keep=2&x=a+b")
+    assert resp.status_code == 307
+    assert resp.headers["x-stablellm-race"] == "pending"
+    assert resp.headers["x-stablellm-race-candidates"] == "2"
+    location = resp.headers["location"]
+    assert location.startswith("/v1/chat/completions?")
+    assert "keep=1" in location and "keep=2" in location and "x=a+b" in location
+    assert "stablellm_race_redirect=1" in location
+    # The handshake is inert: no upstream traffic, no cadence consumption.
+    assert calls == []
+    assert main._group_race_request_count["fast"] == 1
+    assert main._group_last_race_time["fast"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_marked_request_does_not_count_or_redirect_again(proxy_app):
+    """The marked follow-up races without incrementing the logical count again."""
+    app, calls, main = proxy_app(_TWO_PROVIDER_RACE_CFG, _race_winner_handler)
+    resp = await _post_once(app, {"model": "fast:race", "messages": []}, path="/v1/chat/completions?stablellm_race_redirect=1")
+    assert resp.status_code == 200
+    assert resp.json()["who"] == "b"
+    assert {c[0] for c in calls} == {"https://a.test", "https://b.test"}
+    # The race itself reset cadence, and the marked request never re-counted.
+    assert main._group_race_request_count["fast"] == 0
+    assert main._group_last_race_time["fast"] > 0
+
+
+@pytest.mark.asyncio
+async def test_marked_request_never_redirects_for_non_race_request(proxy_app):
+    """A marked request for a seq group and an unmarked seq request are inert."""
+    cfg = {
+        "providers": {
+            "a": {"base_url": "https://a.test", "api_key": "k"},
+            "b": {"base_url": "https://b.test", "api_key": "k"},
+        },
+        "groups": {"g": {"endpoints": [{"provider": "a"}, {"provider": "b"}]}},
+    }
+    app, calls, _ = proxy_app(cfg, lambda r: _ok_response())
+    resp = await _post_once(app, {"model": "g", "messages": []}, path="/v1/chat/completions?stablellm_race_redirect=1")
+    assert resp.status_code == 200
+    assert [c[0] for c in calls] == ["https://a.test"]
+
+
+@pytest.mark.asyncio
+async def test_marked_request_reevaluates_and_routes_when_no_longer_eligible(proxy_app):
+    """A marked request whose pin/availability changed falls back to preferred
+    order instead of forcing a race."""
+    app, calls, main = proxy_app(_TWO_PROVIDER_RACE_CFG, _race_winner_handler)
+    body = {"model": "fast:race", "messages": [{"role": "user", "content": "hi"}]}
+    # The session became pinned between handshake and follow-up.
+    main._session_pins[("fast", main._session_key(body))] = (0, "a", time.monotonic())
+    resp = await _post_once(app, body, path="/v1/chat/completions?stablellm_race_redirect=1")
+    assert resp.status_code == 200
+    assert resp.headers["x-stablellm-pin"] == "hit; home=a"
+    assert [c[0] for c in calls] == ["https://a.test"]  # no fan-out
+
+
+@pytest.mark.asyncio
+async def test_concurrent_marked_requests_do_not_duplicate_races(proxy_app):
+    """After one race resets cadence, a concurrent marked request routes
+    sequentially rather than launching a second race."""
+    started = asyncio.Event()
+
+    async def handler(req):
+        started.set()
+        await asyncio.sleep(0.02)
+        return _ok_response({"who": req.url.host.split(".")[0]})
+
+    app, calls, _main = proxy_app(_TWO_PROVIDER_RACE_CFG, handler)
+    marked = "/v1/chat/completions?stablellm_race_redirect=1"
+    body = {"model": "fast:race", "messages": []}
+
+    async def second():
+        await started.wait()
+        return await _post_once(app, body, path=marked)
+
+    first, other = await asyncio.gather(
+        _post_once(app, body, path=marked),
+        second(),
+    )
+    assert first.status_code == 200 and other.status_code == 200
+    # One race (two upstream hits) plus one sequential request (one more).
+    assert len(calls) == 3
+
+
+# --- completion race: winner is fastest to finish, not fastest to headers ---
+
+
+@pytest.mark.asyncio
+async def test_race_winner_is_fastest_completion_not_fastest_headers(proxy_app):
+    """a returns headers immediately but streams slowly; b is slow to headers
+    but completes first. b must win and pin the session."""
+    async def handler(req):
+        if req.url.host == "a.test":
+            async def slow_body():
+                yield b'data: {"choices":[{"delta":{"content":"a"}}]}\n\n'
+                await asyncio.sleep(0.05)
+                yield b"data: [DONE]\n\n"
+
+            return httpx.Response(200, content=slow_body(), headers={"content-type": "text/event-stream"})
+        await asyncio.sleep(0.02)
+        return httpx.Response(
+            200,
+            content=b'data: {"choices":[{"delta":{"content":"b"}}]}\n\ndata: [DONE]\n\n',
+            headers={"content-type": "text/event-stream"},
+        )
+
+    app, _calls, main = proxy_app(_TWO_PROVIDER_RACE_CFG, handler)
+    body = {"model": "fast:race", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+    resp = await _post(app, body)
+    assert resp.status_code == 200
+    assert resp.headers["x-stablellm-provider"] == "b"
+    assert b'"b"' in resp.content
+    pin = main._session_pins[("fast", main._session_key(body))]
+    assert main._endpoint_label(main.config.ENDPOINTS[pin[0]]) == "b"
+
+
+@pytest.mark.asyncio
+async def test_race_sse_winner_is_delivered_as_one_burst_with_metadata(proxy_app):
+    """The winner's complete SSE arrives as a normal Response: full body,
+    correct media type, Content-Length, and meta headers."""
+    sse_body = (
+        b': OPENROUTER PROCESSING\n\n'
+        b'data: {"choices":[{"delta":{"content":"hi"}}],"provider":"Cerebras"}\n\n'
+        b'data: {"usage":{"completion_tokens":3}}\n\n'
+        b"data: [DONE]\n\n"
+    )
+
+    def handler(req):
+        return httpx.Response(200, content=sse_body, headers={"content-type": "text/event-stream; charset=utf-8"})
+
+    cfg = {
+        "providers": {
+            "or1": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"},
+            "or2": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"},
+        },
+        "groups": {"fast": {"endpoints": [
+            {"provider": "or1", "model": "ma"},
+            {"provider": "or2", "model": "mb"},
+        ]}},
+    }
+    app, _calls, _ = proxy_app(cfg, handler)
+    resp = await _post(app, {"model": "fast:race", "stream": True, "messages": []})
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    assert resp.headers["content-length"] == str(len(sse_body))
+    assert resp.content == sse_body
+    assert resp.headers["x-stablellm-via"] == "Cerebras"
+    assert resp.headers["x-stablellm-mode"] == "race"
+    assert resp.headers["x-stablellm-provider"].startswith("or")
+
+
+@pytest.mark.asyncio
+async def test_race_invalid_nonstream_json_cannot_win(proxy_app):
+    """A candidate whose JSON is garbage loses; a later valid candidate wins."""
+    async def handler(req):
+        if req.url.host == "a.test":
+            return httpx.Response(200, content=b"{not json")
+        await asyncio.sleep(0.01)
+        return _ok_response({"who": "b"})
+
+    app, _calls, main = proxy_app(_TWO_PROVIDER_RACE_CFG, handler)
+    resp = await _post(app, {"model": "fast:race", "messages": []})
+    assert resp.status_code == 200
+    assert resp.json()["who"] == "b"
+    assert main._last_failure[0].startswith("invalid JSON")
+
+
+@pytest.mark.asyncio
+async def test_race_malformed_stream_body_cannot_win(proxy_app):
+    """A candidate whose SSE data is malformed loses; a later valid candidate wins."""
+    async def handler(req):
+        if req.url.host == "a.test":
+            return httpx.Response(
+                200,
+                content=b"data: {not json\n\n",
+                headers={"content-type": "text/event-stream"},
+            )
+        await asyncio.sleep(0.01)
+        return httpx.Response(200, content=b"data: [DONE]\n\n", headers={"content-type": "text/event-stream"})
+
+    app, _calls, main = proxy_app(_TWO_PROVIDER_RACE_CFG, handler)
+    resp = await _post(app, {"model": "fast:race", "stream": True, "messages": []})
+    assert resp.status_code == 200
+    assert resp.headers["x-stablellm-provider"] == "b"
+    assert main._last_failure[0].startswith("invalid SSE")
+
+
+@pytest.mark.asyncio
+async def test_race_without_successful_completion_falls_back_to_sequential(proxy_app):
+    """No candidate completes successfully (both reject): the marked request
+    still falls back to ordinary sequential routing, which can succeed."""
+    state = {"failures": 2}
+
+    async def handler(req):
+        if state["failures"] > 0:
+            state["failures"] -= 1
+            return httpx.Response(503, json={"error": "busy"})
+        return _ok_response({"who": req.url.host.split(".")[0]})
+
+    app, calls, _main = proxy_app(
+        {**_TWO_PROVIDER_RACE_CFG, "settings": {"cooloff_seconds": 0}}, handler
+    )
+    resp = await _post(app, {"model": "fast:race", "messages": []})
+    assert resp.status_code == 200
+    # Race tried both, sequential then retried the preferred head.
+    assert [c[0] for c in calls[:2]] == ["https://a.test", "https://b.test"]
+    assert calls[-1][0] == "https://a.test"
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_completion_winner_pin_serves_later_turns(proxy_app):
+    """A race pins the session to head-or-body completion winner; the next
+    turn stays home and does not fan out."""
+    async def handler(req):
+        if req.url.host == "a.test":
+            async def slow_body():
+                yield b'data: {"choices":[{"delta":{"content":"a"}}]}\n\n'
+                await asyncio.sleep(0.05)
+                yield b"data: [DONE]\n\n"
+
+            return httpx.Response(200, content=slow_body(), headers={"content-type": "text/event-stream"})
+        await asyncio.sleep(0.02)
+        return httpx.Response(200, content=b"data: [DONE]\n\n", headers={"content-type": "text/event-stream"})
+
+    app, calls, _ = proxy_app(_TWO_PROVIDER_RACE_CFG, handler)
+    body = {"model": "fast:race", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+    assert (await _post(app, body)).headers["x-stablellm-provider"] == "b"
+
+    calls.clear()
+    follow_up = {"model": "fast:race", "stream": True, "messages": [
+        {"role": "user", "content": "hi"}, {"role": "assistant", "content": "x"}, {"role": "user", "content": "more"},
+    ]}
+    resp = await _post(app, follow_up)
+    assert resp.status_code == 200
+    assert [c[0] for c in calls] == ["https://b.test"]  # pinned, no race
+
+
+@pytest.mark.asyncio
+async def test_race_failure_and_winner_release_every_slot(proxy_app):
+    """A mid-body failure is marked down, the completed winner still serves,
+    and no candidate leaks its concurrency slot."""
+    class BrokenStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"x"}}]}\n\n'
+            raise httpx.RemoteProtocolError("peer closed connection mid-body")
+
+    async def handler(req):
+        if req.url.host == "a.test":
+            return httpx.Response(200, content=BrokenStream(), headers={"content-type": "text/event-stream"})
+        await asyncio.sleep(0.02)
+        return httpx.Response(200, content=b"data: [DONE]\n\n", headers={"content-type": "text/event-stream"})
+
+    cfg = {
+        "settings": {"race_settle_timeout_secs": 0.5},
+        "providers": {
+            "a": {"base_url": "https://a.test", "api_key": "k", "max_concurrency": 1},
+            "b": {"base_url": "https://b.test", "api_key": "k", "max_concurrency": 1},
+        },
+        "groups": {"fast": {"mode": "race", "endpoints": [
+            {"provider": "a", "model": "ma"},
+            {"provider": "b", "model": "mb"},
+        ]}},
+    }
+    app, _calls, main = proxy_app(cfg, handler)
+    resp = await _post(app, {"model": "fast", "stream": True, "messages": []})
+    assert resp.status_code == 200
+    assert resp.headers["x-stablellm-provider"] == "b"
+    assert main._cooloff_until.get(0, 0) > time.monotonic()
+    await asyncio.gather(*tuple(main._background_tasks), return_exceptions=True)
+    assert all(value == 0 for value in main._inflight.values())
+
+
 # --- race mode (via :race suffix and group default) ---
 
 async def _race_winner_handler(req):
@@ -817,6 +1104,7 @@ async def test_race_buffered_drain_closes_response_on_cancellation(proxy_app):
         await main._race_request(
             "chat/completions", {"model": "fast", "messages": []}, False,
             "fast", "", "req-test", "test", "",
+            main._race_candidates("fast", {"model": "fast", "messages": []}),
         )
 
     assert winner.closed
@@ -987,7 +1275,8 @@ async def test_via_header_from_openrouter_race_streaming(proxy_app):
     }
     app, _, _ = proxy_app(cfg, handler)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c, \
-            c.stream("POST", "/v1/chat/completions", json={"model": "fast:race", "stream": True, "messages": []}) as resp:
+            c.stream("POST", "/v1/chat/completions", json={"model": "fast:race", "stream": True, "messages": []},
+                     follow_redirects=True) as resp:
         assert resp.status_code == 200
         assert resp.headers["x-stablellm-via"] == "Azure"
         body = b"".join([chunk async for chunk in resp.aiter_bytes()])
@@ -1571,6 +1860,7 @@ async def test_race_cancel_during_winner_read_releases_slot(proxy_app):
         await main._race_request(
             "chat/completions", {"model": "fast", "messages": []}, False,
             "fast", "", "req-test", "test", "",
+            main._race_candidates("fast", {"model": "fast", "messages": []}),
         )
     await asyncio.gather(*tuple(main._background_tasks), return_exceptions=True)
 
@@ -1664,6 +1954,7 @@ async def test_race_cancel_after_racer_completes_releases_slot(proxy_app, monkey
         await main._race_request(
             "chat/completions", {"model": "fast", "messages": []}, False,
             "fast", "", "req-test", "test", "",
+            main._race_candidates("fast", {"model": "fast", "messages": []}),
         )
     await asyncio.gather(*tuple(main._background_tasks), return_exceptions=True)
 

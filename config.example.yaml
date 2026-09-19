@@ -6,7 +6,7 @@ settings:
   cooloff_seconds: 30
   race_interval_secs: 21600  # 6h
   race_interval_requests: 25
-  race_settle_timeout_secs: 120  # hard cap for race loser/header accounting; must be > 0
+  race_settle_timeout_secs: 120  # hard cap for race completion/drain accounting; must be > 0
   log_level: INFO
 
 # Provider registry — just base_url + api_key, no model info.
@@ -44,7 +44,8 @@ providers:
 # Groups map a request model name to a routing mode and an ordered list of
 # (provider, model_override) endpoints. The client's 'model' field must match
 # a group name (case-insensitively); unknown models get a 404.
-# mode is "seq" (try in order, default) or "race" (send to all, first response wins).
+# mode is "seq" (try in order, default) or "race" (send to all; the first
+# response to complete its whole body wins).
 # The client can override with a :race or :seq suffix on the model name (e.g.,
 # "cheap:race"). :fastest and :normal are aliases.
 groups:

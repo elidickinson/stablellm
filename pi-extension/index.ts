@@ -9,6 +9,7 @@ import {
 } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { mapStableLlmModels, type StableLlmCatalogModel } from "./models.js";
+import { registerRaceFeedback, withRaceFetch } from "./race.js";
 import { registerUpstreamStatus } from "./status.js";
 import { normalizeBaseUrl } from "./url.js";
 
@@ -54,6 +55,7 @@ function toPiModels(catalog: StableLlmCatalogModel[], baseUrl: string): Model<"o
 }
 
 export default function stableLlmExtension(pi: ExtensionAPI): void {
+	const raceFeedback = registerRaceFeedback(pi);
 	const provider = createProvider({
 		id: PROVIDER_ID,
 		name: "StableLLM",
@@ -110,7 +112,7 @@ export default function stableLlmExtension(pi: ExtensionAPI): void {
 			const catalog = await fetchCatalog(baseUrl, apiKey, context.signal);
 			return toPiModels(catalog.data, baseUrl);
 		},
-		api: openAICompletionsApi(),
+		api: withRaceFetch(openAICompletionsApi(), raceFeedback.onRacePending),
 	});
 
 	pi.registerProvider(provider);

@@ -7,12 +7,13 @@ import posixpath
 import secrets
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from itertools import count
 from pathlib import Path
-from typing import ClassVar, Final
-from urllib.parse import unquote, urlparse
+from typing import ClassVar, Final, NamedTuple
+from urllib.parse import unquote, urlencode, urlparse
 
 import httpx
 import yaml
@@ -22,6 +23,7 @@ from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
     PlainTextResponse,
+    Response,
     StreamingResponse,
 )
 
@@ -198,6 +200,8 @@ app.add_middleware(
         "X-StableLLM-Group",
         "X-StableLLM-Via",
         "X-StableLLM-Pin",
+        "X-StableLLM-Race",
+        "X-StableLLM-Race-Candidates",
     ],
 )
 
@@ -452,6 +456,23 @@ def _extract_usage_from_sse(buffer: bytearray, chunk: bytes) -> int | None:
                     if ct is not None:
                         return ct
     return None
+
+
+def _has_openai_sse_event(content: bytes) -> bool:
+    """Whether a completed body contains an OpenAI-style SSE data event."""
+    for line in content.splitlines():
+        if not line.startswith(b"data:"):
+            continue
+        data = line[5:].strip()
+        if data == b"[DONE]":
+            return True
+        try:
+            event = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            return True
+    return False
 
 
 async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, metrics, request_context: str, on_done=None):
@@ -767,6 +788,46 @@ def _endpoint_label(ep: Endpoint) -> str:
     return ep.provider or ep.base_url
 
 
+class _RaceCandidate(NamedTuple):
+    pk: tuple[str, str]
+    idx: int
+
+
+def _race_candidates(group: str, body_dict: dict) -> list[_RaceCandidate]:
+    """Live race candidates: one available, uncapped endpoint per provider group."""
+    candidates: list[_RaceCandidate] = []
+    for pk, indices in _group_provider_groups[group].items():
+        for idx in indices:
+            ep = config.ENDPOINTS[idx]
+            model_name = _effective_model(ep, body_dict.get("model", ""))
+            if _is_available(idx) and not _at_cap(ep, model_name):
+                candidates.append(_RaceCandidate(pk, idx))
+                break
+    return candidates
+
+
+_RACE_REDIRECT_PARAM = "stablellm_race_redirect"
+_RACE_REDIRECT_VALUE = "1"
+
+
+def _race_redirect_response(request: Request, candidates: list[_RaceCandidate]) -> Response:
+    """307 back to the same path with the race marker, preserving other params.
+
+    The 307 is a handshake: the logical request is counted only here, on the
+    first pass. The marked follow-up must not be counted again."""
+    query = [(key, value) for key, value in request.query_params.multi_items() if key != _RACE_REDIRECT_PARAM]
+    query.append((_RACE_REDIRECT_PARAM, _RACE_REDIRECT_VALUE))
+    location = f"{request.url.path}?{urlencode(query)}"
+    return Response(
+        status_code=307,
+        headers={
+            "Location": location,
+            "X-StableLLM-Race": "pending",
+            "X-StableLLM-Race-Candidates": str(len(candidates)),
+        },
+    )
+
+
 def _pk_label(group: str, pk: tuple[str, str]) -> str:
     """Display name for a (model, base_url) provider-group key."""
     indices = _group_provider_groups.get(group, {}).get(pk, [])
@@ -808,25 +869,25 @@ def _finish_race(
     )
 
 
-async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: str, keyname: str, req_id: str, trigger: str, session_key: str):
-    """Race one endpoint per provider group with real request. Returns response or None."""
-    pg = _group_provider_groups[group]
+class _RaceOutcome(NamedTuple):
+    pk: tuple[str, str]
+    idx: int
+    completion: float
+    headers: dict[str, str]
 
-    candidates: list[tuple[tuple[str, str], int]] = []
-    for key, indices in pg.items():
-        for idx in indices:
-            ep = config.ENDPOINTS[idx]
-            model_name = _effective_model(ep, body_dict.get("model", ""))
-            if _is_available(idx) and not _at_cap(ep, model_name):
-                candidates.append((key, idx))
-                break
 
-    if len(candidates) <= 1:
-        log.debug("req=%s race: skipped (need 2+ available candidates, have %d)", req_id, len(candidates))
-        return None, False
+async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: str, keyname: str, req_id: str, trigger: str, session_key: str, candidates: list[_RaceCandidate]):
+    """Race one endpoint per provider group. Returns (response, raced).
 
+    Candidates are buffered through the end of their response body, so the
+    winner is the provider with the fastest total completion rather than the
+    first response headers. The winner's buffered bytes are then delivered to
+    the client as one burst, and the session is pinned to that winner."""
     # Reset race-cadence state on attempt so a failed race doesn't cause every
     # following request to retry the race against still-cooling-off endpoints.
+    # Synchronous, before the first await: concurrent marked requests arriving
+    # after this see a fresh cadence and route sequentially rather than
+    # launching a duplicate race against the same providers.
     _group_race_request_count[group] = 0
     _group_last_race_time[group] = time.monotonic()
     # Keep the race generation separate from the response generator below.
@@ -834,7 +895,6 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
     race_generation: Final[int] = next(_race_ids)
     _group_race_generation[group] = race_generation
 
-    race_context = _request_context(body_dict, group, req_id)
     log.debug(
         "req=%s race: trigger=%s candidates=%s generation=%d",
         req_id,
@@ -847,23 +907,25 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
     race_start = time.monotonic()
     race_loop = asyncio.get_running_loop()
     race_deadline = race_loop.time() + config.SETTINGS.race_settle_timeout_secs
-    race_fastest_secs: float | None = None
     race_timeouts: set[asyncio.Timeout] = set()
-    race_state = {"failures": 0}
+    race_failures = 0
+    race_grace: float | None = None
     race_finished = False
+    # Per-candidate body buffers plus when their headers/first byte arrived.
+    # Loser buffers are cleared as soon as the winner is known.
+    buffers: dict[int, list[bytes]] = {candidate.idx: [] for candidate in candidates}
+    opened_at: dict[int, float] = {}
+    first_byte_at: dict[int, float] = {}
+    keep_chunks = True
 
-    def _new_race_timeout() -> asyncio.Timeout:
-        timeout = asyncio.timeout_at(race_deadline)
-        race_timeouts.add(timeout)
-        return timeout
-
-    def _note_first_finish(elapsed: float):
-        nonlocal race_deadline, race_fastest_secs
-        if race_fastest_secs is not None:
+    def _note_success(elapsed: float):
+        """Record the first successful completion and shrink the shared budget:
+        leftover racers get the post-winner grace before being timed out."""
+        nonlocal race_deadline, race_grace
+        if race_grace is not None:
             return
-        race_fastest_secs = elapsed
-        grace = max(elapsed * _RACE_DRAIN_GRACE_RATIO, _RACE_DRAIN_MIN_GRACE_SECS)
-        race_deadline = min(race_deadline, race_loop.time() + grace)
+        race_grace = max(elapsed * _RACE_DRAIN_GRACE_RATIO, _RACE_DRAIN_MIN_GRACE_SECS)
+        race_deadline = min(race_deadline, race_loop.time() + race_grace)
         for timeout in tuple(race_timeouts):
             try:
                 timeout.reschedule(race_deadline)
@@ -871,22 +933,25 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                 # The timeout is already expiring; its owner will account it.
                 race_timeouts.discard(timeout)
         log.debug(
-            "req=%s race: fastest complete %.1fs; loser deadline in %.1fs",
+            "req=%s race: first successful completion %.1fs; remaining deadline in %.1fs",
             req_id,
             elapsed,
             max(0.0, race_deadline - race_loop.time()),
         )
 
+    def _accounting() -> str:
+        return f"{len(race_times) + race_failures}/{len(candidates)}"
+
     def _record_race_timeout(pk: tuple[str, str]):
-        race_state["failures"] += 1
+        nonlocal race_failures
+        race_failures += 1
         log.debug(
-            "req=%s race: candidate %s model=%s exceeded drain budget at %.1fs accounted=%d/%d",
+            "req=%s race: candidate %s model=%s exceeded drain budget at %.1fs accounted=%s",
             req_id,
             _pk_label(group, pk),
             pk[0] or "-",
             time.monotonic() - race_start,
-            len(race_times) + race_state["failures"],
-            len(candidates),
+            _accounting(),
         )
 
     def _maybe_finalize():
@@ -904,7 +969,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                 current_generation if current_generation is not None else "-",
             )
             return
-        accounted = len(race_times) + race_state["failures"]
+        accounted = len(race_times) + race_failures
         if race_finished or accounted < len(candidates):
             return
         race_finished = True
@@ -917,17 +982,25 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
             total=len(candidates),
         )
 
-    async def _abandon(resp, release):
-        """Consume an orphaned racer response: release its slot, drop the conn."""
-        release()
-        await _close_quietly(resp)
+    def _bg(task: asyncio.Task):
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
-    def _bg(coro):
-        t = asyncio.create_task(coro)
-        _background_tasks.add(t)
-        t.add_done_callback(_background_tasks.discard)
+    def _note_failure(pk: tuple[str, str], idx: int, detail: str):
+        nonlocal race_failures
+        race_failures += 1
+        _mark_down(idx, detail, _request_context(body_dict, group, req_id))
+        log.debug(
+            "req=%s race: candidate %s model=%s failed accounted=%s: %s",
+            req_id,
+            _pk_label(group, pk),
+            pk[0] or "-",
+            _accounting(),
+            detail,
+        )
 
-    async def _send(pk: tuple, idx: int):
+    async def _open(pk: tuple[str, str], idx: int) -> tuple[httpx.Response, Callable[[], None]]:
+        """Acquire the slot and headers, releasing both on every failed open."""
         ep = config.ENDPOINTS[idx]
         model_name = _effective_model(ep, body_dict.get("model", ""))
         if not _try_acquire_slot(ep, model_name):
@@ -935,6 +1008,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
             # route to the same (base_url, model) grabbed the slot meanwhile.
             raise CapReached(f"concurrency cap {ep.max_concurrency} reached")
         release = _slot_releaser(ep, model_name)
+        resp: httpx.Response | None = None
         try:
             headers = _build_upstream_headers(ep)
             stripped = _strip_unsupported(body_dict, ep)
@@ -942,87 +1016,143 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
             url = f"{ep.base_url}/{path}"
             req = http_client.build_request("POST", url, headers=headers, content=send_body)
             resp = await _send_upstream(req, ep, stream=True)
+            if resp.status_code != 200:
+                raise UpstreamError(await _http_error_reason(resp))
+            return resp, release
         except BaseException:
             release()
+            if resp is not None:
+                await _close_quietly(resp)
             raise
-        if resp.status_code != 200:
-            reason = await _http_error_reason(resp)
-            await _close_quietly(resp)
-            release()
-            raise UpstreamError(reason)
-        return pk, idx, resp, release
 
-    tasks = {asyncio.create_task(_send(pk, idx)): (pk, idx) for pk, idx in candidates}
-
-    winner = None
-    losers_to_drain: list[tuple] = []
-    pending = set(tasks.keys())
-
-    try:
-        while pending and winner is None:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                pk, idx = tasks[task]
+    async def _race_one(candidate: _RaceCandidate):
+        """Consume one candidate to completion, owning its response and slot."""
+        nonlocal race_failures
+        pk, idx = candidate
+        deadline = asyncio.timeout_at(race_deadline)
+        resp: httpx.Response | None = None
+        release: Callable[[], None] | None = None
+        completed = False
+        try:
+            async with deadline:
+                race_timeouts.add(deadline)
                 try:
-                    rpk, ridx, resp, release = task.result()
-                    if winner is None:
-                        winner = (rpk, ridx, resp, release)
-                    else:
-                        losers_to_drain.append((rpk, ridx, resp, release))
+                    resp, release = await _open(pk, idx)
                 except CapReached as exc:
                     # Healthy endpoint, merely full: skip the mark-down.
-                    race_state["failures"] += 1
-                    log.debug(
-                        "req=%s race: %s accounted=%d/%d",
-                        req_id,
-                        exc,
-                        len(race_times) + race_state["failures"],
-                        len(candidates),
-                    )
+                    race_failures += 1
+                    log.debug("req=%s race: %s accounted=%s", req_id, exc, _accounting())
+                    return None
                 except Exception as exc:  # noqa: BLE001 - a failed racer must not abort the request
-                    race_state["failures"] += 1
-                    _mark_down(idx, _exception_detail(exc), _request_context(body_dict, group, req_id))
-                    log.debug(
-                        "req=%s race: candidate %s model=%s failed accounted=%d/%d: %s",
-                        req_id,
-                        _pk_label(group, pk),
-                        pk[0] or "-",
-                        len(race_times) + race_state["failures"],
-                        len(candidates),
-                        _exception_detail(exc),
-                    )
+                    _note_failure(pk, idx, _exception_detail(exc))
+                    return None
+                opened_at[idx] = time.monotonic() - race_start
+                async for chunk in resp.aiter_bytes():
+                    if keep_chunks:
+                        if idx not in first_byte_at:
+                            first_byte_at[idx] = time.monotonic() - race_start
+                        buffers[idx].append(chunk)
+                if keep_chunks:
+                    candidate_body = b"".join(buffers[idx])
+                    try:
+                        if is_streaming:
+                            if not _has_openai_sse_event(candidate_body):
+                                raise ValueError("no valid data event")
+                        else:
+                            json.loads(candidate_body)
+                    except Exception as exc:  # noqa: BLE001 - malformed output must not win
+                        kind = "SSE" if is_streaming else "JSON"
+                        detail = f"invalid {kind}: {_exception_detail(exc)}"
+                        snippet = _body_snippet(candidate_body)
+                        if snippet:
+                            detail = f"{detail}: {snippet}"
+                        buffers[idx].clear()
+                        _note_failure(pk, idx, detail)
+                        return None
+                completed = True
+                completion = time.monotonic() - race_start
+        except TimeoutError:
+            _record_race_timeout(pk)
+            return None
+        except Exception as exc:  # noqa: BLE001 - body failures are a racer failure
+            _note_failure(pk, idx, _exception_detail(exc))
+            return None
+        finally:
+            race_timeouts.discard(deadline)
+            if completed:
+                race_times[pk] = completion
+                _note_success(completion)
+            if release is not None:
+                release()
+            # Finalize before the close await so cancellation cannot skip it.
+            _maybe_finalize()
+            if resp is not None:
+                await _close_quietly(resp)
+        if not completed:
+            return None
+        assert resp is not None
+        log.debug(
+            "req=%s race: %s model=%s completed %.3fs accounted=%s",
+            req_id,
+            _pk_label(group, pk),
+            pk[0] or "-",
+            completion,
+            _accounting(),
+        )
+        return _RaceOutcome(pk, idx, completion, dict(resp.headers))
+
+    racetasks = {asyncio.create_task(_race_one(candidate)): candidate for candidate in candidates}
+
+    winner: _RaceOutcome | None = None
+    try:
+        while racetasks and winner is None:
+            done, _ = await asyncio.wait(set(racetasks), return_when=asyncio.FIRST_COMPLETED)
+            outcomes: list[_RaceOutcome] = []
+            for task in done:
+                racetasks.pop(task)
+                if task.cancelled():
+                    # A candidate's body raised CancelledError (or the racer was
+                    # cancelled). Propagate it as request cancellation.
+                    await task
+                outcome = task.result()
+                if outcome is not None:
+                    outcomes.append(outcome)
+            if outcomes:
+                # Compare timestamps when several racers land in one loop turn.
+                winner = min(outcomes, key=lambda outcome: outcome.completion)
     except BaseException:
-        # Request cancelled mid-race (client hangup). Cancel still-acquiring
-        # racers, and harvest any that completed in the same instant asyncio.wait
-        # raised -- their release would otherwise never run. (A completed task's
-        # result that was never delivered is invisible to the done/pending sets.)
-        for t in pending:
-            t.cancel()
-        for t, (pk, idx) in tasks.items():
-            if t.done() and not t.cancelled():
-                try:
-                    _, _, resp, release = t.result()
-                except Exception as exc:  # noqa: BLE001 - _send released internally
-                    log.debug("req=%s race harvest: %s", req_id, _exception_detail(exc))
-                    continue
-                _bg(_abandon(resp, release))
+        keep_chunks = False
+        for task in racetasks:
+            task.cancel()
+        await asyncio.gather(*racetasks, return_exceptions=True)
         raise
 
     if winner is None:
-        for t in pending:
-            t.cancel()
+        # Every candidate failed; let the caller use ordinary sequential routing.
         return None, True
 
-    win_pk, win_idx, win_resp, win_release = winner
+    # Winner known: keep its bytes, drop every loser's immediately, and let the
+    # unfinished racers keep draining in the background (discarding chunks)
+    # under the settle deadline so their completion times still rank the order.
+    keep_chunks = False
+    for idx, buffer in buffers.items():
+        if idx != winner.idx:
+            buffer.clear()
+    win_body = b"".join(buffers[winner.idx])
+    buffers[winner.idx].clear()
+    for task in racetasks:
+        _bg(task)
+
+    _, win_idx, win_completion, win_headers = winner
     ep = config.ENDPOINTS[win_idx]
     model_name = _effective_model(ep, body_dict.get("model", ""))
     race_pin = f"new; home={_endpoint_label(ep)}" if session_key else "none"
     log.debug(
-        "req=%s race: winner %s (model=%s) ttfb=%.0fms; draining %d other candidate(s)",
+        "req=%s race: winner %s (model=%s) completed %.3fs; %d other candidate(s) draining",
         req_id,
         _endpoint_label(ep),
         model_name,
-        (time.monotonic() - race_start) * 1000,
+        win_completion,
         len(candidates) - 1,
     )
     _stats["requests"][win_idx] += 1
@@ -1035,246 +1165,35 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         model_served=model_name,
         mode=config.MODE_RACE,
         stream=is_streaming,
-        ttfb_ms=(time.monotonic() - race_start) * 1000,
+        ttfb_ms=opened_at[win_idx] * 1000,
     )
 
-    async def _drain(pk, resp, idx, release, timeout: asyncio.Timeout | None = None):
-        owns_timeout = timeout is None
-        if timeout is None:
-            timeout = _new_race_timeout()
-
-        async def _consume():
-            async for _ in resp.aiter_bytes():
-                pass
-            race_times[pk] = time.monotonic() - race_start
-            _note_first_finish(race_times[pk])
-            log.debug(
-                "req=%s race: drain %s model=%s done %.1fs accounted=%d/%d",
-                req_id,
-                _pk_label(group, pk),
-                pk[0] or "-",
-                race_times[pk],
-                len(race_times) + race_state["failures"],
-                len(candidates),
-            )
-
-        try:
-            if owns_timeout:
-                async with timeout:
-                    await _consume()
-            else:
-                await _consume()
-        except TimeoutError:
-            _record_race_timeout(pk)
-        except Exception as exc:  # noqa: BLE001 - drain failures are incidental
-            race_state["failures"] += 1
-            _mark_down(idx, _exception_detail(exc), _request_context(body_dict, group, req_id))
-            log.debug(
-                "req=%s race: drain %s model=%s failed accounted=%d/%d: %s",
-                req_id,
-                _pk_label(group, pk),
-                pk[0] or "-",
-                len(race_times) + race_state["failures"],
-                len(candidates),
-                _exception_detail(exc),
-            )
-        finally:
-            if owns_timeout:
-                race_timeouts.discard(timeout)
-            # Sync accounting before the close await: a cancellation arriving
-            # during _close_quietly must not skip the slot release.
-            release()
-            _maybe_finalize()
-            await _close_quietly(resp)
-
-    async def _await_and_drain(task, pk, idx):
-        timeout = _new_race_timeout()
-        response_claimed = False
-        try:
-            async with timeout:
-                try:
-                    _, _, resp, release = await task
-                    response_claimed = True
-                except CapReached as exc:
-                    race_state["failures"] += 1
-                    log.debug(
-                        "req=%s race: %s accounted=%d/%d",
-                        req_id,
-                        exc,
-                        len(race_times) + race_state["failures"],
-                        len(candidates),
-                    )
-                    _maybe_finalize()
-                    return
-                except Exception as exc:  # noqa: BLE001 - a failed racer must not abort the request
-                    race_state["failures"] += 1
-                    _mark_down(idx, _exception_detail(exc), _request_context(body_dict, group, req_id))
-                    log.debug(
-                        "req=%s race: candidate %s model=%s failed accounted=%d/%d: %s",
-                        req_id,
-                        _pk_label(group, pk),
-                        pk[0] or "-",
-                        len(race_times) + race_state["failures"],
-                        len(candidates),
-                        _exception_detail(exc),
-                    )
-                    _maybe_finalize()
-                    return
-                await _drain(pk, resp, idx, release, timeout)
-        except TimeoutError:
-            if not response_claimed:
-                if not task.done():
-                    task.cancel()
-                try:
-                    _, _, resp, release = await task
-                except asyncio.CancelledError:
-                    pass
-                except Exception as exc:  # noqa: BLE001 - retrieve a timed-out task's exception during cleanup
-                    log.debug("req=%s race: timed-out candidate cleanup: %s", req_id, _exception_detail(exc))
-                else:
-                    await _abandon(resp, release)
-            _record_race_timeout(pk)
-            _maybe_finalize()
-        finally:
-            race_timeouts.discard(timeout)
-
-    for pk, idx, resp, release in losers_to_drain:
-        _bg(_drain(pk, resp, idx, release))
-    for task in pending:
-        pk, idx = tasks[task]
-        _bg(_await_and_drain(task, pk, idx))
-
     if is_streaming:
-        t0_race = race_start
-        want_via = _openrouter_via(ep)
-        byte_iter = win_resp.aiter_bytes()
-        primed: list[bytes] = []
-        via = None
-        if want_via:
-            try:
-                while len(primed) < 8:
-                    chunk = await byte_iter.__anext__()
-                    if race_metrics.ttft_ms is None:
-                        race_metrics.ttft_ms = (time.monotonic() - t0_race) * 1000
-                    primed.append(chunk)
-                    via = _provider_from_sse(chunk)
-                    if via:
-                        break
-            except StopAsyncIteration:
-                pass
-            except (asyncio.CancelledError, GeneratorExit):
-                # Request is dying (shutdown or client cancel): not the endpoint's
-                # fault, so no mark-down. This aborted row is the terminal line;
-                # the cancel propagates and no sequential fallback follows.
-                race_metrics.status = "aborted"
-                win_release()
-                await asyncio.to_thread(requestlog.log_request, race_metrics)
-                await _close_quietly(win_resp)
-                raise
-            except BaseException as exc:  # noqa: BLE001 - any priming failure must fail the race, not the request
-                # Winner stalled mid-priming (transport error or similar). Close it
-                # and fail the race so the caller falls back to sequential rather
-                # than 500-ing the client / leaking the conn. No terminal row here:
-                # the sequential outcome owns it.
-                race_state["failures"] += 1
-                _mark_down(win_idx, _exception_detail(exc), race_context)
-                win_release()
-                await _close_quietly(win_resp)
-                _maybe_finalize()
-                return None, True
+        via = _provider_from_sse(win_body) if _openrouter_via(ep) else None
         race_metrics.via = via or ""
-
-        async def generate():
-            t_first = None
-            completion_tokens = None
-            sse_buf = bytearray()
-            outcome = "200"
-            try:
-                yield b""  # placeholder, consumed by the priming step below
-                for chunk in primed:
-                    ct = _extract_usage_from_sse(sse_buf, chunk)
-                    if ct is not None:
-                        completion_tokens = ct
-                    if t_first is None:
-                        t_first = time.monotonic()
-                    yield chunk
-                async for chunk in byte_iter:
-                    if t_first is None:
-                        t_first = time.monotonic()
-                        race_metrics.ttft_ms = (t_first - t0_race) * 1000
-                    ct = _extract_usage_from_sse(sse_buf, chunk)
-                    if ct is not None:
-                        completion_tokens = ct
-                    yield chunk
-            except (asyncio.CancelledError, GeneratorExit):
-                outcome = "aborted"
-                raise
-            except BaseException as exc:
-                outcome = "interrupted"
-                race_metrics.reason = _clip(_exception_detail(exc))
-                raise
-            finally:
-                if race_metrics.ttft_ms is not None and completion_tokens is not None and t_first is not None:
-                    duration = time.monotonic() - t_first
-                    if duration > 0:
-                        race_metrics.tokens_per_sec = completion_tokens / duration
-                race_metrics.tokens = completion_tokens
-                race_metrics.status = outcome
-                # Sync accounting first: a cancellation arriving during the awaits
-                # below must not skip race finalization.
-                race_times[win_pk] = time.monotonic() - race_start
-                if outcome == "200":
-                    _note_first_finish(race_times[win_pk])
-                _maybe_finalize()
-                win_release()
-                await asyncio.to_thread(requestlog.log_request, race_metrics)
-                await _close_quietly(win_resp)
-
-        # Start the generator so its finally (and win_release) is armed before
-        # anything can drop the response un-iterated.
-        response_generator = generate()
-        await response_generator.__anext__()
-        result = _streaming_response(win_resp, response_generator)
-        _stats["successes"][win_idx] += 1
-        _set_session_pin(group, session_key, win_idx)
-        _set_meta_headers(result, provider=ep.provider, model=model_name, mode=config.MODE_RACE, group=group, via=via, pin=race_pin)
-        return result, True
+        race_metrics.ttft_ms = first_byte_at[win_idx] * 1000
+        completion_tokens = _extract_usage_from_sse(bytearray(), win_body)
+        if completion_tokens is not None:
+            duration = win_completion - first_byte_at[win_idx]
+            if duration > 0:
+                race_metrics.tokens_per_sec = completion_tokens / duration
+        race_metrics.tokens = completion_tokens
+        race_metrics.status = "200"
+        await asyncio.to_thread(requestlog.log_request, race_metrics)
+        forward_headers = {k: v for k, v in win_headers.items() if k.lower() not in _EXCLUDED_HEADERS}
+        result: Response = Response(
+            content=win_body,
+            status_code=200,
+            headers=forward_headers,
+            media_type=win_headers.get("content-type", "text/event-stream"),
+        )
+        if via:
+            result.headers["X-StableLLM-Via"] = via
     else:
-        chunks = []
-        winner_body_completed = False
-        try:
-            async for chunk in win_resp.aiter_bytes():
-                chunks.append(chunk)
-            winner_body_completed = True
-        except httpx.TransportError as exc:
-            # Winner died mid-body; fail the race so the caller falls back to
-            # sequential. No terminal row: the sequential outcome owns it.
-            race_state["failures"] += 1
-            _mark_down(win_idx, _exception_detail(exc), race_context)
-            return None, True
-        finally:
-            # Sync accounting before the close await: a cancellation arriving
-            # during _close_quietly must not skip the slot release.
-            win_release()
-            race_times[win_pk] = time.monotonic() - race_start
-            if winner_body_completed:
-                _note_first_finish(race_times[win_pk])
-            _maybe_finalize()
-            await _close_quietly(win_resp)
-        elapsed = time.monotonic() - race_start
+        # Winning non-stream bodies were validated before winner selection.
+        data = json.loads(win_body)
+        elapsed = win_completion
         race_metrics.elapsed_ms = elapsed * 1000
-        response_body = b"".join(chunks)
-        try:
-            data = json.loads(response_body)
-        except Exception as exc:  # noqa: BLE001 - upstream garbage must degrade, not crash
-            reason = f"invalid JSON from race winner: {_exception_detail(exc)}"
-            detail = _body_snippet(response_body)
-            if detail:
-                reason = f"{reason}: {detail}"
-            race_metrics.status = "502"
-            race_metrics.reason = _clip(reason)
-            await asyncio.to_thread(requestlog.log_request, race_metrics)
-            return JSONResponse({"error": "upstream returned invalid JSON"}, status_code=502), True
         usage = data.get("usage")
         tokens = None
         if usage:
@@ -1287,13 +1206,14 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         race_metrics.via = via or ""
         race_metrics.status = "200"
         await asyncio.to_thread(requestlog.log_request, race_metrics)
-        buffered_result = JSONResponse(content=data, status_code=win_resp.status_code)
+        result = JSONResponse(content=data, status_code=200)
         if via:
-            buffered_result.headers["X-StableLLM-Via"] = via
-        _stats["successes"][win_idx] += 1
-        _set_session_pin(group, session_key, win_idx)
-        _set_meta_headers(buffered_result, provider=ep.provider, model=model_name, mode=config.MODE_RACE, group=group, via=via, pin=race_pin)
-        return buffered_result, True
+            result.headers["X-StableLLM-Via"] = via
+
+    _stats["successes"][win_idx] += 1
+    _set_session_pin(group, session_key, win_idx)
+    _set_meta_headers(result, provider=ep.provider, model=model_name, mode=config.MODE_RACE, group=group, via=race_metrics.via or None, pin=race_pin)
+    return result, True
 
 
 @app.get("/health")
@@ -1928,13 +1848,29 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
 
     session_key = _session_key(body_dict)
     pinned = _pinned_endpoint(group_name, session_key)
+    race_marked = request.query_params.get(_RACE_REDIRECT_PARAM) == _RACE_REDIRECT_VALUE
 
     if mode == config.MODE_RACE:
-        _group_race_request_count[group_name] += 1
+        # One logical request counts once: the unmarked pass counts here; the
+        # marked follow-up is a loop guard, never authorization to race.
+        if not race_marked:
+            _group_race_request_count[group_name] += 1
 
         should_race, trigger = _should_race(group_name, pinned is not None)
+        candidates = _race_candidates(group_name, body_dict) if should_race else []
+        if should_race and len(candidates) <= 1:
+            should_race = False
+            log.debug("req=%s race: skipped (need 2+ available candidates, have %d)", req_id, len(candidates))
+
+        if should_race and not race_marked:
+            # Handshake: send the client back to this same path marked, so the
+            # fetch wrapper can surface race feedback. No upstream traffic, no
+            # cadence reset -- the marked request decides afresh.
+            log.debug("req=%s race: eligible with %d candidates; redirecting to marked request", req_id, len(candidates))
+            return _race_redirect_response(request, candidates)
+
         if should_race:
-            result, raced = await _race_request(path, body_dict, is_streaming, group_name, keyname, req_id, trigger, session_key)
+            result, raced = await _race_request(path, body_dict, is_streaming, group_name, keyname, req_id, trigger, session_key, candidates)
             if result is not None:
                 return result
             if raced:

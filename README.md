@@ -39,7 +39,7 @@ settings:
   cooloff_seconds: 30          # how long a failing endpoint is skipped
   race_interval_secs: 21600    # 6h — time between races (per group)
   race_interval_requests: 25   # request count between races (per group)
-  race_settle_timeout_secs: 120  # hard cap for loser/header accounting from race start; must be > 0
+  race_settle_timeout_secs: 120  # hard cap for race completion/drain accounting from race start; must be > 0
   session_pin_ttl_secs: 900    # 15m — how long an idle session stays pinned to its endpoint
   log_level: INFO
 
@@ -77,7 +77,7 @@ groups:
 
 **`groups`** — maps a request model name to a routing mode and an ordered list of upstream entries. Each group has:
 
-- `mode` — `seq` (try in order, default) or `race` (send to all, first response wins). Can be overridden per-request with `:race`/`:seq` suffix on the model name.
+- `mode` — `seq` (try in order, default) or `race` (send to all, first fully-completed response wins). Can be overridden per-request with `:race`/`:seq` suffix on the model name.
 - `endpoints` — ordered list of entries, each with:
   - `provider` — name from the providers section (required)
   - `model` — model name to send upstream. If omitted, falls back to the provider's `model` (if set), otherwise the client's requested model passes through unchanged.
@@ -106,7 +106,7 @@ uv run uvicorn main:app --host $HOST --port $PORT
 
 ## Pi provider extension
 
-[`pi-extension/`](pi-extension/) discovers this server's model groups, registers them as the `stablellm` provider, adds `:race` variants where useful, and displays the upstream route used for the last response. It has no built-in server address; configure one through `/login stablellm` or `STABLELLM_BASE_URL`. See [the extension README](pi-extension/README.md) for installation and authentication.
+[`pi-extension/`](pi-extension/) discovers this server's model groups, registers them as the `stablellm` provider, adds `:race` variants where useful, and displays the upstream route used for the last response. It also follows the race redirect handshake transparently and shows `StableLLM is racing providers...` while a race is pending, so the OpenAI client never has to understand the `307`. It has no built-in server address; configure one through `/login stablellm` or `STABLELLM_BASE_URL`. See [the extension README](pi-extension/README.md) for installation and authentication.
 
 POST to `/v1/chat/completions` (or any path) like the OpenAI API. Every request must include a `model` field whose value matches a configured group name; otherwise the proxy returns 404.
 
@@ -115,7 +115,9 @@ POST to `/v1/chat/completions` (or any path) like the OpenAI API. Every request 
 The request's `model` field selects the group. Within that group, the routing mode determines how endpoints are dispatched:
 
 - **`seq`** (default) — try endpoints in order. A failing endpoint cools off for `cooloff_seconds` before being retried. If all endpoints fail, the request returns a 502.
-- **`race`** — send the request to one endpoint per provider concurrently; the first response wins for the current request. The remaining responses are drained in the background, and once all candidate outcomes are accounted for their completion times update the preferred provider order. A re-race triggers when either `race_interval_requests` requests have passed or `race_interval_secs` seconds have elapsed since the last race (defaults: **25 requests** or **6 hours**) *and* the current request belongs to an unpinned session (see below). Between races, requests stay in `race` mode and use the current preferred order with normal failover. If a race fails, the proxy also falls back to that preferred order. Before any complete response anchors the budget, and for candidates still waiting for headers, `race_settle_timeout_secs` from race start is the hard cap. After the first complete response, an unfinished loser gets up to 50% of that response's elapsed time, with a 1-second minimum, subject to the same cap; it is moved to the end of the preferred order without being marked down.
+- **`race`** — send the request to one endpoint per provider group concurrently and wait for each candidate's **entire response body** to complete. The first candidate to finish successfully wins; the other responses are drained in the background, and once all candidate outcomes are accounted for their completion times update the preferred provider order. HTTP errors, stream errors, cancellation, and malformed JSON or SSE bodies can never win. The winner's complete response is delivered to the client afterward in one burst, so a race trades time-to-first-token for a reliable measure of which provider finishes fastest. A re-race triggers when either `race_interval_requests` requests have passed or `race_interval_secs` seconds have elapsed since the last race (defaults: **25 requests** or **6 hours**) *and* the current request belongs to an unpinned session (see below). Between races, requests stay in `race` mode and use the current preferred order with normal failover. If no candidate completes successfully, the proxy falls back to that preferred order. Before any successful completion, `race_settle_timeout_secs` from race start is the hard cap for all candidates. After one, unfinished racers get up to 50% of the winner's elapsed time, with a 1-second minimum, subject to the same cap; a loser that overruns is moved to the end of the preferred order without being marked down.
+
+A race is confirmed by a redirect handshake: an eligible race request returns `307 Temporary Redirect` to the same path with a `stablellm_race_redirect=1` query parameter and `X-StableLLM-Race: pending`, before any upstream request is launched. Clients that follow it (the Pi extension does) get the race; clients that don't simply see the 307. The logical request is counted once, on the initial request; the marked follow-up re-checks pin, cadence, availability, and caps and only races if still eligible.
 
 The client can override a group's mode with a `:race` or `:seq` suffix on the model name (e.g. `glm-4.7:race`).
 
@@ -139,10 +141,12 @@ Every proxied response includes headers telling the client which upstream actual
 | `X-StableLLM-Group` | `glm-4.7` | Group the request resolved to |
 | `X-StableLLM-Via` | `OpenAI` | Sub-provider that served the request — only present when routing through OpenRouter (see below) |
 | `X-StableLLM-Pin` | `hit; home=synthetic` | Session pin state: `hit` (served by the session's pinned endpoint), `bounce` (pinned endpoint unavailable — served and re-pinned elsewhere; this turn is a cache miss), `new` (first request of a session, including a race winner), `none` (no derivable session) |
+| `X-StableLLM-Race` | `pending` | Present only on the `307` race handshake, confirming an eligible race request was redirected to its marked follow-up |
+| `X-StableLLM-Race-Candidates` | `3` | Present only on the `307` race handshake: number of provider-group candidates that would race |
 
 Headers are present on both streaming and non-streaming responses. They are exposed via CORS so browser clients can read them.
 
-**OpenRouter sub-provider (`X-StableLLM-Via`).** OpenRouter itself fans a request out to one of several underlying providers (e.g. `OpenAI`, `Azure`, `Cerebras`). It tags every response body / stream chunk with that choice in a top-level `provider` field. When an endpoint's `base_url` points at `openrouter.ai`, stablellm reads that field and surfaces it as `X-StableLLM-Via`, so `X-StableLLM-Provider: openrouter` + `X-StableLLM-Via: Cerebras` means the request went through OpenRouter and was served by Cerebras. Non-OpenRouter endpoints don't set this header. (On streaming responses, stablellm peeks at the leading chunks to extract it before headers are committed.)
+**OpenRouter sub-provider (`X-StableLLM-Via`).** OpenRouter itself fans a request out to one of several underlying providers (e.g. `OpenAI`, `Azure`, `Cerebras`). It tags every response body / stream chunk with that choice in a top-level `provider` field. When an endpoint's `base_url` points at `openrouter.ai`, stablellm reads that field and surfaces it as `X-StableLLM-Via`, so `X-StableLLM-Provider: openrouter` + `X-StableLLM-Via: Cerebras` means the request went through OpenRouter and was served by Cerebras. Non-OpenRouter endpoints don't set this header. (On race streaming responses, the buffered winner SSE is scanned before delivery.)
 
 **Unknown request parameters** (not in the supported set) are silently stripped per-endpoint before forwarding. This lets providers with different capabilities share the same request body.
 
