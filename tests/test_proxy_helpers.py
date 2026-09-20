@@ -177,6 +177,46 @@ def test_strip_unsupported_no_provider_without_routing(main_module):
     assert "provider" not in out
 
 
+def test_apply_reasoning_default_fills_when_client_sends_none(main_module):
+    from config import Endpoint
+    ep = Endpoint(base_url="x", api_key="k", model="m", reasoning_effort="high")
+    out = main_module._strip_unsupported({"messages": []}, ep)
+    assert out["reasoning_effort"] == "high"
+
+
+def test_apply_reasoning_default_respects_client_effort(main_module):
+    from config import Endpoint
+    ep = Endpoint(base_url="x", api_key="k", model="m", reasoning_effort="high")
+    out = main_module._strip_unsupported({"messages": [], "reasoning_effort": "low"}, ep)
+    assert out["reasoning_effort"] == "low"
+
+
+def test_apply_reasoning_default_respects_client_reasoning_object(main_module):
+    from config import Endpoint
+    ep = Endpoint(base_url="x", api_key="k", model="m", reasoning_effort="high")
+    out = main_module._strip_unsupported({"messages": [], "reasoning": {"effort": "medium"}}, ep)
+    assert "reasoning_effort" not in out
+    assert out["reasoning"] == {"effort": "medium"}
+
+
+def test_apply_reasoning_force_overrides_client_params(main_module):
+    from config import Endpoint
+    ep = Endpoint(base_url="x", api_key="k", model="m", reasoning_effort="high", reasoning_force=True)
+    out = main_module._strip_unsupported(
+        {"messages": [], "reasoning": {"effort": "low"}, "reasoning_effort": "low"}, ep,
+    )
+    assert out["reasoning_effort"] == "high"
+    assert "reasoning" not in out
+
+
+def test_apply_reasoning_no_policy_is_noop(main_module):
+    from config import Endpoint
+    ep = Endpoint(base_url="x", api_key="k", model="m")
+    body = {"messages": [], "reasoning": {"effort": "low"}}
+    out = main_module._strip_unsupported(body, ep)
+    assert out["reasoning"] == {"effort": "low"}
+
+
 def test_usd_per_token_precision(main_module):
     assert main_module._usd_per_token(1.0) == "0.000001"
     assert main_module._usd_per_token(0.15) == "0.00000015"

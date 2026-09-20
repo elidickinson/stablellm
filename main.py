@@ -747,6 +747,22 @@ SUPPORTED_PARAMS = {
 _REASONING_KEYS = frozenset({"reasoning", "reasoning_content", "thinking"})
 
 
+def _apply_reasoning(body: dict, ep: Endpoint) -> None:
+    """Apply the endpoint's reasoning policy to a stripped request body (in place).
+
+    reasoning_effort fills in the top-level `reasoning_effort` field when the
+    client sent none; reasoning_force additionally removes any client-sent
+    `reasoning`/`reasoning_effort` so the endpoint's value is authoritative.
+    """
+    if not ep.reasoning_effort:
+        return
+    if ep.reasoning_force:
+        body.pop("reasoning", None)
+        body["reasoning_effort"] = ep.reasoning_effort
+    elif "reasoning_effort" not in body and "reasoning" not in body:
+        body["reasoning_effort"] = ep.reasoning_effort
+
+
 def _rewrite_model(body: dict, ep: Endpoint) -> dict:
     return {**body, "model": _effective_model(ep, body.get("model", ""))}
 
@@ -760,6 +776,7 @@ def _strip_unsupported(body: dict, ep: Endpoint) -> dict:
     base = {k: v for k, v in body.items() if k in SUPPORTED_PARAMS}
     if not ep.keep_reasoning and "messages" in base:
         base["messages"] = _strip_message_reasoning(base["messages"])
+    _apply_reasoning(base, ep)
     if ep.routing is not None:
         base["provider"] = {**ep.routing}  # OpenRouter provider-selection params
     return _rewrite_model(base, ep)

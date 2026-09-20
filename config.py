@@ -37,6 +37,8 @@ class Endpoint:
     max_concurrency: int = 0
     ttfb_deadline_secs: float = 0.0
     routing: dict | None = None
+    reasoning_effort: str = ""  # sent when the request omits one; "" = leave client's choice
+    reasoning_force: bool = False  # override the client's reasoning params with reasoning_effort
 
 
 @dataclass(frozen=True)
@@ -323,6 +325,15 @@ def _parse_groups(raw: object, providers: dict[str, Provider]) -> tuple[dict[str
             if not isinstance(flags, list):
                 raise ConfigError(f"entry {i} in group '{group_name}': 'flags' must be a list")
 
+            reasoning_effort = entry.get("reasoning_effort", "")
+            if not isinstance(reasoning_effort, str):
+                raise ConfigError(f"entry {i} in group '{group_name}': 'reasoning_effort' must be a string")
+            reasoning_force = entry.get("reasoning_force", False)
+            if not isinstance(reasoning_force, bool):
+                raise ConfigError(f"entry {i} in group '{group_name}': 'reasoning_force' must be a boolean")
+            if reasoning_force and not reasoning_effort:
+                raise ConfigError(f"entry {i} in group '{group_name}': 'reasoning_force' requires 'reasoning_effort'")
+
             routing = _opt_mapping(entry.get("routing"), "routing")
             if routing is None:
                 routing = prov.routing
@@ -336,6 +347,8 @@ def _parse_groups(raw: object, providers: dict[str, Provider]) -> tuple[dict[str
                 max_concurrency=_opt_count(entry.get("max_concurrency"), "max_concurrency", prov.max_concurrency),
                 ttfb_deadline_secs=_opt_secs(entry.get("ttfb_deadline_secs"), "ttfb_deadline_secs", prov.ttfb_deadline_secs),
                 routing=routing,
+                reasoning_effort=reasoning_effort,
+                reasoning_force=reasoning_force,
             ))
             indices.append(len(endpoints) - 1)
 

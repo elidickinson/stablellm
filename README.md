@@ -82,6 +82,8 @@ groups:
   - `provider` — name from the providers section (required)
   - `model` — model name to send upstream. If omitted, falls back to the provider's `model` (if set), otherwise the client's requested model passes through unchanged.
   - `flags` — per-endpoint flags: `keep_reasoning` preserves `reasoning`/`reasoning_content`/`thinking` fields in messages (otherwise stripped).
+  - `reasoning_effort` — effort level (e.g. `high`) injected as the top-level `reasoning_effort` param when the client sends no reasoning params of its own. Independent of group `meta` reasoning fields, which only advertise capabilities on `/v1/models`.
+  - `reasoning_force` — with `reasoning_effort`, also override client-sent `reasoning`/`reasoning_effort`.
   - `max_concurrency` / `ttfb_deadline_secs` / `routing` — per-endpoint overrides of the provider-level settings above. Concurrency is counted per `(provider, model)` across all groups: entries sharing a provider+model share one counter, so give them the same (smallest) cap.
 - `meta` — optional descriptive metadata published on `/v1/models` in OpenRouter's response shape. When set, the entry uses OpenRouter keys (`context_length`, `architecture`, `pricing`, `top_provider`, `reasoning`) instead of the minimal OpenAI shape. All fields optional. Fields:
   - `name` / `description`

@@ -323,6 +323,40 @@ def test_meta_reasoning_fields_require_supports_reasoning_is_config_error():
             })
 
 
+def test_endpoint_reasoning_effort_parsed(make_config):
+    cfg = make_config(make_minimal(groups={"default": _group([
+        {"provider": "a", "reasoning_effort": "high"},
+        {"provider": "a", "reasoning_effort": "low", "reasoning_force": True},
+    ])}))
+    eps = cfg.ENDPOINTS
+    assert eps[0].reasoning_effort == "high" and eps[0].reasoning_force is False
+    assert eps[1].reasoning_effort == "low" and eps[1].reasoning_force is True
+
+
+def test_endpoint_reasoning_force_without_effort_is_config_error():
+    with pytest.raises(ConfigError, match="reasoning_force"):
+        parse_config({
+            "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
+            "groups": {"default": {"endpoints": [{"provider": "a", "reasoning_force": True}]}},
+        })
+
+
+def test_endpoint_reasoning_effort_must_be_string_is_config_error():
+    with pytest.raises(ConfigError, match="reasoning_effort"):
+        parse_config({
+            "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
+            "groups": {"default": {"endpoints": [{"provider": "a", "reasoning_effort": True}]}},
+        })
+
+
+def test_endpoint_reasoning_force_must_be_bool_is_config_error():
+    with pytest.raises(ConfigError, match="reasoning_force"):
+        parse_config({
+            "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
+            "groups": {"default": {"endpoints": [{"provider": "a", "reasoning_effort": "high", "reasoning_force": "yes"}]}},
+        })
+
+
 def test_meta_mandatory_without_efforts_is_valid(make_config):
     # Mandatory reasoning with no effort list exists in OpenRouter's catalog
     cfg = make_config({

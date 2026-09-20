@@ -66,6 +66,8 @@ groups:
       # reasoning_mandatory: false                 # reasoning cannot be disabled by the client
     endpoints:
       - provider: openai
+        # reasoning_effort: high       # sent when the client doesn't specify an effort
+        # reasoning_force: true        # with reasoning_effort: override the client's choice too
       - provider: openai_backup
       - provider: openrouter
         model: openai/gpt-4o
