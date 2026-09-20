@@ -50,7 +50,9 @@ Restart Pi, or use `/reload` after changing the extension. Remove any hand-writt
 
 A normal sequential group is exposed twice: `group` and `group:race`. A group whose server default is already `race` is exposed only as `group`; the extension does not add a `group:seq` alias. If Pi's `enabledModels` setting is in use, include the desired `:race` IDs or a `stablellm/*` pattern there as well.
 
-When optional model metadata is missing, the extension carries conservative built-in metadata for known StableLLM model groups. Unknown groups use Pi's standard custom-model defaults: text input, a 128K context window, 16K maximum output, no reasoning, and zero cost.
+A group whose catalog entry omits optional metadata falls back to defaults: text-only input, a 256K context window, a 16K maximum output, and zero cost. The extension holds no built-in model list, so a group with no `meta:` block in `config.yaml` is offered but under-reports its capabilities and price, and is not treated as a reasoning model — fill in the group's `meta:` to get accurate context handling, cost, and thinking controls in Pi. Published values always win, field by field.
+
+A group that sets `supports_reasoning: true` without `reasoning_efforts` publishes no effort vocabulary, so pi's level names can't be forwarded as-is: every thinking level sends the effort the server names as its `default_effort`, and the extended levels are hidden. If the server names no default either, no level can be sent safely and thinking is left off. Declare `reasoning_efforts` to send the level you pick instead.
 
 ## Race handshake
 
