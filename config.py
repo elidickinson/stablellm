@@ -10,7 +10,12 @@ from dataclasses import dataclass
 import yaml
 from dotenv import load_dotenv
 
-from performance_routing import _QUANT_TIER_LABELS, _QUANT_TIERS, PerformanceRouting
+from performance_routing import (
+    _QUANT_FLOOR_AUTO,
+    _QUANT_TIER_LABELS,
+    _QUANT_TIERS,
+    PerformanceRouting,
+)
 
 load_dotenv()
 
@@ -281,15 +286,15 @@ def _opt_performance_routing(value: object) -> PerformanceRouting | None:
             if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw) or raw < 0:
                 raise ConfigError("'performance_routing.price_cap_tolerance' must be a non-negative number (none = off)")
             price_cap_tolerance = float(raw)
-    floor = None
-    if "quantization_floor" in value and value["quantization_floor"] not in _OFF_SPELLINGS:
+    floor = _QUANT_FLOOR_AUTO
+    if "quantization_floor" in value:
         raw_floor = value["quantization_floor"]
-        tiers = _QUANT_TIERS
-        if raw_floor == "auto":
-            pass
-        elif isinstance(raw_floor, bool) or not isinstance(raw_floor, int) or raw_floor not in tiers:
-            raise ConfigError(f"'performance_routing.quantization_floor' must be one of: {_QUANT_TIER_LABELS}")
-        else:
+        # The off spellings disable the floor; auto (the default) derives it.
+        if raw_floor in _OFF_SPELLINGS:
+            floor = None
+        elif raw_floor != _QUANT_FLOOR_AUTO:
+            if isinstance(raw_floor, bool) or not isinstance(raw_floor, int) or raw_floor not in _QUANT_TIERS:
+                raise ConfigError(f"'performance_routing.quantization_floor' must be one of: {_QUANT_TIER_LABELS}")
             floor = raw_floor
     include_unknown = True
     if "include_unknown_quantization" in value:

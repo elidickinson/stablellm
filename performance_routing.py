@@ -18,6 +18,7 @@ _QUANT_BITS = {
 }
 _QUANT_TIERS = frozenset({4, 8, 16, 32})
 _QUANT_TIER_LABELS = "auto (derived), 4, 8, 16, 32, none"
+_QUANT_FLOOR_AUTO = "auto"
 
 
 @dataclass(frozen=True)
@@ -26,7 +27,7 @@ class PerformanceRouting:
     speed_tolerance: float = 0.15
     cache_ttl_seconds: float = 900.0
     price_cap_tolerance: float | None = 0.15  # None = no price constraint
-    quantization_floor: int | None = None  # None = derived quantization_floor(rows)
+    quantization_floor: int | str | None = _QUANT_FLOOR_AUTO  # None = off, _QUANT_FLOOR_AUTO = derived from rows
     include_unknown_quantization: bool = True
 
 
@@ -99,7 +100,8 @@ def row_passes(row: dict, caps: dict[str, float] | None, quant_values: frozenset
                 price = float(pricing.get(field))
             except (TypeError, ValueError):
                 return False
-            if not 0 < price <= cap:
+            # A free row's zero price satisfies the cap.
+            if not 0 <= price <= cap:
                 return False
     return quant_values is None or row.get("quantization") in quant_values
 
@@ -164,14 +166,13 @@ def derive_constraints(rows: list[object], policy: PerformanceRouting, provider:
             # token, so enforce the sent values on the per-token scale.
             caps = {field: value / 1e6 for field, value in emitted.items()}
     if quant_values is None:
-        floor = policy.quantization_floor
-        if floor is None:
-            floor = quantization_floor(rows)
+        requested = policy.quantization_floor
+        floor = quantization_floor(rows) if requested == _QUANT_FLOOR_AUTO else requested
         if floor is not None:
             lowest = min((bits for row in rows if (bits := row_bits(row)) is not None), default=None)
             # An explicit tier is always emitted; a derived floor equal to the
             # lowest observed width excludes nothing and is skipped.
-            if policy.quantization_floor is not None or floor > lowest:
+            if requested != _QUANT_FLOOR_AUTO or floor > lowest:
                 emitted = quantization_values(floor, policy.include_unknown_quantization)
                 quant_values = frozenset(emitted)
                 provider["quantizations"] = emitted

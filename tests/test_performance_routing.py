@@ -55,6 +55,17 @@ def test_price_medians_exclude_nonpositive_rows():
     assert derive_constraints(rows, PerformanceRouting(), {})[0] == {"prompt": 2.3, "completion": 3.45}
 
 
+def test_free_rows_pass_the_price_cap():
+    rows = [
+        _row("free", "0", "0", "fp8"),
+        _row("a", "1e-06", "3e-06", "fp8"),
+        _row("b", "3e-06", "3e-06", "fp8"),
+    ]
+    _caps, _quants, eligible, _floor = derive_constraints(rows, PerformanceRouting(), {})
+    # free passes the cap; b exceeds the median-derived prompt cap
+    assert [row["tag"] for row in eligible] == ["free", "a"]
+
+
 def test_quantization_floor_is_modal_width_tied_down():
     fp4 = _row("a", "1e-06", "1e-06", "fp4")
     fp8 = _row("b", "1e-06", "1e-06", "fp8")
@@ -69,6 +80,19 @@ def test_derived_floor_excluding_nothing_is_not_emitted():
     _derived, quants, eligible, _floor = derive_constraints(rows, PerformanceRouting(), {})
     assert quants is None
     assert {row["quantization"] for row in eligible} == {"fp8", "int4"}
+
+
+def test_quantization_floor_off_disables_derivation():
+    # The modal fp8 floor would drop the fp4 row; off keeps it.
+    rows = [
+        _row("a", "1e-06", "1e-06", "fp8"),
+        _row("b", "1e-06", "1e-06", "fp8"),
+        _row("c", "1e-06", "1e-06", "fp4"),
+    ]
+    _derived, quants, eligible, floor = derive_constraints(rows, PerformanceRouting(quantization_floor=None), {})
+    assert quants is None
+    assert floor is None
+    assert [row["tag"] for row in eligible] == ["a", "b", "c"]
 
 
 def test_ranking_runs_inside_the_constraints():

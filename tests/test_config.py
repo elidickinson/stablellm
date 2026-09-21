@@ -3,6 +3,7 @@ import datetime
 import pytest
 
 from config import MODE_RACE, MODE_SEQ, ConfigError, parse_config
+from performance_routing import _QUANT_FLOOR_AUTO
 
 
 def _group(endpoints, mode=None) -> dict:
@@ -541,7 +542,7 @@ def _perf_cfg(**endpoint_extra) -> dict:
 def test_performance_routing_defaults_are_on():
     endpoints, _, _ = parse_config({"groups": {"default": _group([{"provider": "openrouter", "performance_routing": {}}])}})
     policy = endpoints[0].performance_routing
-    assert (policy.price_cap_tolerance, policy.quantization_floor, policy.include_unknown_quantization) == (0.15, None, True)
+    assert (policy.price_cap_tolerance, policy.quantization_floor, policy.include_unknown_quantization) == (0.15, _QUANT_FLOOR_AUTO, True)
 
 
 @pytest.mark.parametrize("spelling", [None, "none", "None"])
@@ -555,10 +556,13 @@ def test_price_cap_zero_is_not_a_sentinel():
     assert endpoints[0].performance_routing.price_cap_tolerance == 0.0
 
 
-def test_quantization_floor_off_and_tiers():
-    for spelling, expected in [(None, None), ("none", None), ("auto", None), (8, 8), (32, 32)]:
+def test_quantization_floor_off_auto_and_tiers():
+    for spelling, expected in [(None, None), ("none", None), ("auto", _QUANT_FLOOR_AUTO), (8, 8), (32, 32)]:
         endpoints, _, _ = parse_config(_perf_cfg(quantization_floor=spelling))
         assert endpoints[0].performance_routing.quantization_floor == expected, spelling
+    # The absent key means auto (derived), not off.
+    endpoints, _, _ = parse_config(_perf_cfg())
+    assert endpoints[0].performance_routing.quantization_floor == _QUANT_FLOOR_AUTO
 
 
 def test_quantization_floor_invalid_tier_is_config_error():
