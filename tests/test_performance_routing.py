@@ -6,14 +6,29 @@ import httpx
 import pytest
 from conftest import fresh_config
 
-from performance_routing import PerformanceRouting, fast_tags
+from performance_routing import (
+    PerformanceRouting,
+    derive_constraints,
+    fast_tags,
+    price_cap,
+    quantization_floor,
+)
 
 
-def _endpoint(tag, latency, throughput):
+def _endpoint(tag, latency, throughput, **extra):
     return {
         "tag": tag,
         "latency_last_30m": {"p50": latency},
         "throughput_last_30m": {"p50": throughput},
+        **extra,
+    }
+
+
+def _row(tag, prompt, completion, quantization):
+    return {
+        "tag": tag,
+        "pricing": {"prompt": prompt, "completion": completion},
+        "quantization": quantization,
     }
 
 
@@ -23,32 +38,98 @@ def test_fast_tags_use_projected_completion_time():
         _endpoint("near", 100, 90),
         _endpoint("slow", 100, 70),
         _endpoint("unknown", None, None),
-    ], PerformanceRouting(target_tokens=10_000, tolerance=0.15))
+    ], PerformanceRouting(target_tokens=10_000, speed_tolerance=0.15))
     assert tags == ["fast", "near"]
+
+
+def test_price_cap_converts_per_token_to_per_million():
+    assert price_cap(5e-06, 0.15) == 5.75
+
+
+def test_price_medians_exclude_nonpositive_rows():
+    rows = [
+        _row("a", "1e-06", "3e-06", "fp8"),
+        _row("free", "0", "5e-06", "fp8"),  # :free variant drags nothing: it earns no vote
+        _row("b", "3e-06", "3e-06", "fp8"),
+    ]
+    assert derive_constraints(rows, PerformanceRouting(), {})[0] == {"prompt": 2.3, "completion": 3.45}
+
+
+def test_quantization_floor_is_modal_width_tied_down():
+    fp4 = _row("a", "1e-06", "1e-06", "fp4")
+    fp8 = _row("b", "1e-06", "1e-06", "fp8")
+    assert quantization_floor([fp4, fp8]) == 4  # tie resolves to the lower tier
+    assert quantization_floor([fp8, fp8, fp4]) == 8
+    assert quantization_floor([fp8, {"quantization": "fp4"}, {"quantization": "int4"}]) == 4
+    assert quantization_floor([{"quantization": "unknown"}]) is None
+
+
+def test_derived_floor_excluding_nothing_is_not_emitted():
+    rows = [_row("a", "1e-06", "1e-06", "fp8"), _row("b", "1e-06", "1e-06", "int4")]
+    _derived, quants, eligible, _floor = derive_constraints(rows, PerformanceRouting(), {})
+    assert quants is None
+    assert {row["quantization"] for row in eligible} == {"fp8", "int4"}
+
+
+def test_ranking_runs_inside_the_constraints():
+    # The 4-bit endpoint is fastest overall; the floor must remove it before
+    # ranking so it cannot anchor the speed window.
+    rows = [
+        {**_row("four", "1e-06", "1e-06", "fp4"), "latency_last_30m": {"p50": 100}, "throughput_last_30m": {"p50": 100}},
+        {**_row("eight", "1e-06", "1e-06", "fp8"), "latency_last_30m": {"p50": 100}, "throughput_last_30m": {"p50": 100}},
+        {**_row("out", "1e-06", "1e-06", "fp8"), "latency_last_30m": {"p50": 100}, "throughput_last_30m": {"p50": 50}},
+    ]
+    _derived, quants, eligible, _floor = derive_constraints(rows, PerformanceRouting(), {})
+    assert quants == ["int8", "fp8", "mxfp8", "fp16", "bf16", "fp32", "unknown"]
+    assert fast_tags(eligible, PerformanceRouting()) == ["eight"]
+
+
+def test_static_constraints_govern_filtering_and_are_emitted_verbatim():
+    rows = [_row("cheap", "1e-06", "2e-06", "fp8"), _row("dear", "5e-06", "9e-06", "fp8")]
+    derived, quants, eligible, _floor = derive_constraints(
+        rows, PerformanceRouting(), {"max_price": {"prompt": 2}, "quantizations": ["fp8", "unknown"]},
+    )
+    assert derived == {"prompt": 2}
+    assert quants == ["fp8", "unknown"]
+    assert [row["tag"] for row in eligible] == ["cheap"]
+
+
+def test_derivation_is_none_when_every_row_is_excluded():
+    # Opposite price shapes: the cheap-prompt row is not the cheap-completion row.
+    rows = [_row("a", "1e-06", "9e-06", "fp8"), _row("b", "5e-06", "1e-06", "fp8")]
+    assert derive_constraints(rows, PerformanceRouting(), {}) is None
+
+
+def test_unmeasured_eligible_rows_rank_to_no_tags():
+    _derived, quants, eligible, _floor = derive_constraints([_row("u", "1e-06", "2e-06", "fp8")], PerformanceRouting(), {})
+    assert quants is None
+    assert eligible
+    assert fast_tags(eligible, PerformanceRouting()) == []
+
+
+def _test_config(endpoints):
+    return {
+        "providers": {"openrouter": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"}},
+        "groups": {"default": {"endpoints": endpoints}},
+    }
+
+
+_SINGLE_ENDPOINT_CONFIG = _test_config([{
+    "provider": "openrouter",
+    "model": "author/model",
+    "performance_routing": {},
+    "routing": {
+        "sort": "throughput",
+        "order": ["old"],
+        "preferred_max_latency": {"p50": 1},
+    },
+}])
 
 
 @pytest.fixture
 def performance_app(monkeypatch, tmp_path):
-    def build(handler):
-        fresh_config(monkeypatch, tmp_path, {
-            "providers": {"openrouter": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"}},
-            "groups": {
-                "default": {
-                    "endpoints": [{
-                        "provider": "openrouter",
-                        "model": "author/model",
-                        "performance_routing": {},
-                        "routing": {
-                            "sort": "throughput",
-                            "order": ["old"],
-                            "preferred_max_latency": {"p50": 1},
-                            "max_price": {"prompt": 1},
-                            "quantizations": ["fp8"],
-                        },
-                    }],
-                },
-            },
-        })
+    def build(handler, config=None):
+        fresh_config(monkeypatch, tmp_path, config or _SINGLE_ENDPOINT_CONFIG)
         sys.modules.pop("main", None)
         import main
 
@@ -78,18 +159,31 @@ async def _post(app):
         })
 
 
+def _priced(tag, latency, throughput):
+    return {
+        **_endpoint(tag, latency, throughput),
+        "pricing": {"prompt": "2e-06", "completion": "4e-06"},
+        "quantization": "fp8",
+    }
+
+
+def _catalog(rows):
+    def handler(request, _body):
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": {"endpoints": rows}})
+        return httpx.Response(200, json={"choices": [], "usage": {"completion_tokens": 1}})
+
+    return handler
+
+
 @pytest.mark.asyncio
-async def test_performance_routing_generates_only_and_caches_catalog(performance_app):
-    rows = [_endpoint("fast", 400, 100), _endpoint("near", 100, 90), _endpoint("slow", 100, 60)]
+async def test_performance_routing_emits_derived_constraints_and_caches_catalog(performance_app):
+    rows = [_priced("fast", 400, 100), _priced("near", 100, 90), _priced("slow", 100, 60)]
 
     def handler(request, _body):
         if request.method == "GET":
             return httpx.Response(200, json={"data": {"endpoints": rows}})
-        return httpx.Response(200, json={
-            "provider": "fast",
-            "choices": [],
-            "usage": {"completion_tokens": 1},
-        })
+        return httpx.Response(200, json={"provider": "fast", "choices": [], "usage": {"completion_tokens": 1}})
 
     app, calls = performance_app(handler)
     assert (await _post(app)).status_code == 200
@@ -99,25 +193,21 @@ async def test_performance_routing_generates_only_and_caches_catalog(performance
     provider = calls[1][2]["provider"]
     assert provider["only"] == ["fast", "near"]
     assert provider["allow_fallbacks"] is True
-    assert provider["max_price"] == {"prompt": 1}
-    assert provider["quantizations"] == ["fp8"]
+    assert provider["max_price"] == {"prompt": 2.3, "completion": 4.6}
+    assert "quantizations" not in provider  # fp8-only catalog: the floor would be a no-op
     assert "sort" not in provider
     assert "order" not in provider
-    assert "preferred_max_latency" not in provider
+    assert provider["preferred_max_latency"] == {"p50": 1}
 
 
 @pytest.mark.asyncio
 async def test_pinned_via_stays_in_generated_only(performance_app):
-    rows = [_endpoint("fast", 400, 100), _endpoint("slow", 100, 60)]
+    rows = [_priced("fast", 400, 100), _priced("slow", 100, 60)]
 
     def handler(request, _body):
         if request.method == "GET":
             return httpx.Response(200, json={"data": {"endpoints": rows}})
-        return httpx.Response(200, json={
-            "provider": "cached-provider",
-            "choices": [],
-            "usage": {"completion_tokens": 1},
-        })
+        return httpx.Response(200, json={"provider": "cached-provider", "choices": [], "usage": {"completion_tokens": 1}})
 
     app, calls = performance_app(handler)
     assert (await _post(app)).status_code == 200
@@ -127,13 +217,12 @@ async def test_pinned_via_stays_in_generated_only(performance_app):
 
 @pytest.mark.asyncio
 async def test_no_compatible_generated_only_retries_raw_routing(performance_app):
-    rows = [_endpoint("fast", 400, 100)]
     post_calls = 0
 
     def handler(request, _body):
         nonlocal post_calls
         if request.method == "GET":
-            return httpx.Response(200, json={"data": {"endpoints": rows}})
+            return httpx.Response(200, json={"data": {"endpoints": [_priced("fast", 400, 100)]}})
         post_calls += 1
         if post_calls == 1:
             return httpx.Response(400, json={"error": {"message": "No providers available"}})
@@ -145,3 +234,67 @@ async def test_no_compatible_generated_only_retries_raw_routing(performance_app)
     assert calls[1][2]["provider"]["allow_fallbacks"] is True
     assert "only" not in calls[2][2]["provider"]
     assert calls[2][2]["provider"]["sort"] == "throughput"
+
+
+@pytest.mark.asyncio
+async def test_empty_derivation_skips_to_next_endpoint(performance_app):
+    def handler(request, _body):
+        if request.method == "GET":
+            rows = (
+                [_row("a", "1e-06", "9e-06", "fp8"), _row("b", "5e-06", "1e-06", "fp8")]
+                if "author" in request.url.path
+                else [_priced("ok", 100, 100)]
+            )
+            return httpx.Response(200, json={"data": {"endpoints": rows}})
+        return httpx.Response(200, json={"choices": [], "usage": {"completion_tokens": 1}})
+
+    config = _test_config([
+        {"provider": "openrouter", "model": "author/model", "performance_routing": {}},
+        {"provider": "openrouter", "model": "other/model", "performance_routing": {}},
+    ])
+    app, calls = performance_app(handler, config)
+    resp = await _post(app)
+    assert resp.status_code == 200
+    # The skipped endpoint sent nothing; the second one served the request.
+    posts = [body for method, _, body in calls if method == "POST"]
+    assert len(posts) == 1
+    assert posts[0]["model"] == "other/model"
+    assert posts[0]["provider"]["only"] == ["ok"]
+
+
+@pytest.mark.asyncio
+async def test_all_skip_group_names_empty_derivation_in_502(performance_app):
+    def handler(request, _body):
+        if request.method == "GET":
+            rows = [_row("a", "1e-06", "9e-06", "fp8"), _row("b", "5e-06", "1e-06", "fp8")]
+            return httpx.Response(200, json={"data": {"endpoints": rows}})
+        raise AssertionError("no endpoint should be posted to")
+
+    app, calls = performance_app(handler)
+    resp = await _post(app)
+    assert resp.status_code == 502
+    assert "caps exclude every catalog row" in resp.json()["error"]
+    assert [method for method, _, _ in calls] == ["GET"]
+
+
+@pytest.mark.asyncio
+async def test_unrankable_eligible_still_emits_constraints_and_retries(performance_app):
+    """Eligible rows with no measurements: constraints are sent without `only`,
+    and a cap rejection still triggers the single no-constraint retry."""
+    post_calls = 0
+
+    def handler(request, _body):
+        nonlocal post_calls
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": {"endpoints": [_row("unmeasured", "1e-06", "2e-06", "fp8")]}})
+        post_calls += 1
+        if post_calls == 1:
+            return httpx.Response(400, json={"error": {"message": "no endpoints found matching max_price"}})
+        return httpx.Response(200, json={"choices": [], "usage": {"completion_tokens": 1}})
+
+    app, calls = performance_app(handler)
+    assert (await _post(app)).status_code == 200
+    first = calls[1][2]["provider"]
+    assert first["max_price"] == {"prompt": 1.15, "completion": 2.3}
+    assert "only" not in first
+    assert "only" not in calls[2][2]["provider"]

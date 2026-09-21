@@ -5,12 +5,108 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+# Bit width of each quantization value OpenRouter's catalog reports. The
+# quantizations vocabulary is the short forms; long forms fold into their short
+# equivalent. 6-bit is a documented width but no catalog row reports it, so it
+# is not an offerable floor tier.
+_QUANT_BITS = {
+    "int4": 4, "fp4": 4, "mxfp4": 4, "nvfp4": 4,
+    "fp6": 6,
+    "int8": 8, "fp8": 8, "mxfp8": 8,
+    "fp16": 16, "bf16": 16,
+    "fp32": 32,
+}
+_QUANT_TIERS = frozenset({4, 8, 16, 32})
+_QUANT_TIER_LABELS = "auto (derived), 4, 8, 16, 32, none"
+
 
 @dataclass(frozen=True)
 class PerformanceRouting:
     target_tokens: int = 10_000
-    tolerance: float = 0.15
+    speed_tolerance: float = 0.15
     cache_ttl_seconds: float = 900.0
+    price_cap_tolerance: float | None = 0.15  # None = no price constraint
+    quantization_floor: int | None = None  # None = derived quantization_floor(rows)
+    include_unknown_quantization: bool = True
+
+
+def price_cap(row_price: float, tolerance: float) -> int:
+    """OpenRouter max_price value for a per-token catalog price: the price
+    converted to dollars per million tokens and padded by the tolerance."""
+    return round(row_price * 1e6 * (1 + tolerance), 6)
+
+
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def _row_price(row: dict, field: str) -> float | None:
+    """Row's positive per-token price for the field, or None."""
+    try:
+        price = float((row.get("pricing") or {}).get(field))
+    except (TypeError, ValueError):
+        return None
+    return price if price > 0 else None
+
+
+def price_caps(rows: list[object]) -> tuple[float, float] | None:
+    """Unpadded per-token (prompt, completion) price medians over every
+    positively-priced row, measured or not: the cap describes the market for
+    the model. None when a field has no positive-priced row."""
+    prompt = [p for row in rows if isinstance(row, dict) and (p := _row_price(row, "prompt")) is not None]
+    completion = [p for row in rows if isinstance(row, dict) and (p := _row_price(row, "completion")) is not None]
+    if not prompt or not completion:
+        return None
+    return _median(prompt), _median(completion)
+
+
+def row_bits(row: dict) -> int | None:
+    """Bit width of a row's reported quantization, or None when unrecognized."""
+    return _QUANT_BITS.get(row.get("quantization"))
+
+
+def quantization_floor(rows: list[object]) -> int | None:
+    """Modal observed bit width, ties resolved to the lower tier. None when no
+    row reports a recognized width."""
+    widths = [bits for row in rows if isinstance(row, dict) and (bits := row_bits(row)) is not None]
+    if not widths:
+        return None
+    mode = max((widths.count(w), -w) for w in set(widths))
+    return -mode[1]
+
+
+def quantization_values(floor: int, include_unknown: bool = True) -> list[str]:
+    """Vocabulary entries at or above the floor, in OpenRouter's short form,
+    plus `unknown` unless excluded."""
+    values = [q for q, bits in _QUANT_BITS.items() if bits >= floor and "/" not in q]
+    values.sort(key=_QUANT_BITS.__getitem__)
+    if include_unknown:
+        values.append("unknown")
+    return values
+
+
+def row_passes(row: dict, caps: dict[str, float] | None, quant_values: frozenset[str] | None) -> bool:
+    """Whether a row meets the per-token price caps (every listed field must
+    pass) and the quantization allowlist."""
+    if caps is not None:
+        pricing = row.get("pricing") or {}
+        for field, cap in caps.items():
+            try:
+                price = float(pricing.get(field))
+            except (TypeError, ValueError):
+                return False
+            if not 0 < price <= cap:
+                return False
+    return quant_values is None or row.get("quantization") in quant_values
+
+
+def matches_provider_tag(tag: str, allowed: str) -> bool:
+    """Whether an endpoint tag is covered by OpenRouter's provider selector."""
+    return tag == allowed or tag.startswith(f"{allowed}/")
 
 
 def fast_tags(endpoints: Iterable[object], config: PerformanceRouting) -> list[str]:
@@ -38,10 +134,47 @@ def fast_tags(endpoints: Iterable[object], config: PerformanceRouting) -> list[s
     if not scored:
         return []
     fastest = min(score for _, score in scored)
-    limit = fastest * (1 + config.tolerance)
+    limit = fastest * (1 + config.speed_tolerance)
     return [tag for tag, score in scored if score <= limit]
 
 
-def matches_provider_tag(tag: str, allowed: str) -> bool:
-    """Whether an endpoint tag is covered by OpenRouter's provider selector."""
-    return tag == allowed or tag.startswith(f"{allowed}/")
+def derive_constraints(rows: list[object], policy: PerformanceRouting, provider: dict) -> tuple[dict | None, list[str] | None, list[object], int | None] | None:
+    """Derive the price cap and quantization floor from catalog rows, honoring
+    author-set static values, and filter the rows to the eligible population.
+
+    Writes the emitted provider keys in place and returns (max_price emitted or
+    None, quantizations emitted or None, eligible rows, floor bit width or
+    None); returns None when the constraints exclude every row."""
+    static_quant = provider.get("quantizations")
+    quant_values = frozenset(static_quant) if isinstance(static_quant, list) and static_quant else None
+    floor = None
+    caps = None
+    if policy.price_cap_tolerance is not None:
+        emitted = provider.get("max_price") if isinstance(provider.get("max_price"), dict) else None
+        if emitted is None:
+            medians = price_caps(rows)
+            if medians is not None:
+                emitted = {
+                    "prompt": price_cap(medians[0], policy.price_cap_tolerance),
+                    "completion": price_cap(medians[1], policy.price_cap_tolerance),
+                }
+                provider["max_price"] = emitted
+        if emitted is not None:
+            # max_price is dollars per million tokens; rows are priced per
+            # token, so enforce the sent values on the per-token scale.
+            caps = {field: value / 1e6 for field, value in emitted.items()}
+    if quant_values is None:
+        floor = policy.quantization_floor
+        if floor is None:
+            floor = quantization_floor(rows)
+        if floor is not None:
+            lowest = min((bits for row in rows if (bits := row_bits(row)) is not None), default=None)
+            # An explicit tier is always emitted; a derived floor equal to the
+            # lowest observed width excludes nothing and is skipped.
+            if policy.quantization_floor is not None or floor > lowest:
+                emitted = quantization_values(floor, policy.include_unknown_quantization)
+                quant_values = frozenset(emitted)
+                provider["quantizations"] = emitted
+    eligible = [row for row in rows if isinstance(row, dict) and row_passes(row, caps, quant_values)]
+    applied_floor = floor if quant_values is not None else None
+    return (provider.get("max_price"), provider.get("quantizations"), eligible, applied_floor) if eligible else None

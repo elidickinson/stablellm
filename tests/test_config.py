@@ -534,6 +534,45 @@ def test_performance_routing_requires_openrouter_name():
         parse_config(raw)
 
 
+def _perf_cfg(**endpoint_extra) -> dict:
+    return make_minimal(groups={"default": _group([{"provider": "openrouter", "performance_routing": {**endpoint_extra}}])})
+
+
+def test_performance_routing_defaults_are_on():
+    endpoints, _, _ = parse_config({"groups": {"default": _group([{"provider": "openrouter", "performance_routing": {}}])}})
+    policy = endpoints[0].performance_routing
+    assert (policy.price_cap_tolerance, policy.quantization_floor, policy.include_unknown_quantization) == (0.15, None, True)
+
+
+@pytest.mark.parametrize("spelling", [None, "none", "None"])
+def test_price_cap_off_spellings(spelling):
+    endpoints, _, _ = parse_config(_perf_cfg(price_cap_tolerance=spelling))
+    assert endpoints[0].performance_routing.price_cap_tolerance is None
+
+
+def test_price_cap_zero_is_not_a_sentinel():
+    endpoints, _, _ = parse_config(_perf_cfg(price_cap_tolerance=0))
+    assert endpoints[0].performance_routing.price_cap_tolerance == 0.0
+
+
+def test_quantization_floor_off_and_tiers():
+    for spelling, expected in [(None, None), ("none", None), ("auto", None), (8, 8), (32, 32)]:
+        endpoints, _, _ = parse_config(_perf_cfg(quantization_floor=spelling))
+        assert endpoints[0].performance_routing.quantization_floor == expected, spelling
+
+
+def test_quantization_floor_invalid_tier_is_config_error():
+    with pytest.raises(ConfigError, match="quantization_floor"):
+        parse_config(_perf_cfg(quantization_floor=6))
+
+
+def test_speed_tolerance_rename():
+    endpoints, _, _ = parse_config(_perf_cfg(speed_tolerance=0.3))
+    assert endpoints[0].performance_routing.speed_tolerance == 0.3
+    with pytest.raises(ConfigError, match="unknown performance_routing keys: tolerance"):
+        parse_config(_perf_cfg(tolerance=0.3))
+
+
 def test_routing_must_be_mapping_is_config_error():
     raw = make_minimal({"a": {"base_url": "https://a", "api_key": "k", "routing": ["sort"]}})
     with pytest.raises(ConfigError, match="routing"):

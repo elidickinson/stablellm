@@ -91,6 +91,15 @@ groups:
         # routing:
         #   sort: throughput
         #   allow_fallbacks: false
+        # Derived provider constraints plus a speed-ranked allowlist (OpenRouter
+        # only, endpoint-level only). Both constraints are on at these defaults:
+        # performance_routing:
+        #   target_tokens: 10000               # tokens used to score projected time
+        #   speed_tolerance: 0.15              # allowlist window around the fastest endpoint
+        #   cache_ttl_seconds: 900             # endpoint-catalog cache lifetime
+        #   price_cap_tolerance: 0.15          # prompt AND completion <= median * 1.15 (none = off)
+        #   quantization_floor: auto           # mode of observed bit widths (4/8/16/32, none = off)
+        #   include_unknown_quantization: true # whether unknown-width rows pass the floor
         # Per-endpoint overrides of provider-level settings:
         # max_concurrency: 1
         # ttfb_deadline_secs: 10

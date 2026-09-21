@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import yaml
 from dotenv import load_dotenv
 
-from performance_routing import PerformanceRouting
+from performance_routing import _QUANT_TIER_LABELS, _QUANT_TIERS, PerformanceRouting
 
 load_dotenv()
 
@@ -247,22 +247,63 @@ def _opt_secs(value: object, key: str, default: float) -> float:
     return float(value)
 
 
+_OFF_SPELLINGS = frozenset({None, "none", "None", "NONE"})
+
+
 def _opt_performance_routing(value: object) -> PerformanceRouting | None:
     if value is None:
         return None
     if not isinstance(value, dict):
         raise ConfigError("'performance_routing' must be a mapping")
-    unknown = set(value) - {"target_tokens", "tolerance", "cache_ttl_seconds"}
+    unknown = set(value) - {
+        "target_tokens", "speed_tolerance", "cache_ttl_seconds",
+        "price_cap_tolerance", "quantization_floor", "include_unknown_quantization",
+    }
     if unknown:
         raise ConfigError(f"unknown performance_routing keys: {', '.join(sorted(map(str, unknown)))}")
     defaults = PerformanceRouting()
     target_tokens = _opt_count(value.get("target_tokens"), "performance_routing.target_tokens", defaults.target_tokens)
     if target_tokens == 0:
         raise ConfigError("'performance_routing.target_tokens' must be greater than 0")
+    # _opt_secs maps an explicit null to the default, so blank (meaning OFF)
+    # is distinguished by key presence, not a value test.
+    speed_tolerance = (
+        _opt_secs(value["speed_tolerance"], "performance_routing.speed_tolerance", defaults.speed_tolerance)
+        if "speed_tolerance" in value else defaults.speed_tolerance
+    )
+    price_cap_tolerance = defaults.price_cap_tolerance
+    if "price_cap_tolerance" in value:
+        raw = value["price_cap_tolerance"]
+        if raw in _OFF_SPELLINGS:
+            price_cap_tolerance = None
+        else:
+            # 0 is meaningful (cap at the median); only the off spellings disable.
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw) or raw < 0:
+                raise ConfigError("'performance_routing.price_cap_tolerance' must be a non-negative number (none = off)")
+            price_cap_tolerance = float(raw)
+    floor = None
+    if "quantization_floor" in value and value["quantization_floor"] not in _OFF_SPELLINGS:
+        raw_floor = value["quantization_floor"]
+        tiers = _QUANT_TIERS
+        if raw_floor == "auto":
+            pass
+        elif isinstance(raw_floor, bool) or not isinstance(raw_floor, int) or raw_floor not in tiers:
+            raise ConfigError(f"'performance_routing.quantization_floor' must be one of: {_QUANT_TIER_LABELS}")
+        else:
+            floor = raw_floor
+    include_unknown = True
+    if "include_unknown_quantization" in value:
+        raw_unknown = value["include_unknown_quantization"]
+        if not isinstance(raw_unknown, bool):
+            raise ConfigError("'performance_routing.include_unknown_quantization' must be a boolean")
+        include_unknown = raw_unknown
     return PerformanceRouting(
         target_tokens,
-        _opt_secs(value.get("tolerance"), "performance_routing.tolerance", defaults.tolerance),
+        speed_tolerance,
         _opt_secs(value.get("cache_ttl_seconds"), "performance_routing.cache_ttl_seconds", defaults.cache_ttl_seconds),
+        price_cap_tolerance=price_cap_tolerance,
+        quantization_floor=floor,
+        include_unknown_quantization=include_unknown,
     )
 
 

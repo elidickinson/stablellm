@@ -38,7 +38,11 @@ from config import (
     Endpoint,
     ModelMeta,
 )
-from performance_routing import fast_tags, matches_provider_tag
+from performance_routing import (
+    derive_constraints,
+    fast_tags,
+    matches_provider_tag,
+)
 
 config.load_or_exit()
 
@@ -357,6 +361,12 @@ class CapReached(UpstreamError):
     it must not be marked down."""
 
 
+class EligibleEmpty(UpstreamError):
+    """Derived performance-routing constraints exclude every catalog row for
+    this endpoint. Not an endpoint failure: the endpoint is healthy, so it
+    must not be marked down."""
+
+
 async def _send_upstream(req: httpx.Request, ep: Endpoint, *, stream: bool) -> httpx.Response:
     """Send the request, honoring the endpoint's ttfb_deadline_secs.
 
@@ -420,7 +430,8 @@ async def _http_error_reason(resp: httpx.Response) -> str:
 
 
 def _no_compatible_provider(reason: str) -> bool:
-    """Whether OpenRouter rejected an allowlist because it had no usable member."""
+    """Whether OpenRouter rejected the derived allowlist, price cap, or
+    quantization floor because no provider satisfied them."""
     lowered = reason.lower()
     return "no providers" in lowered or "no compatible provider" in lowered or "no endpoints found" in lowered
 
@@ -723,27 +734,52 @@ def _provider_tags(raw_only: object, tags: list[str]) -> list[str]:
 
 
 async def _apply_performance_routing(body: dict, ep: Endpoint, group: str, session_key: str) -> tuple[dict, bool]:
-    """Add a locally-ranked OpenRouter allowlist when fresh metrics are usable."""
+    """Apply derived OpenRouter routing constraints and a locally-ranked
+    allowlist when fresh metrics are usable.
+
+    Raises EligibleEmpty when the constraints exclude every catalog row; the
+    caller skips the endpoint and rolls to the next."""
     if ep.performance_routing is None or not _openrouter_via(ep):
         return body, False
 
     rows, source = await _openrouter_catalog(ep, body["model"])
+    if rows is None:
+        return body, False  # no catalog, no rows: the body passes through unmodified
     provider = {**body.get("provider", {})}
-    tags = fast_tags(rows, ep.performance_routing) if rows is not None else []
+    derivation = derive_constraints(rows, ep.performance_routing, provider)
+    if derivation is None:
+        log.info("performance routing model=%s reason=empty-derivation", body["model"])
+        raise EligibleEmpty("derived price/quantization caps exclude every catalog row")
+    caps, quants, eligible, floor_bits = derivation
+    tags = fast_tags(eligible, ep.performance_routing)
     via = _pinned_via(group, session_key)
     if tags and via and via not in tags:
         tags.append(via)
         source = f"{source}+pinned"
     tags = _provider_tags(provider.get("only"), tags)
-    if not tags:
-        log.info("performance routing model=%s reason=bypassed", body["model"])
-        return body, False
     provider.pop("order", None)
     provider.pop("sort", None)
-    provider.pop("preferred_max_latency", None)
-    provider["only"] = tags
-    provider["allow_fallbacks"] = True
-    log.info("performance routing model=%s tags=%s reason=%s", body["model"], ",".join(tags), source)
+    if caps:
+        provider["max_price"] = caps
+    if quants:
+        provider["quantizations"] = quants
+    if tags:
+        provider["only"] = tags
+    if "allow_fallbacks" not in provider:
+        provider["allow_fallbacks"] = True
+    derivation_line = ""
+    if caps or quants:
+        detail = []
+        if caps:
+            detail.append(f"caps=p:{caps['prompt']:g},c:{caps['completion']:g}")
+        if quants:
+            detail.append(f"quant={floor_bits}bit")
+        detail.append(f"rows={len(eligible)}/{len(rows)}")
+        derivation_line = " " + " ".join(detail)
+    log.info(
+        "performance routing model=%s tags=%s reason=%s%s",
+        body["model"], ",".join(tags) or "-", source, derivation_line,
+    )
     return {**body, "provider": provider}, True
 
 
@@ -1153,6 +1189,11 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                     # Healthy endpoint, merely full: skip the mark-down.
                     race_failures += 1
                     log.debug("req=%s race: %s accounted=%s", req_id, exc, _accounting())
+                    return None
+                except EligibleEmpty as exc:
+                    # Healthy endpoint whose constraints exclude every
+                    # provider: skip the mark-down.
+                    log.info("req=%s race: %s accounted=%s", req_id, exc, _accounting())
                     return None
                 except Exception as exc:  # noqa: BLE001 - a failed racer must not abort the request
                     _note_failure(pk, idx, _exception_detail(exc))
@@ -2040,14 +2081,25 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         client_model = body_dict.get("model", "")
         model_name = _effective_model(ep, client_model)
 
+        try:
+            # Derive the OpenRouter constraints and allowlist before taking a
+            # slot: an endpoint whose constraints exclude every provider is
+            # skipped without consuming concurrency or being marked down.
+            stripped = _strip_unsupported(body_dict, ep)
+            stripped, performance_selected = await _apply_performance_routing(stripped, ep, group_name, session_key)
+        except EligibleEmpty as exc:
+            # Per-request skip, not a mark-down: there is nothing to recover
+            # from, and the 502 must name this rather than the generic skip.
+            last_failure = str(exc)
+            log.debug("req=%s skipping %s (%s)", req_id, ep.provider or ep.base_url, exc)
+            continue
+
         if not _try_acquire_slot(ep, model_name):
             log.debug("req=%s skipping %s (model %r at concurrency cap %d)", req_id, ep.provider or ep.base_url, model_name, ep.max_concurrency)
             continue
 
         _stats["requests"][idx] += 1
 
-        stripped = _strip_unsupported(body_dict, ep)
-        stripped, performance_selected = await _apply_performance_routing(stripped, ep, group_name, session_key)
         send_body = json.dumps(stripped).encode()
 
         log.debug(
