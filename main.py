@@ -38,6 +38,7 @@ from config import (
     Endpoint,
     ModelMeta,
 )
+from performance_routing import fast_tags, matches_provider_tag
 
 config.load_or_exit()
 
@@ -84,7 +85,7 @@ _inflight: dict[tuple[str, str], int] = defaultdict(int)
 # Keeps a session on the endpoint that last served it so upstream prompt
 # caches stay warm; the cap-skip may bounce a session once, and the pin then
 # follows it to the new endpoint instead of re-contesting the old one.
-_session_pins: dict[tuple[str, str], tuple[int, str, float]] = {}
+_session_pins: dict[tuple[str, str], tuple[int, str, float, str]] = {}
 _PIN_TABLE_MAX = 500
 _HASH_CAP = 65536  # serialized bytes of a message fed to the session-key hash
 _HASH_STR_CAP = 8192  # per-string cap, applied BEFORE serialization so huge strings don't stall the loop
@@ -127,6 +128,10 @@ _group_race_request_count: dict[str, int] = defaultdict(int)
 _group_last_race_time: dict[str, float] = defaultdict(float)
 _group_race_generation: dict[str, int] = {}  # group -> id of its latest race
 _race_ids = count(1)  # process-wide monotonic: never reused, even across reloads
+
+# Effective OpenRouter model -> (endpoint rows, fetched monotonic timestamp).
+# Each endpoint policy applies its own TTL to the shared model snapshot.
+_performance_catalogs: dict[str, tuple[list[object], float]] = {}
 
 
 def _build_provider_groups():
@@ -301,7 +306,7 @@ def _pinned_endpoint(group: str, skey: str) -> tuple[int, str] | None:
     entry = _session_pins.get((group, skey))
     if entry is None:
         return None
-    idx, home, ts = entry
+    idx, home, ts, _ = entry
     if time.monotonic() - ts > config.SETTINGS.session_pin_ttl_secs:
         del _session_pins[(group, skey)]
         return None
@@ -313,17 +318,23 @@ def _pinned_endpoint(group: str, skey: str) -> tuple[int, str] | None:
     return idx, home
 
 
-def _set_session_pin(group: str, skey: str, idx: int):
+def _set_session_pin(group: str, skey: str, idx: int, via: str | None = None):
     if not skey:
         return
     if len(_session_pins) >= _PIN_TABLE_MAX and (group, skey) not in _session_pins:
         now = time.monotonic()
         ttl = config.SETTINGS.session_pin_ttl_secs
-        for k in [k for k, (_, _, ts) in _session_pins.items() if now - ts > ttl]:
+        for k in [k for k, (_, _, ts, _) in _session_pins.items() if now - ts > ttl]:
             del _session_pins[k]
         if len(_session_pins) >= _PIN_TABLE_MAX:
             del _session_pins[min(_session_pins, key=lambda k: _session_pins[k][2])]
-    _session_pins[(group, skey)] = (idx, _endpoint_label(config.ENDPOINTS[idx]), time.monotonic())
+    _session_pins[(group, skey)] = (idx, _endpoint_label(config.ENDPOINTS[idx]), time.monotonic(), via or "")
+
+
+def _pinned_via(group: str, skey: str) -> str | None:
+    if _pinned_endpoint(group, skey) is None:
+        return None
+    return _session_pins[(group, skey)][3] or None
 
 
 def _mark_down(idx: int, reason: str, request_context: str = ""):
@@ -406,6 +417,12 @@ async def _http_error_reason(resp: httpx.Response) -> str:
     if detail:
         return f"{reason}: {detail}"
     return reason
+
+
+def _no_compatible_provider(reason: str) -> bool:
+    """Whether OpenRouter rejected an allowlist because it had no usable member."""
+    lowered = reason.lower()
+    return "no providers" in lowered or "no compatible provider" in lowered or "no endpoints found" in lowered
 
 
 def _request_context(body: dict, group: str = "", req_id: str = "") -> str:
@@ -661,6 +678,71 @@ def _openrouter_served_provider(data: object) -> str | None:
         return None
     # Header-unsafe control chars would break response encoding; strip to latin-1 safe.
     return p if p.isascii() and "\r" not in p and "\n" not in p else None
+
+
+def _catalog_model(model: str) -> str:
+    """Remove an OpenRouter routing suffix before querying model endpoints."""
+    return model.split(":", 1)[0]
+
+
+async def _openrouter_catalog(ep: Endpoint, model: str) -> tuple[list[object] | None, str]:
+    """Return fresh or valid-cached endpoint rows; never return expired data."""
+    policy = ep.performance_routing
+    assert policy is not None
+    catalog_model = _catalog_model(model)
+    cached = _performance_catalogs.get(catalog_model)
+    if cached is not None and time.monotonic() - cached[1] <= policy.cache_ttl_seconds:
+        return cached[0], "cached"
+
+    url = f"{ep.base_url}/models/{catalog_model}/endpoints"
+    for attempt in range(1, 3):
+        try:
+            response = await http_client.get(url, headers=_build_upstream_headers(ep), timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            rows = data.get("data", {}).get("endpoints") if isinstance(data, dict) else None
+            if not isinstance(rows, list):
+                raise TypeError("response has no endpoint list")
+            _performance_catalogs[catalog_model] = (rows, time.monotonic())
+            return rows, "fresh"
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            log.warning(
+                "performance routing catalog attempt %d/2 model=%s failed: %s",
+                attempt,
+                catalog_model,
+                _exception_detail(exc),
+            )
+    return None, "bypassed"
+
+
+def _provider_tags(raw_only: object, tags: list[str]) -> list[str]:
+    if raw_only is None:
+        return tags
+    if not isinstance(raw_only, list) or not all(isinstance(tag, str) for tag in raw_only):
+        return []
+    return [tag for tag in tags if any(matches_provider_tag(tag, allowed) for allowed in raw_only)]
+
+
+async def _apply_performance_routing(body: dict, ep: Endpoint, group: str, session_key: str) -> tuple[dict, bool]:
+    """Add a locally-ranked OpenRouter allowlist when fresh metrics are usable."""
+    if ep.performance_routing is None or not _openrouter_via(ep):
+        return body, False
+
+    rows, source = await _openrouter_catalog(ep, body["model"])
+    provider = {**body.get("provider", {})}
+    tags = fast_tags(rows, ep.performance_routing) if rows is not None else []
+    via = _pinned_via(group, session_key)
+    if tags and via and via not in tags:
+        tags.append(via)
+        source = f"{source}+pinned"
+    tags = _provider_tags(provider.get("only"), tags)
+    if not tags:
+        log.info("performance routing model=%s reason=bypassed", body["model"])
+        return body, False
+    provider.pop("order", None)
+    provider["only"] = tags
+    log.info("performance routing model=%s tags=%s reason=%s", body["model"], ",".join(tags), source)
+    return {**body, "provider": provider}, True
 
 
 def _provider_from_sse(bytes_data: bytes) -> str | None:
@@ -1029,12 +1111,22 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         try:
             headers = _build_upstream_headers(ep)
             stripped = _strip_unsupported(body_dict, ep)
+            stripped, performance_selected = await _apply_performance_routing(stripped, ep, group, session_key)
             send_body = json.dumps(stripped).encode()
             url = f"{ep.base_url}/{path}"
             req = http_client.build_request("POST", url, headers=headers, content=send_body)
             resp = await _send_upstream(req, ep, stream=True)
             if resp.status_code != 200:
-                raise UpstreamError(await _http_error_reason(resp))
+                reason = await _http_error_reason(resp)
+                if not performance_selected or not _no_compatible_provider(reason):
+                    raise UpstreamError(reason)
+                log.info("performance routing model=%s reason=bypassed-compatible-provider", model_name)
+                await _close_quietly(resp)
+                stripped = _strip_unsupported(body_dict, ep)
+                req = http_client.build_request("POST", url, headers=headers, content=json.dumps(stripped).encode())
+                resp = await _send_upstream(req, ep, stream=True)
+                if resp.status_code != 200:
+                    raise UpstreamError(await _http_error_reason(resp))
             return resp, release
         except BaseException:
             release()
@@ -1228,7 +1320,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
             result.headers["X-StableLLM-Via"] = via
 
     _stats["successes"][win_idx] += 1
-    _set_session_pin(group, session_key, win_idx)
+    _set_session_pin(group, session_key, win_idx, race_metrics.via or None)
     _set_meta_headers(result, provider=ep.provider, model=model_name, mode=config.MODE_RACE, group=group, via=race_metrics.via or None, pin=race_pin)
     return result, True
 
@@ -1740,6 +1832,7 @@ def _reset_runtime_state():
     # collide with pre-reload ones either. Both halves are required.
     _group_race_generation.clear()
     _session_pins.clear()  # pin values are endpoint indices; stale after reload
+    _performance_catalogs.clear()
     global _pin_promotions
     _pin_promotions = 0
     _last_failure.clear()  # keyed by endpoint index; stale after reload
@@ -1952,6 +2045,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         _stats["requests"][idx] += 1
 
         stripped = _strip_unsupported(body_dict, ep)
+        stripped, performance_selected = await _apply_performance_routing(stripped, ep, group_name, session_key)
         send_body = json.dumps(stripped).encode()
 
         log.debug(
@@ -1983,9 +2077,20 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             else:
                 result, reason = await _proxy_buffered(ep, path, headers, send_body, metrics, request_context)
 
+            if result is None and performance_selected and _no_compatible_provider(reason or ""):
+                log.info("performance routing model=%s reason=bypassed-compatible-provider", model_name)
+                stripped = _strip_unsupported(body_dict, ep)
+                send_body = json.dumps(stripped).encode()
+                if is_streaming:
+                    result, reason = await _proxy_stream(ep, path, headers, send_body, metrics, request_context, on_done=release)
+                    if result is not None:
+                        owns_release = False
+                else:
+                    result, reason = await _proxy_buffered(ep, path, headers, send_body, metrics, request_context)
+
             if result is not None:
                 _stats["successes"][idx] += 1
-                _set_session_pin(group_name, session_key, idx)
+                _set_session_pin(group_name, session_key, idx, result.headers.get("X-StableLLM-Via"))
                 if had_pin:
                     pin = f"{'hit' if idx == pinned_idx else 'bounce'}; home={pin_home}"
                     if idx == pinned_idx:

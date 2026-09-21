@@ -535,7 +535,7 @@ async def test_marked_request_reevaluates_and_routes_when_no_longer_eligible(pro
     app, calls, main = proxy_app(_TWO_PROVIDER_RACE_CFG, _race_winner_handler)
     body = {"model": "fast:race", "messages": [{"role": "user", "content": "hi"}]}
     # The session became pinned between handshake and follow-up.
-    main._session_pins[("fast", main._session_key(body))] = (0, "a", time.monotonic())
+    main._session_pins[("fast", main._session_key(body))] = (0, "a", time.monotonic(), "")
     resp = await _post_once(app, body, path="/v1/chat/completions?stablellm_race_redirect=1")
     assert resp.status_code == 200
     assert resp.headers["x-stablellm-pin"] == "hit; home=a"
@@ -788,6 +788,39 @@ async def test_race_suffix_routes_to_winner(proxy_app):
     assert resp.status_code == 200
     assert resp.json()["who"] == "b"
     assert {c[0] for c in calls} == {"https://a.test", "https://b.test"}
+
+
+@pytest.mark.asyncio
+async def test_race_applies_performance_routing(proxy_app):
+    rows = [
+        {"tag": "fast", "latency_last_30m": {"p50": 400}, "throughput_last_30m": {"p50": 100}},
+        {"tag": "slow", "latency_last_30m": {"p50": 100}, "throughput_last_30m": {"p50": 60}},
+    ]
+
+    async def handler(req):
+        if req.url.host == "openrouter.ai":
+            if req.method == "GET":
+                return httpx.Response(200, json={"data": {"endpoints": rows}})
+            return _ok_response({"who": "openrouter", "provider": "fast"})
+        await asyncio.sleep(0.05)
+        return _ok_response({"who": "other"})
+
+    cfg = {
+        "providers": {
+            "or": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"},
+            "other": {"base_url": "https://other.test", "api_key": "k"},
+        },
+        "groups": {"fast": {"endpoints": [
+            {"provider": "or", "model": "author/model", "performance_routing": {}},
+            {"provider": "other", "model": "other-model"},
+        ]}},
+    }
+    app, calls, _ = proxy_app(cfg, handler)
+    resp = await _post(app, {"model": "fast:race", "messages": []})
+    assert resp.status_code == 200
+    assert resp.json()["who"] == "openrouter"
+    openrouter_post = next(body for base, body, _ in calls if base == "https://openrouter.ai" and body is not None)
+    assert openrouter_post["provider"]["only"] == ["fast"]
 
 
 @pytest.mark.asyncio
@@ -1671,8 +1704,8 @@ async def test_session_pin_keeps_session_on_bounced_endpoint(proxy_app):
     import config
 
     skey = main._session_key(body)
-    idx, home, ts = main._session_pins[("default", skey)]
-    main._session_pins[("default", skey)] = (idx, home, ts - config.SETTINGS.session_pin_ttl_secs - 1)
+    idx, home, ts, via = main._session_pins[("default", skey)]
+    main._session_pins[("default", skey)] = (idx, home, ts - config.SETTINGS.session_pin_ttl_secs - 1, via)
     calls.clear()
     resp = await _post(app, body)
     assert resp.status_code == 200
@@ -1891,7 +1924,7 @@ async def test_stale_pin_index_is_dropped_not_crashed(proxy_app):
     )
     body = {"model": "default", "messages": [{"role": "user", "content": "hi"}]}
     skey = main._session_key(body)
-    main._session_pins[("default", skey)] = (999, "a", time.monotonic())  # out of range
+    main._session_pins[("default", skey)] = (999, "a", time.monotonic(), "")  # out of range
 
     resp = await _post(app, body)
     assert resp.status_code == 200
@@ -2000,7 +2033,7 @@ async def test_stale_pin_with_mismatched_home_label_is_dropped(proxy_app):
     body = {"model": "default", "messages": [{"role": "user", "content": "hi"}]}
     skey = main._session_key(body)
     # Pin points at index 1 but remembers home "a"; index 1 is actually "b".
-    main._session_pins[("default", skey)] = (1, "a", time.monotonic())
+    main._session_pins[("default", skey)] = (1, "a", time.monotonic(), "")
 
     resp = await _post(app, body)
     assert resp.status_code == 200

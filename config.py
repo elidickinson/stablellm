@@ -10,6 +10,8 @@ from dataclasses import dataclass
 import yaml
 from dotenv import load_dotenv
 
+from performance_routing import PerformanceRouting
+
 load_dotenv()
 
 log = logging.getLogger("stablellm.config")
@@ -37,6 +39,7 @@ class Endpoint:
     max_concurrency: int = 0
     ttfb_deadline_secs: float = 0.0
     routing: dict | None = None
+    performance_routing: PerformanceRouting | None = None
     reasoning_effort: str = ""  # sent when the request omits one; "" = leave client's choice
     reasoning_force: bool = False  # override the client's reasoning params with reasoning_effort
 
@@ -205,6 +208,25 @@ def _opt_secs(value: object, key: str, default: float) -> float:
     return float(value)
 
 
+def _opt_performance_routing(value: object) -> PerformanceRouting | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ConfigError("'performance_routing' must be a mapping")
+    unknown = set(value) - {"target_tokens", "tolerance", "cache_ttl_seconds"}
+    if unknown:
+        raise ConfigError(f"unknown performance_routing keys: {', '.join(sorted(map(str, unknown)))}")
+    defaults = PerformanceRouting()
+    target_tokens = _opt_count(value.get("target_tokens"), "performance_routing.target_tokens", defaults.target_tokens)
+    if target_tokens == 0:
+        raise ConfigError("'performance_routing.target_tokens' must be greater than 0")
+    return PerformanceRouting(
+        target_tokens,
+        _opt_secs(value.get("tolerance"), "performance_routing.tolerance", defaults.tolerance),
+        _opt_secs(value.get("cache_ttl_seconds"), "performance_routing.cache_ttl_seconds", defaults.cache_ttl_seconds),
+    )
+
+
 def _meta_str(value: object, key: str) -> str:
     if not isinstance(value, str):
         raise ConfigError(f"meta '{key}' must be a string")
@@ -337,6 +359,7 @@ def _parse_groups(raw: object, providers: dict[str, Provider]) -> tuple[dict[str
             routing = _opt_mapping(entry.get("routing"), "routing")
             if routing is None:
                 routing = prov.routing
+            performance_routing = _opt_performance_routing(entry.get("performance_routing"))
 
             endpoints.append(Endpoint(
                 base_url=prov.base_url,
@@ -347,6 +370,7 @@ def _parse_groups(raw: object, providers: dict[str, Provider]) -> tuple[dict[str
                 max_concurrency=_opt_count(entry.get("max_concurrency"), "max_concurrency", prov.max_concurrency),
                 ttfb_deadline_secs=_opt_secs(entry.get("ttfb_deadline_secs"), "ttfb_deadline_secs", prov.ttfb_deadline_secs),
                 routing=routing,
+                performance_routing=performance_routing,
                 reasoning_effort=reasoning_effort,
                 reasoning_force=reasoning_force,
             ))
