@@ -617,13 +617,10 @@ async def test_race_sse_winner_is_delivered_as_one_burst_with_metadata(proxy_app
         return httpx.Response(200, content=sse_body, headers={"content-type": "text/event-stream; charset=utf-8"})
 
     cfg = {
-        "providers": {
-            "or1": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"},
-            "or2": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"},
-        },
+        "providers": {"openrouter": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"}},
         "groups": {"fast": {"endpoints": [
-            {"provider": "or1", "model": "ma"},
-            {"provider": "or2", "model": "mb"},
+            {"provider": "openrouter", "model": "ma"},
+            {"provider": "openrouter", "model": "mb"},
         ]}},
     }
     app, _calls, _ = proxy_app(cfg, handler)
@@ -634,7 +631,7 @@ async def test_race_sse_winner_is_delivered_as_one_burst_with_metadata(proxy_app
     assert resp.content == sse_body
     assert resp.headers["x-stablellm-via"] == "Cerebras"
     assert resp.headers["x-stablellm-mode"] == "race"
-    assert resp.headers["x-stablellm-provider"].startswith("or")
+    assert resp.headers["x-stablellm-provider"] == "openrouter"
 
 
 @pytest.mark.asyncio
@@ -807,11 +804,11 @@ async def test_race_applies_performance_routing(proxy_app):
 
     cfg = {
         "providers": {
-            "or": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"},
+            "openrouter": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"},
             "other": {"base_url": "https://other.test", "api_key": "k"},
         },
         "groups": {"fast": {"endpoints": [
-            {"provider": "or", "model": "author/model", "performance_routing": {}},
+            {"provider": "openrouter", "model": "author/model", "performance_routing": {}},
             {"provider": "other", "model": "other-model"},
         ]}},
     }
@@ -1231,8 +1228,8 @@ async def test_via_header_from_openrouter_buffered(proxy_app):
     """OpenRouter upstreams tag the body with top-level `provider`; surface it."""
     app, _, _ = proxy_app(
         {
-            "providers": {"or": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"}},
-            "groups": {"g": {"endpoints": [{"provider": "or", "model": "openai/gpt-4o-mini"}]}},
+            "providers": {"openrouter": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"}},
+            "groups": {"g": {"endpoints": [{"provider": "openrouter", "model": "openai/gpt-4o-mini"}]}},
         },
         lambda r: _ok_response({"provider": "OpenAI", "model": "openai/gpt-4o-mini"}),
     )
@@ -1256,8 +1253,8 @@ async def test_via_header_from_openrouter_streaming(proxy_app):
 
     app, _, _ = proxy_app(
         {
-            "providers": {"or": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"}},
-            "groups": {"g": {"endpoints": [{"provider": "or", "model": "m"}]}},
+            "providers": {"openrouter": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"}},
+            "groups": {"g": {"endpoints": [{"provider": "openrouter", "model": "m"}]}},
         },
         handler,
     )
@@ -1298,13 +1295,10 @@ async def test_via_header_from_openrouter_race_streaming(proxy_app):
         return httpx.Response(200, content=sse, headers={"content-type": "text/event-stream"})
 
     cfg = {
-        "providers": {
-            "or1": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"},
-            "or2": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"},
-        },
+        "providers": {"openrouter": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"}},
         "groups": {"fast": {"endpoints": [
-            {"provider": "or1", "model": "ma"},
-            {"provider": "or2", "model": "mb"},
+            {"provider": "openrouter", "model": "ma"},
+            {"provider": "openrouter", "model": "mb"},
         ]}},
     }
     app, _, _ = proxy_app(cfg, handler)

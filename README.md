@@ -69,22 +69,23 @@ groups:
       - provider: openai
 ```
 
-**`providers`** — a registry of upstream API endpoints. Each has a `base_url` and `api_key`. Optionally set `model` here as a provider-wide default — used when a group entry omits `model`. Three optional per-provider settings, all inheritable to (and overridable on) individual group entries:
+**`providers`** — an optional registry of upstream API endpoints. `openrouter` is always predefined with base URL `https://openrouter.ai/api/v1` and the `OPENROUTER_API_KEY` environment variable; declaring it overrides supplied fields, so an `api_key`-only entry inherits the default URL. Other provider entries require `base_url` and `api_key`. Optionally set `model` here as a provider-wide default — used when a group entry omits `model`. Three optional per-provider settings, all inheritable to (and overridable on) individual group entries:
 
 - `max_concurrency` — maximum in-flight requests per model (0/unset = unlimited). When an endpoint is at its cap, routing skips it immediately instead of queueing behind providers like synthetic.new, which silently hold queued requests until a slot frees. Counted per `(provider, model)` across all groups. The slot is held until the response is fully consumed, including the whole lifetime of a stream.
 - `ttfb_deadline_secs` — fail over if response headers don't arrive within this many seconds (0/unset = disabled). Queued requests are indistinguishable from slow ones — providers withhold headers while a request waits for a slot, with no error and no keepalives — so this is the only externally visible tripwire for queueing the proxy can't see (e.g. another client sharing the same API key).
-- `routing` — passthrough mapping injected as the request's `provider` object, for OpenRouter's [provider-selection](https://openrouter.ai/docs/guides/routing/provider-selection) params (`sort`, `order`, `ignore`, `quantizations`, `max_price`, ...). OpenRouter only: config parsing rejects it on any other upstream. Injected after client params are stripped, so clients cannot override it.
+- `routing` — passthrough mapping injected as the request's `provider` object, for OpenRouter's [provider-selection](https://openrouter.ai/docs/guides/routing/provider-selection) params (`sort`, `order`, `ignore`, `quantizations`, `max_price`, ...). Valid only when the provider name is `openrouter`; config parsing rejects it for every other provider. Injected after client params are stripped, so clients cannot override it.
 
 **`groups`** — maps a request model name to a routing mode and an ordered list of upstream entries. Each group has:
 
 - `mode` — `seq` (try in order, default) or `race` (send to all, first fully-completed response wins). Can be overridden per-request with `:race`/`:seq` suffix on the model name.
 - `endpoints` — ordered list of entries, each with:
-  - `provider` — name from the providers section (required)
+  - `provider` — name from the providers section, or the predefined `openrouter` provider (required)
   - `model` — model name to send upstream. If omitted, falls back to the provider's `model` (if set), otherwise the client's requested model passes through unchanged.
   - `flags` — per-endpoint flags: `keep_reasoning` preserves `reasoning`/`reasoning_content`/`thinking` fields in messages (otherwise stripped).
   - `reasoning_effort` — effort level (e.g. `high`) injected as the top-level `reasoning_effort` param when the client sends no reasoning params of its own. Independent of group `meta` reasoning fields, which only advertise capabilities on `/v1/models`.
   - `reasoning_force` — with `reasoning_effort`, also override client-sent `reasoning`/`reasoning_effort`.
   - `max_concurrency` / `ttfb_deadline_secs` / `routing` — per-endpoint overrides of the provider-level settings above. Concurrency is counted per `(provider, model)` across all groups: entries sharing a provider+model share one counter, so give them the same (smallest) cap.
+  - `performance_routing` — OpenRouter only, and endpoint-level only (not inheritable from `providers`). Scores the model's live OpenRouter endpoints by projected time to generate `target_tokens` (default `10000`) from p50 latency and p50 throughput, then allows only those within `tolerance` (default `0.15`) of the fastest as `provider.only`. A static `routing.only` narrows the result further, other `routing` filters (`max_price`, `quantizations`, `ignore`, ...) pass through, and ranking keys (`sort`, `order`, `preferred_max_latency`) are dropped — they contradict an explicit allowlist. The catalog is cached per model for `cache_ttl_seconds` (default `900`); if OpenRouter rejects the allowlist, the request retries once without it. Example: `performance_routing: {}` takes all defaults.
 - `meta` — optional descriptive metadata published on `/v1/models` in OpenRouter's response shape. When set, the entry uses OpenRouter keys (`context_length`, `architecture`, `pricing`, `top_provider`, `reasoning`) instead of the minimal OpenAI shape. All fields optional. Fields:
   - `name` / `description`
   - `context` / `max_output` — window and max completion tokens (tokens)
@@ -148,7 +149,7 @@ Every proxied response includes headers telling the client which upstream actual
 
 Headers are present on both streaming and non-streaming responses. They are exposed via CORS so browser clients can read them.
 
-**OpenRouter sub-provider (`X-StableLLM-Via`).** OpenRouter itself fans a request out to one of several underlying providers (e.g. `OpenAI`, `Azure`, `Cerebras`). It tags every response body / stream chunk with that choice in a top-level `provider` field. When an endpoint's `base_url` points at `openrouter.ai`, stablellm reads that field and surfaces it as `X-StableLLM-Via`, so `X-StableLLM-Provider: openrouter` + `X-StableLLM-Via: Cerebras` means the request went through OpenRouter and was served by Cerebras. Non-OpenRouter endpoints don't set this header. (On race streaming responses, the buffered winner SSE is scanned before delivery.)
+**OpenRouter sub-provider (`X-StableLLM-Via`).** OpenRouter itself fans a request out to one of several underlying providers (e.g. `OpenAI`, `Azure`, `Cerebras`). It tags every response body / stream chunk with that choice in a top-level `provider` field. When an endpoint uses the provider named `openrouter`, stablellm reads that field and surfaces it as `X-StableLLM-Via`, even when its configured URL is a gateway or cache in front of OpenRouter. Non-OpenRouter endpoints don't set this header. (On race streaming responses, the buffered winner SSE is scanned before delivery.)
 
 **Unknown request parameters** (not in the supported set) are silently stripped per-endpoint before forwarding. This lets providers with different capabilities share the same request body.
 

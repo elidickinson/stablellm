@@ -27,6 +27,39 @@ def test_provider_parsed(make_config):
     assert cfg.ENDPOINTS[0].model == ""  # no model → passthrough
 
 
+def test_openrouter_is_predefined_without_a_providers_block(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "env-key")
+    endpoints, _, _ = parse_config({"groups": {"default": _group([{"provider": "openrouter"}])}})
+    assert endpoints[0].base_url == "https://openrouter.ai/api/v1"
+    assert endpoints[0].api_key == "env-key"
+
+
+def test_openrouter_override_inherits_unspecified_fields(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "env-key")
+    endpoints, _, _ = parse_config({
+        "providers": {"openrouter": {"base_url": "https://or.internal/v1"}},
+        "groups": {"default": _group([{"provider": "openrouter", "routing": {"sort": "throughput"}}])},
+    })
+    assert endpoints[0].base_url == "https://or.internal/v1"
+    assert endpoints[0].api_key == "env-key"
+
+
+def test_unused_openrouter_does_not_warn(monkeypatch, caplog):
+    """The predefined openrouter provider must not demand a key the config never uses."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    with caplog.at_level("WARNING", logger="stablellm.config"):
+        parse_config(make_minimal())
+    assert not caplog.records
+
+
+def test_used_openrouter_without_key_warns(monkeypatch, caplog):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    raw = {"groups": {"default": _group([{"provider": "openrouter"}])}}
+    with caplog.at_level("WARNING", logger="stablellm.config"):
+        parse_config(raw)
+    assert any("no api_key" in r.message for r in caplog.records)
+
+
 def test_provider_with_model(make_config):
     cfg = make_config({
         "providers": {"foo": {"base_url": "https://a.example", "api_key": "k"}},
@@ -465,39 +498,39 @@ def test_routing_defaults_to_none(make_config):
 
 def test_provider_routing_inherited_by_endpoints(make_config):
     cfg = make_config({
-        "providers": {"or": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k", "routing": {"sort": "throughput"}}},
-        "groups": {"default": _group([{"provider": "or"}])},
+        "providers": {"openrouter": {"api_key": "k", "routing": {"sort": "throughput"}}},
+        "groups": {"default": _group([{"provider": "openrouter"}])},
     })
     assert cfg.ENDPOINTS[0].routing == {"sort": "throughput"}
 
 
 def test_endpoint_routing_overrides_provider(make_config):
     cfg = make_config({
-        "providers": {"or": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k", "routing": {"sort": "throughput"}}},
+        "providers": {"openrouter": {"api_key": "k", "routing": {"sort": "throughput"}}},
         "groups": {"default": _group([
-            {"provider": "or", "routing": {"order": ["deepinfra"]}},
-            {"provider": "or"},
+            {"provider": "openrouter", "routing": {"order": ["deepinfra"]}},
+            {"provider": "openrouter"},
         ])},
     })
     assert cfg.ENDPOINTS[0].routing == {"order": ["deepinfra"]}
     assert cfg.ENDPOINTS[1].routing == {"sort": "throughput"}  # inherited
 
 
-def test_provider_routing_requires_openrouter():
+def test_provider_routing_requires_openrouter_name():
     raw = make_minimal({"a": {"base_url": "https://a", "api_key": "k", "routing": {"sort": "throughput"}}})
-    with pytest.raises(ConfigError, match="'routing' requires an OpenRouter base_url"):
+    with pytest.raises(ConfigError, match="provider 'a': 'routing' is only valid on the 'openrouter' provider"):
         parse_config(raw)
 
 
-def test_endpoint_routing_requires_openrouter():
+def test_endpoint_routing_requires_openrouter_name():
     raw = make_minimal(groups={"default": _group([{"provider": "a", "routing": {"sort": "throughput"}}])})
-    with pytest.raises(ConfigError, match="entry 0: 'routing' requires an OpenRouter base_url"):
+    with pytest.raises(ConfigError, match="entry 0: 'routing' is only valid on the 'openrouter' provider"):
         parse_config(raw)
 
 
-def test_performance_routing_requires_openrouter():
+def test_performance_routing_requires_openrouter_name():
     raw = make_minimal(groups={"default": _group([{"provider": "a", "performance_routing": {}}])})
-    with pytest.raises(ConfigError, match="entry 0: 'performance_routing' requires an OpenRouter base_url"):
+    with pytest.raises(ConfigError, match="entry 0: 'performance_routing' is only valid on the 'openrouter' provider"):
         parse_config(raw)
 
 

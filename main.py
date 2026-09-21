@@ -664,7 +664,7 @@ def _build_upstream_headers(ep: Endpoint) -> dict:
 def _openrouter_via(ep: Endpoint) -> bool:
     """True if the endpoint routes through OpenRouter, which tags every
     response/chunk with the serving sub-provider in a top-level ``provider`` field."""
-    return config.is_openrouter_url(ep.base_url)
+    return ep.provider == "openrouter"
 
 
 def _openrouter_served_provider(data: object) -> str | None:

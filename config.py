@@ -6,7 +6,6 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from urllib.parse import urlparse
 
 import yaml
 from dotenv import load_dotenv
@@ -147,47 +146,69 @@ def _env_substitute(value: str) -> str:
     return _ENV_VAR_RE.sub(_replace, value)
 
 
-def is_openrouter_url(base_url: str) -> bool:
-    """True if a base URL points at OpenRouter, the only upstream that takes
-    provider-selection params."""
-    host = urlparse(base_url).hostname or ""
-    return host == "openrouter.ai" or host.endswith(".openrouter.ai")
+def _default_openrouter() -> Provider:
+    return Provider(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=os.environ.get("OPENROUTER_API_KEY", ""),
+    )
 
 
-def _require_openrouter(value: object, key: str, base_url: str, where: str) -> None:
-    """Reject an OpenRouter-only setting configured against another upstream."""
-    if value is not None and not is_openrouter_url(base_url):
-        raise ConfigError(f"{where}: '{key}' requires an OpenRouter base_url")
+def _require_openrouter(value: object, key: str, provider_name: str, where: str) -> None:
+    """Reject an OpenRouter-only setting configured on another provider."""
+    if value is not None and provider_name != "openrouter":
+        raise ConfigError(f"{where}: '{key}' is only valid on the 'openrouter' provider")
+
+
+def _parse_provider(name: str, entry: object, defaults: Provider | None = None) -> Provider:
+    if not isinstance(entry, dict):
+        raise ConfigError(f"provider '{name}' must be a mapping")
+
+    if defaults is None:
+        if "base_url" not in entry or "api_key" not in entry:
+            raise ConfigError(f"provider '{name}' requires 'base_url' and 'api_key'")
+        base_url = str(entry["base_url"]).rstrip("/")
+        api_key = _env_substitute(str(entry["api_key"]))
+        model_default = ""
+        max_concurrency_default = 0
+        ttfb_deadline_default = 0.0
+    else:
+        base_url = str(entry.get("base_url", defaults.base_url)).rstrip("/")
+        api_key = (
+            _env_substitute(str(entry["api_key"]))
+            if "api_key" in entry else defaults.api_key
+        )
+        model_default = defaults.model
+        max_concurrency_default = defaults.max_concurrency
+        ttfb_deadline_default = defaults.ttfb_deadline_secs
+
+    routing = _opt_mapping(entry.get("routing"), "routing")
+    _require_openrouter(routing, "routing", name, f"provider '{name}'")
+    return Provider(
+        base_url=base_url,
+        api_key=api_key,
+        model=str(entry.get("model", model_default)),
+        max_concurrency=_opt_count(entry.get("max_concurrency"), "max_concurrency", max_concurrency_default),
+        ttfb_deadline_secs=_opt_secs(entry.get("ttfb_deadline_secs"), "ttfb_deadline_secs", ttfb_deadline_default),
+        routing=routing,
+    )
 
 
 def _parse_providers(raw: object) -> dict[str, Provider]:
     """Parse top-level 'providers' mapping. Returns {name_lower: Provider}."""
-    if not isinstance(raw, dict) or not raw:
-        raise ConfigError("'providers' must be a non-empty mapping")
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ConfigError("'providers' must be a mapping")
 
-    providers: dict[str, Provider] = {}
+    providers: dict[str, Provider] = {"openrouter": _default_openrouter()}
+    declared: set[str] = set()
     for name, entry in raw.items():
-        if not isinstance(entry, dict):
-            raise ConfigError(f"provider '{name}' must be a mapping")
-        if "base_url" not in entry or "api_key" not in entry:
-            raise ConfigError(f"provider '{name}' requires 'base_url' and 'api_key'")
-
         name_lower = str(name).lower()
-        if name_lower in providers:
+        if name_lower in declared:
             raise ConfigError(f"duplicate provider name '{name}'")
-
-        base_url = str(entry["base_url"]).rstrip("/")
-        routing = _opt_mapping(entry.get("routing"), "routing")
-        _require_openrouter(routing, "routing", base_url, f"provider '{name}'")
-
-        providers[name_lower] = Provider(
-            base_url=base_url,
-            api_key=_env_substitute(str(entry["api_key"])),
-            model=str(entry.get("model", "")),
-            max_concurrency=_opt_count(entry.get("max_concurrency"), "max_concurrency", 0),
-            ttfb_deadline_secs=_opt_secs(entry.get("ttfb_deadline_secs"), "ttfb_deadline_secs", 0.0),
-            routing=routing,
-        )
+        declared.add(name_lower)
+        defaults = providers["openrouter"] if name_lower == "openrouter" else None
+        providers[name_lower] = _parse_provider(name_lower, entry, defaults)
     return providers
 
 
@@ -377,8 +398,8 @@ def _parse_groups(raw: object, providers: dict[str, Provider]) -> tuple[dict[str
             routing = _opt_mapping(entry.get("routing"), "routing")
             performance_routing = _opt_performance_routing(entry.get("performance_routing"))
             where = f"group '{group_name}' entry {i}"
-            _require_openrouter(routing, "routing", prov.base_url, where)
-            _require_openrouter(performance_routing, "performance_routing", prov.base_url, where)
+            _require_openrouter(routing, "routing", prov_lower, where)
+            _require_openrouter(performance_routing, "performance_routing", prov_lower, where)
             if routing is None:
                 routing = prov.routing
 
@@ -451,6 +472,8 @@ def parse_config(raw: object) -> tuple[list[Endpoint], dict[str, Group], Setting
     providers = _parse_providers(raw.get("providers", {}))
     groups, endpoints = _parse_groups(raw.get("groups"), providers)
     settings = _parse_settings(raw.get("settings"))
+    if any(ep.provider == "openrouter" and not ep.api_key for ep in endpoints):
+        log.warning("provider 'openrouter' has no api_key: set OPENROUTER_API_KEY or declare it in 'providers'")
     return endpoints, groups, settings
 
 

@@ -9,7 +9,9 @@ settings:
   race_settle_timeout_secs: 120  # hard cap for race completion/drain accounting; must be > 0
   log_level: INFO
 
-# Provider registry — just base_url + api_key, no model info.
+# Provider registry — optional. The predefined openrouter provider is always
+# available with https://openrouter.ai/api/v1 and ${OPENROUTER_API_KEY}; omit
+# this block unless you need other providers or want to override openrouter.
 providers:
   openai:
     base_url: https://api.openai.com/v1
@@ -23,6 +25,8 @@ providers:
     base_url: https://api.cerebras.ai/v1
     api_key: ${CEREBRAS_API_KEY}
 
+  # This override block is optional. Unspecified fields inherit the predefined
+  # openrouter provider; set base_url here when using an OpenRouter gateway.
   openrouter:
     base_url: https://openrouter.ai/api/v1
     api_key: ${OPENROUTER_API_KEY}
@@ -82,8 +86,8 @@ groups:
         model: openai/gpt-4o-mini
         # Per-endpoint OpenRouter routing params, injected as the request's
         # `provider` object: https://openrouter.ai/docs/guides/routing/provider-selection
-        # OpenRouter only — rejected at parse time on any other provider.
-        # (also settable provider-wide). E.g.:
+        # Only valid for the provider named `openrouter` — rejected at parse
+        # time on every other provider. (also settable provider-wide). E.g.:
         # routing:
         #   sort: throughput
         #   allow_fallbacks: false

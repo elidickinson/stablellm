@@ -31,11 +31,11 @@ def test_fast_tags_use_projected_completion_time():
 def performance_app(monkeypatch, tmp_path):
     def build(handler):
         fresh_config(monkeypatch, tmp_path, {
-            "providers": {"or": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"}},
+            "providers": {"openrouter": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"}},
             "groups": {
                 "default": {
                     "endpoints": [{
-                        "provider": "or",
+                        "provider": "openrouter",
                         "model": "author/model",
                         "performance_routing": {},
                         "routing": {
