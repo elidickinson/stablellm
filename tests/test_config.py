@@ -465,22 +465,40 @@ def test_routing_defaults_to_none(make_config):
 
 def test_provider_routing_inherited_by_endpoints(make_config):
     cfg = make_config({
-        "providers": {"a": {"base_url": "https://a", "api_key": "k", "routing": {"sort": "throughput"}}},
-        "groups": {"default": _group([{"provider": "a"}])},
+        "providers": {"or": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k", "routing": {"sort": "throughput"}}},
+        "groups": {"default": _group([{"provider": "or"}])},
     })
     assert cfg.ENDPOINTS[0].routing == {"sort": "throughput"}
 
 
 def test_endpoint_routing_overrides_provider(make_config):
     cfg = make_config({
-        "providers": {"a": {"base_url": "https://a", "api_key": "k", "routing": {"sort": "throughput"}}},
+        "providers": {"or": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k", "routing": {"sort": "throughput"}}},
         "groups": {"default": _group([
-            {"provider": "a", "routing": {"order": ["deepinfra"]}},
-            {"provider": "a"},
+            {"provider": "or", "routing": {"order": ["deepinfra"]}},
+            {"provider": "or"},
         ])},
     })
     assert cfg.ENDPOINTS[0].routing == {"order": ["deepinfra"]}
     assert cfg.ENDPOINTS[1].routing == {"sort": "throughput"}  # inherited
+
+
+def test_provider_routing_requires_openrouter():
+    raw = make_minimal({"a": {"base_url": "https://a", "api_key": "k", "routing": {"sort": "throughput"}}})
+    with pytest.raises(ConfigError, match="'routing' requires an OpenRouter base_url"):
+        parse_config(raw)
+
+
+def test_endpoint_routing_requires_openrouter():
+    raw = make_minimal(groups={"default": _group([{"provider": "a", "routing": {"sort": "throughput"}}])})
+    with pytest.raises(ConfigError, match="entry 0: 'routing' requires an OpenRouter base_url"):
+        parse_config(raw)
+
+
+def test_performance_routing_requires_openrouter():
+    raw = make_minimal(groups={"default": _group([{"provider": "a", "performance_routing": {}}])})
+    with pytest.raises(ConfigError, match="entry 0: 'performance_routing' requires an OpenRouter base_url"):
+        parse_config(raw)
 
 
 def test_routing_must_be_mapping_is_config_error():

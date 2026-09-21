@@ -821,6 +821,7 @@ async def test_race_applies_performance_routing(proxy_app):
     assert resp.json()["who"] == "openrouter"
     openrouter_post = next(body for base, body, _ in calls if base == "https://openrouter.ai" and body is not None)
     assert openrouter_post["provider"]["only"] == ["fast"]
+    assert openrouter_post["provider"]["allow_fallbacks"] is True
 
 
 @pytest.mark.asyncio

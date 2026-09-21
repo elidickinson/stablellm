@@ -82,6 +82,7 @@ groups:
         model: openai/gpt-4o-mini
         # Per-endpoint OpenRouter routing params, injected as the request's
         # `provider` object: https://openrouter.ai/docs/guides/routing/provider-selection
+        # OpenRouter only — rejected at parse time on any other provider.
         # (also settable provider-wide). E.g.:
         # routing:
         #   sort: throughput

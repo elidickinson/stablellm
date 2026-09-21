@@ -38,7 +38,13 @@ def performance_app(monkeypatch, tmp_path):
                         "provider": "or",
                         "model": "author/model",
                         "performance_routing": {},
-                        "routing": {"sort": "throughput", "order": ["old"]},
+                        "routing": {
+                            "sort": "throughput",
+                            "order": ["old"],
+                            "preferred_max_latency": {"p50": 1},
+                            "max_price": {"prompt": 1},
+                            "quantizations": ["fp8"],
+                        },
                     }],
                 },
             },
@@ -92,8 +98,12 @@ async def test_performance_routing_generates_only_and_caches_catalog(performance
     assert [method for method, _, _ in calls] == ["GET", "POST", "POST"]
     provider = calls[1][2]["provider"]
     assert provider["only"] == ["fast", "near"]
-    assert provider["sort"] == "throughput"
+    assert provider["allow_fallbacks"] is True
+    assert provider["max_price"] == {"prompt": 1}
+    assert provider["quantizations"] == ["fp8"]
+    assert "sort" not in provider
     assert "order" not in provider
+    assert "preferred_max_latency" not in provider
 
 
 @pytest.mark.asyncio
@@ -132,4 +142,6 @@ async def test_no_compatible_generated_only_retries_raw_routing(performance_app)
     app, calls = performance_app(handler)
     assert (await _post(app)).status_code == 200
     assert calls[1][2]["provider"]["only"] == ["fast"]
+    assert calls[1][2]["provider"]["allow_fallbacks"] is True
     assert "only" not in calls[2][2]["provider"]
+    assert calls[2][2]["provider"]["sort"] == "throughput"

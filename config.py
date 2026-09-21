@@ -6,6 +6,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import yaml
 from dotenv import load_dotenv
@@ -146,6 +147,19 @@ def _env_substitute(value: str) -> str:
     return _ENV_VAR_RE.sub(_replace, value)
 
 
+def is_openrouter_url(base_url: str) -> bool:
+    """True if a base URL points at OpenRouter, the only upstream that takes
+    provider-selection params."""
+    host = urlparse(base_url).hostname or ""
+    return host == "openrouter.ai" or host.endswith(".openrouter.ai")
+
+
+def _require_openrouter(value: object, key: str, base_url: str, where: str) -> None:
+    """Reject an OpenRouter-only setting configured against another upstream."""
+    if value is not None and not is_openrouter_url(base_url):
+        raise ConfigError(f"{where}: '{key}' requires an OpenRouter base_url")
+
+
 def _parse_providers(raw: object) -> dict[str, Provider]:
     """Parse top-level 'providers' mapping. Returns {name_lower: Provider}."""
     if not isinstance(raw, dict) or not raw:
@@ -162,13 +176,17 @@ def _parse_providers(raw: object) -> dict[str, Provider]:
         if name_lower in providers:
             raise ConfigError(f"duplicate provider name '{name}'")
 
+        base_url = str(entry["base_url"]).rstrip("/")
+        routing = _opt_mapping(entry.get("routing"), "routing")
+        _require_openrouter(routing, "routing", base_url, f"provider '{name}'")
+
         providers[name_lower] = Provider(
-            base_url=str(entry["base_url"]).rstrip("/"),
+            base_url=base_url,
             api_key=_env_substitute(str(entry["api_key"])),
             model=str(entry.get("model", "")),
             max_concurrency=_opt_count(entry.get("max_concurrency"), "max_concurrency", 0),
             ttfb_deadline_secs=_opt_secs(entry.get("ttfb_deadline_secs"), "ttfb_deadline_secs", 0.0),
-            routing=_opt_mapping(entry.get("routing"), "routing"),
+            routing=routing,
         )
     return providers
 
@@ -357,9 +375,12 @@ def _parse_groups(raw: object, providers: dict[str, Provider]) -> tuple[dict[str
                 raise ConfigError(f"entry {i} in group '{group_name}': 'reasoning_force' requires 'reasoning_effort'")
 
             routing = _opt_mapping(entry.get("routing"), "routing")
+            performance_routing = _opt_performance_routing(entry.get("performance_routing"))
+            where = f"group '{group_name}' entry {i}"
+            _require_openrouter(routing, "routing", prov.base_url, where)
+            _require_openrouter(performance_routing, "performance_routing", prov.base_url, where)
             if routing is None:
                 routing = prov.routing
-            performance_routing = _opt_performance_routing(entry.get("performance_routing"))
 
             endpoints.append(Endpoint(
                 base_url=prov.base_url,

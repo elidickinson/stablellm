@@ -73,7 +73,7 @@ groups:
 
 - `max_concurrency` — maximum in-flight requests per model (0/unset = unlimited). When an endpoint is at its cap, routing skips it immediately instead of queueing behind providers like synthetic.new, which silently hold queued requests until a slot frees. Counted per `(provider, model)` across all groups. The slot is held until the response is fully consumed, including the whole lifetime of a stream.
 - `ttfb_deadline_secs` — fail over if response headers don't arrive within this many seconds (0/unset = disabled). Queued requests are indistinguishable from slow ones — providers withhold headers while a request waits for a slot, with no error and no keepalives — so this is the only externally visible tripwire for queueing the proxy can't see (e.g. another client sharing the same API key).
-- `routing` — passthrough mapping injected as the request's `provider` object, for OpenRouter's [provider-selection](https://openrouter.ai/docs/guides/routing/provider-selection) params (`sort`, `order`, `ignore`, `quantizations`, `max_price`, ...). Only meaningful for OpenRouter endpoints; other upstreams ignore the extra field. Injected after client params are stripped, so clients cannot override it.
+- `routing` — passthrough mapping injected as the request's `provider` object, for OpenRouter's [provider-selection](https://openrouter.ai/docs/guides/routing/provider-selection) params (`sort`, `order`, `ignore`, `quantizations`, `max_price`, ...). OpenRouter only: config parsing rejects it on any other upstream. Injected after client params are stripped, so clients cannot override it.
 
 **`groups`** — maps a request model name to a routing mode and an ordered list of upstream entries. Each group has:
 

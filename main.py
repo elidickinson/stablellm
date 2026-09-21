@@ -13,7 +13,7 @@ from decimal import Decimal
 from itertools import count
 from pathlib import Path
 from typing import ClassVar, Final, NamedTuple
-from urllib.parse import unquote, urlencode, urlparse
+from urllib.parse import unquote, urlencode
 
 import httpx
 import yaml
@@ -664,8 +664,7 @@ def _build_upstream_headers(ep: Endpoint) -> dict:
 def _openrouter_via(ep: Endpoint) -> bool:
     """True if the endpoint routes through OpenRouter, which tags every
     response/chunk with the serving sub-provider in a top-level ``provider`` field."""
-    host = urlparse(ep.base_url).hostname or ""
-    return host == "openrouter.ai" or host.endswith(".openrouter.ai")
+    return config.is_openrouter_url(ep.base_url)
 
 
 def _openrouter_served_provider(data: object) -> str | None:
@@ -740,7 +739,10 @@ async def _apply_performance_routing(body: dict, ep: Endpoint, group: str, sessi
         log.info("performance routing model=%s reason=bypassed", body["model"])
         return body, False
     provider.pop("order", None)
+    provider.pop("sort", None)
+    provider.pop("preferred_max_latency", None)
     provider["only"] = tags
+    provider["allow_fallbacks"] = True
     log.info("performance routing model=%s tags=%s reason=%s", body["model"], ",".join(tags), source)
     return {**body, "provider": provider}, True
 
