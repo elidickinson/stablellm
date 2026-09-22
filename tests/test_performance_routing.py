@@ -66,24 +66,27 @@ def test_free_rows_pass_the_price_cap():
     assert [row["tag"] for row in eligible] == ["free", "a"]
 
 
-def test_quantization_floor_is_modal_width_tied_down():
+def test_quantization_floor_is_median_width_rounded_up():
     fp4 = _row("a", "1e-06", "1e-06", "fp4")
     fp8 = _row("b", "1e-06", "1e-06", "fp8")
-    assert quantization_floor([fp4, fp8]) == 4  # tie resolves to the lower tier
-    assert quantization_floor([fp8, fp8, fp4]) == 8
-    assert quantization_floor([fp8, {"quantization": "fp4"}, {"quantization": "int4"}]) == 4
+    fp16 = _row("c", "1e-06", "1e-06", "bf16")
+    assert quantization_floor([fp4, fp8]) == 8  # median 6 rounds up to the next tier
+    assert quantization_floor([fp4, fp4, fp8]) == 4  # median 4 is already a tier
+    assert quantization_floor([fp4, fp8, fp16]) == 8  # median 8
+    assert quantization_floor([fp8, fp16]) == 16  # median 12 rounds up
+    assert quantization_floor([fp4, fp4, fp4, fp8, fp8, fp16]) == 8  # mode is 4, median 6
     assert quantization_floor([{"quantization": "unknown"}]) is None
 
 
 def test_derived_floor_excluding_nothing_is_not_emitted():
-    rows = [_row("a", "1e-06", "1e-06", "fp8"), _row("b", "1e-06", "1e-06", "int4")]
+    rows = [_row("a", "1e-06", "1e-06", "fp8"), _row("b", "1e-06", "1e-06", "fp8")]
     _derived, quants, eligible, _floor = derive_constraints(rows, PerformanceRouting(), {})
     assert quants is None
-    assert {row["quantization"] for row in eligible} == {"fp8", "int4"}
+    assert {row["quantization"] for row in eligible} == {"fp8"}
 
 
 def test_quantization_floor_off_disables_derivation():
-    # The modal fp8 floor would drop the fp4 row; off keeps it.
+    # The derived 8-bit floor would drop the fp4 row; off keeps it.
     rows = [
         _row("a", "1e-06", "1e-06", "fp8"),
         _row("b", "1e-06", "1e-06", "fp8"),
@@ -231,7 +234,7 @@ async def test_static_only_disjoint_from_ranked_tags_is_dropped(performance_app)
 @pytest.mark.asyncio
 async def test_quantization_floor_spellings_route_differently(performance_app):
     # off / auto / explicit tier are three different routing outcomes on the
-    # same catalog: the modal fp8 floor is what drops the 4-bit endpoint.
+    # same catalog: the derived 8-bit floor is what drops the 4-bit endpoint.
     rows_side_by_side = [_priced("four", 100, 100, "fp4"), _priced("eight1", 100, 100, "fp8"), _priced("eight2", 100, 100, "fp8")]
 
     def handler(request, _body):

@@ -71,13 +71,13 @@ def row_bits(row: dict) -> int | None:
 
 
 def quantization_floor(rows: list[object]) -> int | None:
-    """Modal observed bit width, ties resolved to the lower tier. None when no
-    row reports a recognized width."""
+    """Median observed bit width, rounded up to the next tier. None when no row
+    reports a recognized width."""
     widths = [bits for row in rows if isinstance(row, dict) and (bits := row_bits(row)) is not None]
     if not widths:
         return None
-    mode = max((widths.count(w), -w) for w in set(widths))
-    return -mode[1]
+    median = _median(widths)
+    return min(tier for tier in _QUANT_TIERS if tier >= median)
 
 
 def quantization_values(floor: int, include_unknown: bool = True) -> list[str]:
