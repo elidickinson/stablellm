@@ -351,6 +351,12 @@ def _mark_down(idx: int, reason: str, request_context: str = ""):
     log.warning("endpoint %s marked down for %ss%s: %s", ep.base_url, cooloff, context, _clip(reason))
 
 
+def _count_success(idx: int):
+    """Record a genuinely healthy completion for the endpoint. Streaming defers
+    this to the stream's terminal finally; buffered/race call it on success."""
+    _stats["successes"][idx] += 1
+
+
 class UpstreamError(Exception):
     pass
 
@@ -462,7 +468,38 @@ def _authenticate(authorization: str | None, req_id: str = "") -> tuple[str, JSO
     return keyname, None
 
 
-def _extract_usage_from_sse(buffer: bytearray, chunk: bytes) -> int | None:
+def _sse_error_detail(obj: dict) -> str | None:
+    """Error detail from a single SSE data event, e.g.
+    ``{"error": {"message": "...", "code": ...}}``, or None if the event is healthy.
+
+    Providers signal backend failure mid-stream with a top-level ``error`` field
+    (the OpenAI JS SDK throws on exactly this), and the event may carry no
+    ``choices`` at all, so status/usage checks alone miss it."""
+    err = obj.get("error")
+    if not err:
+        return None
+    if isinstance(err, dict):
+        message = str(err.get("message") or "")
+        bits = [str(err[k]) for k in ("code", "type") if err.get(k) is not None]
+        if message:
+            bits.insert(0, message)
+        detail = "; ".join(bits) or json.dumps(err, ensure_ascii=False)
+    else:
+        detail = str(err)
+    return _clip(detail)
+
+
+def _body_error_detail(data: dict) -> str | None:
+    """Same detection for a buffered (non-SSE) response body."""
+    return _sse_error_detail(data)
+
+
+def _scan_sse_events(buffer: bytearray, chunk: bytes) -> tuple[int | None, str | None]:
+    """Consume complete data events from the stream. Returns (completion_tokens,
+    error_detail), each the first/best seen in this chunk or None. The buffer is
+    mutated destructively (events are consumed exactly once)."""
+    tokens: int | None = None
+    error: str | None = None
     buffer.extend(chunk)
     while b"\n\n" in buffer:
         event, _, rest = buffer.partition(b"\n\n")
@@ -478,16 +515,22 @@ def _extract_usage_from_sse(buffer: bytearray, chunk: bytes) -> int | None:
                     continue
                 if not isinstance(obj, dict):
                     continue
-                usage = obj.get("usage")
-                if isinstance(usage, dict):
-                    ct = usage.get("completion_tokens")
-                    if ct is not None:
-                        return ct
-    return None
+                if error is None:
+                    error = _sse_error_detail(obj)
+                if tokens is None:
+                    usage = obj.get("usage")
+                    if isinstance(usage, dict):
+                        ct = usage.get("completion_tokens")
+                        if ct is not None:
+                            tokens = ct
+    return tokens, error
 
 
 def _has_openai_sse_event(content: bytes) -> bool:
-    """Whether a completed body contains an OpenAI-style SSE data event."""
+    """Whether a completed body contains a healthy OpenAI-style SSE data event.
+
+    An event carrying a top-level ``error`` doesn't count -- it means the
+    provider failed, not that it served well."""
     for line in content.splitlines():
         if not line.startswith(b"data:"):
             continue
@@ -499,15 +542,20 @@ def _has_openai_sse_event(content: bytes) -> bool:
         except json.JSONDecodeError:
             continue
         if isinstance(event, dict):
+            if _sse_error_detail(event) is not None:
+                return False
             return True
     return False
 
 
-async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, metrics, request_context: str, on_done=None):
+async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, metrics, request_context: str, on_done=None, on_failure=None, on_success=None):
     """Stream response from upstream. Returns (StreamingResponse, None) or (None, reason).
 
-    on_done (optional) fires once the stream has been fully consumed; every
-    earlier exit leaves cleanup to the caller."""
+    The terminal outcome isn't known until the stream finishes, so the lifecycle
+    hooks fire from the generator's finally: on_success() only when the stream
+    completed healthy; on_failure(reason) when upstream was at fault (mid-stream
+    error event or dropped connection) so the caller can cool the endpoint off;
+    on_done() always (slot release). A client abort is none of these."""
     url = f"{ep.base_url}/{path}"
     t0 = time.monotonic()
     req = http_client.build_request("POST", url, headers=headers, content=body)
@@ -553,7 +601,15 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
                 pass
         metrics.via = via or ""
 
+        # Mid-stream upstream error events (e.g. a chunk carrying a top-level
+        # "error") are proxied to the client verbatim -- the client sees exactly
+        # what the provider sent -- then we stop iterating: waiting on a failed
+        # generation only delays the client retrying. The terminal bookkeeping
+        # (status, mark-down) happens in the generator's finally.
+        upstream_failed = False
+
         async def generate():
+            nonlocal upstream_failed
             t_first = None
             completion_tokens = None
             sse_buf = bytearray()
@@ -561,21 +617,33 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
             try:
                 yield b""  # placeholder, consumed by the priming step below
                 for chunk in primed:
-                    ct = _extract_usage_from_sse(sse_buf, chunk)
+                    ct, err = _scan_sse_events(sse_buf, chunk)
                     if ct is not None:
                         completion_tokens = ct
+                    if err is not None:
+                        upstream_failed = True
+                        outcome = "error"
+                        metrics.reason = err
                     if t_first is None:
                         t_first = time.monotonic()
                     yield chunk
-                async for chunk in byte_iter:
-                    if t_first is None:
-                        t_first = time.monotonic()
-                        metrics.ttft_ms = (t_first - t0) * 1000
-                        log.debug("req=%s %s TTFT %.0fms (TTFB %.0fms)", metrics.req_id, ep.provider, metrics.ttft_ms, ttfb * 1000)
-                    ct = _extract_usage_from_sse(sse_buf, chunk)
-                    if ct is not None:
-                        completion_tokens = ct
-                    yield chunk
+                    if upstream_failed:
+                        break
+                if not upstream_failed:
+                    async for chunk in byte_iter:
+                        if t_first is None:
+                            t_first = time.monotonic()
+                            metrics.ttft_ms = (t_first - t0) * 1000
+                            log.debug("req=%s %s TTFT %.0fms (TTFB %.0fms)", metrics.req_id, ep.provider, metrics.ttft_ms, ttfb * 1000)
+                        ct, err = _scan_sse_events(sse_buf, chunk)
+                        if ct is not None:
+                            completion_tokens = ct
+                        yield chunk
+                        if err is not None:
+                            upstream_failed = True
+                            outcome = "error"
+                            metrics.reason = err
+                            break
             except (asyncio.CancelledError, GeneratorExit):
                 # Client hung up mid-stream (or response was closed early).
                 outcome = "aborted"
@@ -592,6 +660,10 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
                         metrics.tokens_per_sec = completion_tokens / duration
                 metrics.tokens = completion_tokens
                 metrics.status = outcome
+                if outcome in ("error", "interrupted") and on_failure is not None:
+                    on_failure(metrics.reason or outcome)
+                if outcome == "200" and on_success is not None:
+                    on_success()
                 if on_done:
                     on_done()
                 await asyncio.to_thread(requestlog.log_request, metrics)
@@ -641,6 +713,14 @@ async def _proxy_buffered(ep: Endpoint, path: str, headers: dict, body: bytes, m
             reason = f"{reason}: {detail}"
         log.warning("upstream returned invalid JSON from %s (%s): %s", ep.base_url, request_context, reason)
         return None, reason
+
+    # A 200 JSON body can still be an upstream failure (top-level "error").
+    # This path is pre-commit, so it fails over like any other rejection.
+    if isinstance(data, dict):
+        if body_err := _body_error_detail(data):
+            reason = f"error body: {body_err}"
+            log.warning("upstream returned 200 with error body from %s (%s): %s", ep.base_url, request_context, reason)
+            return None, reason
 
     metrics.elapsed_ms = elapsed * 1000
     usage = data.get("usage")
@@ -1208,10 +1288,16 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                     candidate_body = b"".join(buffers[idx])
                     try:
                         if is_streaming:
+                            _tokens, err = _scan_sse_events(bytearray(), candidate_body)
+                            if err is not None:
+                                raise ValueError(f"stream error: {err}")
                             if not _has_openai_sse_event(candidate_body):
                                 raise ValueError("no valid data event")
                         else:
-                            json.loads(candidate_body)
+                            parsed = json.loads(candidate_body)
+                            if isinstance(parsed, dict):
+                                if body_err := _body_error_detail(parsed):
+                                    raise ValueError(f"error body: {body_err}")
                     except Exception as exc:  # noqa: BLE001 - malformed output must not win
                         kind = "SSE" if is_streaming else "JSON"
                         detail = f"invalid {kind}: {_exception_detail(exc)}"
@@ -1324,7 +1410,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         via = _provider_from_sse(win_body) if _openrouter_via(ep) else None
         race_metrics.via = via or ""
         race_metrics.ttft_ms = first_byte_at[win_idx] * 1000
-        completion_tokens = _extract_usage_from_sse(bytearray(), win_body)
+        completion_tokens, _ = _scan_sse_events(bytearray(), win_body)
         if completion_tokens is not None:
             duration = win_completion - first_byte_at[win_idx]
             if duration > 0:
@@ -1362,7 +1448,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         if via:
             result.headers["X-StableLLM-Via"] = via
 
-    _stats["successes"][win_idx] += 1
+    _count_success(win_idx)
     _set_session_pin(group, session_key, win_idx, race_metrics.via or None)
     _set_meta_headers(result, provider=ep.provider, model=model_name, mode=config.MODE_RACE, group=group, via=race_metrics.via or None, pin=race_pin)
     return result, True
@@ -2120,10 +2206,12 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         )
 
         release = _slot_releaser(ep, model_name)
+        mark_failed = lambda r: _mark_down(idx, r, request_context)  # noqa: E731 - bound endpoint idx
+        count_success = lambda: _count_success(idx)  # noqa: E731 - bound endpoint idx
         owns_release = True
         try:
             if is_streaming:
-                result, reason = await _proxy_stream(ep, path, headers, send_body, metrics, request_context, on_done=release)
+                result, reason = await _proxy_stream(ep, path, headers, send_body, metrics, request_context, on_done=release, on_failure=mark_failed, on_success=count_success)
                 if result is not None:
                     # Ownership moved to the response generator: the slot is
                     # held until the client has consumed the whole stream.
@@ -2136,14 +2224,18 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
                 stripped = _strip_unsupported(body_dict, ep)
                 send_body = json.dumps(stripped).encode()
                 if is_streaming:
-                    result, reason = await _proxy_stream(ep, path, headers, send_body, metrics, request_context, on_done=release)
+                    result, reason = await _proxy_stream(ep, path, headers, send_body, metrics, request_context, on_done=release, on_failure=mark_failed, on_success=count_success)
                     if result is not None:
                         owns_release = False
                 else:
                     result, reason = await _proxy_buffered(ep, path, headers, send_body, metrics, request_context)
 
             if result is not None:
-                _stats["successes"][idx] += 1
+                # Success = a genuinely healthy completion. Streaming's terminal
+                # outcome isn't known yet here, so it counts via on_success when
+                # the generator's finally runs; buffered knows already.
+                if not is_streaming:
+                    _count_success(idx)
                 _set_session_pin(group_name, session_key, idx, result.headers.get("X-StableLLM-Via"))
                 if had_pin:
                     pin = f"{'hit' if idx == pinned_idx else 'bounce'}; home={pin_home}"

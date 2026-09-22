@@ -352,6 +352,103 @@ async def test_streaming_failover_emits_single_terminal_row(proxy_app, monkeypat
     assert [m.status for m in rows] == ["200"]
 
 
+@pytest.mark.asyncio
+async def test_midstream_error_event_is_failure_and_marks_down(proxy_app, monkeypatch):
+    """Regression: a 200 SSE stream carrying a top-level {"error": ...} chunk must
+    not be counted a success. The client receives the chunks verbatim (it renders
+    the error itself), but the proxy logs status=error and cools the endpoint off.
+
+    Mirrors the neuralwatt incident: "The inference backend encountered an
+    internal error. Please retry shortly." arrived mid-stream under HTTP 200 and
+    stablellm logged it as a clean 200.
+    """
+    sse_body = (
+        b'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
+        b'data: {"error":{"message":"The inference backend encountered an internal error. Please retry shortly.","code":500}}\n\n'
+    )
+
+    async def broken_stream():
+        yield sse_body
+
+    def handler(req):
+        if req.url.host == "a.test":
+            return httpx.Response(200, content=broken_stream(), headers={"content-type": "text/event-stream"})
+        return httpx.Response(200, content=b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+                              headers={"content-type": "text/event-stream"})
+
+    app, _calls, main = proxy_app(
+        {
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k"},
+                "b": {"base_url": "https://b.test", "api_key": "k"},
+            },
+            "groups": {"default": {"endpoints": [{"provider": "a"}, {"provider": "b"}]}},
+        },
+        handler,
+    )
+    rows: list[object] = []
+    monkeypatch.setattr(main.requestlog, "log_request", rows.append)
+
+    # First request hits a, gets the error chunk verbatim but a terminal error row.
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c, \
+            c.stream("POST", "/v1/chat/completions", json={"model": "default", "stream": True, "messages": []}) as resp:
+        assert resp.status_code == 200
+        body = b"".join([chunk async for chunk in resp.aiter_bytes()])
+    # Client still sees the provider's error chunk verbatim (unmasked).
+    assert b"inference backend" in body
+
+    assert len(rows) == 1
+    metrics = rows[0]
+    assert metrics.status == "error"
+    assert "inference backend" in (metrics.reason or "")
+    # The endpoint that served a mid-stream error cools off like any other failure.
+    assert main._stats["failures"][0] == 1
+    assert main._cooloff_until.get(0, 0) > time.monotonic()
+    # A mid-stream error is NOT a success: success is only counted on a clean finish.
+    assert main._stats["successes"][0] == 0
+    assert main._stats["requests"][0] == 1
+
+    # Second request: a is cooling off, so failover to b (healthy stream).
+    rows.clear()
+    resp2 = await _post(app, {"model": "default", "messages": [], "stream": True})
+    assert resp2.status_code == 200
+    assert [m.status for m in rows] == ["200"]
+    assert all(m.provider_served != "a" for m in rows)
+    # The healthy failover's success IS counted.
+    assert main._stats["successes"][1] == 1
+
+
+@pytest.mark.asyncio
+async def test_buffered_200_with_error_body_fails_over(proxy_app, monkeypatch):
+    """A non-stream 200 JSON body with a top-level {"error": ...} is a failure,
+    not a success: it fails over to the next endpoint and only the failover logs."""
+    def handler(req):
+        if req.url.host == "a.test":
+            return httpx.Response(200, json={"error": {"message": "The inference backend encountered an internal error. Please retry shortly.", "code": 500}})
+        return _ok_response()
+
+    app, calls, main = proxy_app(
+        {
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k"},
+                "b": {"base_url": "https://b.test", "api_key": "k"},
+            },
+            "groups": {"default": {"endpoints": [{"provider": "a"}, {"provider": "b"}]}},
+        },
+        handler,
+    )
+    rows: list[object] = []
+    monkeypatch.setattr(main.requestlog, "log_request", rows.append)
+
+    resp = await _post(app, {"model": "default", "messages": []})
+    assert resp.status_code == 200
+    assert [c[0] for c in calls] == ["https://a.test", "https://b.test"]
+    # a is marked down; only the healthy failover attempt logged a row.
+    assert main._stats["failures"][0] == 1
+    assert [m.status for m in rows] == ["200"]
+    assert rows[0].provider_served == "b"
+
+
 # --- dashboard: manual down affects routing ---
 
 @pytest.mark.asyncio
@@ -668,6 +765,44 @@ async def test_race_malformed_stream_body_cannot_win(proxy_app):
     assert resp.status_code == 200
     assert resp.headers["x-stablellm-provider"] == "b"
     assert main._last_failure[0].startswith("invalid SSE")
+
+
+@pytest.mark.asyncio
+async def test_race_error_body_cannot_win(proxy_app):
+    """A candidate whose non-stream 200 body carries a top-level error loses the
+    race; a slower healthy candidate wins. Error bodies return fast, so without
+    this check the broken backend would systematically win races."""
+    async def handler(req):
+        if req.url.host == "a.test":
+            return httpx.Response(200, json={"error": {"message": "The inference backend encountered an internal error. Please retry shortly.", "code": 500}})
+        await asyncio.sleep(0.01)
+        return _ok_response({"who": "b"})
+
+    app, _calls, main = proxy_app(_TWO_PROVIDER_RACE_CFG, handler)
+    resp = await _post(app, {"model": "fast:race", "messages": []})
+    assert resp.status_code == 200
+    assert resp.json()["who"] == "b"
+    assert "error body" in main._last_failure[0]
+
+
+@pytest.mark.asyncio
+async def test_race_stream_error_body_cannot_win(proxy_app):
+    """A candidate whose SSE stream is an error event loses the race."""
+    async def handler(req):
+        if req.url.host == "a.test":
+            return httpx.Response(
+                200,
+                content=b'data: {"error":{"message":"inference backend down","code":500}}\n\n',
+                headers={"content-type": "text/event-stream"},
+            )
+        await asyncio.sleep(0.01)
+        return httpx.Response(200, content=b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', headers={"content-type": "text/event-stream"})
+
+    app, _calls, main = proxy_app(_TWO_PROVIDER_RACE_CFG, handler)
+    resp = await _post(app, {"model": "fast:race", "stream": True, "messages": []})
+    assert resp.status_code == 200
+    assert resp.headers["x-stablellm-provider"] == "b"
+    assert "stream error" in main._last_failure[0]
 
 
 @pytest.mark.asyncio

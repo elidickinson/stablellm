@@ -118,7 +118,7 @@ def log_request(m: RequestMetrics):
     """Record the request in SQLite (if enabled) and emit the console summary line."""
     if m.status.startswith("5"):
         level = logging.ERROR
-    elif m.status == "interrupted":
+    elif m.status in ("interrupted", "error"):
         level = logging.WARNING
     else:
         level = logging.INFO

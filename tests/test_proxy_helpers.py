@@ -20,36 +20,72 @@ def main_module(monkeypatch, tmp_path):
     return main
 
 
-# --- _extract_usage_from_sse ---
+# --- _scan_sse_events ---
 
 def test_sse_extracts_completion_tokens_from_finished_event(main_module):
     buf = bytearray()
     chunk = b'data: {"usage": {"completion_tokens": 42}}\n\n'
-    assert main_module._extract_usage_from_sse(buf, chunk) == 42
+    assert main_module._scan_sse_events(buf, chunk) == (42, None)
 
 
 def test_sse_returns_none_until_event_terminator_seen(main_module):
     buf = bytearray()
     # Partial event — no \n\n terminator yet
-    assert main_module._extract_usage_from_sse(buf, b'data: {"usage": {"completion_tokens": 7}}') is None
+    assert main_module._scan_sse_events(buf, b'data: {"usage": {"completion_tokens": 7}}') == (None, None)
     # Now flush the terminator
-    assert main_module._extract_usage_from_sse(buf, b"\n\n") == 7
+    assert main_module._scan_sse_events(buf, b"\n\n") == (7, None)
 
 
 def test_sse_skips_done_sentinel(main_module):
     buf = bytearray()
-    assert main_module._extract_usage_from_sse(buf, b"data: [DONE]\n\n") is None
+    assert main_module._scan_sse_events(buf, b"data: [DONE]\n\n") == (None, None)
 
 
 def test_sse_ignores_events_without_usage(main_module):
     buf = bytearray()
     chunk = b'data: {"choices": [{"delta": {"content": "hi"}}]}\n\n'
-    assert main_module._extract_usage_from_sse(buf, chunk) is None
+    assert main_module._scan_sse_events(buf, chunk) == (None, None)
 
 
 def test_sse_tolerates_malformed_json(main_module):
     buf = bytearray()
-    assert main_module._extract_usage_from_sse(buf, b"data: {not json\n\n") is None
+    assert main_module._scan_sse_events(buf, b"data: {not json\n\n") == (None, None)
+
+
+def test_sse_detects_top_level_error_event(main_module):
+    """Mid-stream upstream failure: an SSE data event with a truthy top-level error."""
+    buf = bytearray()
+    chunk = b'data: {"error": {"message": "The inference backend encountered an internal error. Please retry shortly.", "code": 500, "type": "server_error"}}\n\n'
+    tokens, err = main_module._scan_sse_events(buf, chunk)
+    assert tokens is None
+    assert err is not None
+    assert "inference backend" in err
+    assert "500" in err and "server_error" in err
+
+
+def test_sse_ignores_null_error(main_module):
+    buf = bytearray()
+    chunk = b'data: {"choices": [{"delta": {"content": "hi"}}], "error": null}\n\n'
+    assert main_module._scan_sse_events(buf, chunk) == (None, None)
+
+
+def test_sse_error_split_across_chunks(main_module):
+    """The error event can be split across byte chunks; only complete events parse."""
+    buf = bytearray()
+    part1 = b'data: {"error": {"message": "boom'
+    part2 = b'", "code": 502}}\n\n'
+    assert main_module._scan_sse_events(buf, part1) == (None, None)
+    tokens, err = main_module._scan_sse_events(buf, part2)
+    assert tokens is None
+    assert err == "boom; 502"
+
+
+def test_body_error_detail_variants(main_module):
+    err = main_module._body_error_detail({"error": {"message": "bad", "code": 503}})
+    assert err == "bad; 503"
+    assert main_module._body_error_detail({"error": "plain string"}) == "plain string"
+    assert main_module._body_error_detail({"choices": []}) is None
+    assert main_module._body_error_detail({"error": None}) is None
 
 
 @pytest.mark.asyncio
