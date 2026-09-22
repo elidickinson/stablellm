@@ -19,6 +19,13 @@ _QUANT_BITS = {
 _QUANT_TIERS = frozenset({4, 8, 16, 32})
 _QUANT_TIER_LABELS = "auto (derived), 4, 8, 16, 32, none"
 _QUANT_FLOOR_AUTO = "auto"
+# The selector's short forms cover their long-form variants, so `fp4` admits a
+# row reporting `mxfp4`. int4 is a separate family from fp4.
+_QUANT_FAMILY = {"mxfp4": "fp4", "nvfp4": "fp4", "mxfp8": "fp8"}
+
+# Catalog pricing fields the local cap can compare. `request` and `image` are
+# passed through to OpenRouter, which enforces them.
+_PRICE_FIELDS = frozenset({"prompt", "completion"})
 
 
 @dataclass(frozen=True)
@@ -70,6 +77,11 @@ def row_bits(row: dict) -> int | None:
     return _QUANT_BITS.get(row.get("quantization"))
 
 
+def quant_family(value: object) -> object:
+    """Fold a reported quantization into the short form the selector accepts."""
+    return _QUANT_FAMILY.get(value, value)
+
+
 def quantization_floor(rows: list[object]) -> int | None:
     """Median observed bit width, rounded up to the next tier. None when no row
     reports a recognized width."""
@@ -103,7 +115,7 @@ def row_passes(row: dict, caps: dict[str, float] | None, quant_values: frozenset
             # A free row's zero price satisfies the cap.
             if not 0 <= price <= cap:
                 return False
-    return quant_values is None or row.get("quantization") in quant_values
+    return quant_values is None or quant_family(row.get("quantization")) in quant_values
 
 
 def matches_provider_tag(tag: str, allowed: str) -> bool:
@@ -148,7 +160,7 @@ def derive_constraints(rows: list[object], policy: PerformanceRouting, provider:
     None, quantizations emitted or None, eligible rows, effective floor bit
     width or None); returns None when the constraints exclude every row."""
     static_quant = provider.get("quantizations")
-    quant_values = frozenset(static_quant) if isinstance(static_quant, list) and static_quant else None
+    quant_values = frozenset(map(quant_family, static_quant)) if isinstance(static_quant, list) and static_quant else None
     floor = None
     static_price = provider.get("max_price") if isinstance(provider.get("max_price"), dict) else None
     if policy.price_cap_tolerance is not None and static_price is None:
@@ -163,7 +175,7 @@ def derive_constraints(rows: list[object], policy: PerformanceRouting, provider:
     # enforce the sent values on the per-token scale. A static cap governs
     # filtering even when the derived rule is off.
     caps = (
-        {field: value / 1e6 for field, value in static_price.items()}
+        {field: value / 1e6 for field, value in static_price.items() if field in _PRICE_FIELDS}
         if static_price is not None
         else None
     )
@@ -176,11 +188,11 @@ def derive_constraints(rows: list[object], policy: PerformanceRouting, provider:
             # lowest observed width excludes nothing and is skipped.
             if requested != _QUANT_FLOOR_AUTO or floor > lowest:
                 emitted = quantization_values(floor, policy.include_unknown_quantization)
-                quant_values = frozenset(emitted)
+                quant_values = frozenset(map(quant_family, emitted))
                 provider["quantizations"] = emitted
     else:
         # A static list states its own floor, so the log can report it.
-        floor = min((bits for row in rows if row.get("quantization") in quant_values and (bits := row_bits(row)) is not None), default=None)
+        floor = min((bits for row in rows if (bits := row_bits(row)) is not None and quant_family(row.get("quantization")) in quant_values), default=None)
     eligible = [row for row in rows if isinstance(row, dict) and row_passes(row, caps, quant_values)]
     applied_floor = floor if quant_values is not None else None
     return (provider.get("max_price"), provider.get("quantizations"), eligible, applied_floor) if eligible else None

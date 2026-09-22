@@ -107,6 +107,40 @@ def test_static_quantizations_report_their_own_floor():
     assert floor == 8
 
 
+def test_static_quantizations_short_form_admits_long_form_rows():
+    # `fp4` is the selector's short form for the whole family, so a row
+    # reporting `mxfp4` has to survive it. int4 is a different family.
+    rows = [
+        _row("long", "1e-06", "1e-06", "mxfp4"),
+        _row("int", "1e-06", "1e-06", "int4"),
+        _row("other", "1e-06", "1e-06", "fp8"),
+    ]
+    _caps, _quants, eligible, floor = derive_constraints(rows, PerformanceRouting(), {"quantizations": ["fp4"]})
+    assert [row["tag"] for row in eligible] == ["long"]
+    assert floor == 4
+
+
+def test_static_max_price_ignores_fields_the_catalog_cannot_express():
+    # A static cap keeps keys for fields rows do not price per token; they are
+    # sent to OpenRouter but cannot take part in local filtering.
+    rows = [_row("a", "2e-06", "4e-06", "fp8")]
+    caps, _quants, eligible, _floor = derive_constraints(
+        rows,
+        PerformanceRouting(price_cap_tolerance=None),
+        {"max_price": {"prompt": 3.0, "completion": 5.0, "image": 0.03}},
+    )
+    assert caps == {"prompt": 3.0, "completion": 5.0, "image": 0.03}
+    assert [row["tag"] for row in eligible] == ["a"]
+
+
+def test_static_max_price_still_excludes_rows_over_the_cap():
+    rows = [_row("cheap", "1e-06", "1e-06", "fp8"), _row("dear", "9e-06", "1e-06", "fp8")]
+    _caps, _quants, eligible, _floor = derive_constraints(
+        rows, PerformanceRouting(price_cap_tolerance=None), {"max_price": {"prompt": 2.0}},
+    )
+    assert [row["tag"] for row in eligible] == ["cheap"]
+
+
 def test_ranking_runs_inside_the_constraints():
     # The 4-bit endpoint is fastest overall; the floor must remove it before
     # ranking so it cannot anchor the speed window.
