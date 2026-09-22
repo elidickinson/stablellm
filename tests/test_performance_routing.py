@@ -135,6 +135,26 @@ def test_static_quantizations_short_form_admits_long_form_rows():
     assert floor == 4
 
 
+def test_malformed_catalog_quantization_values_never_crash():
+    # A row's quantization comes from the upstream catalog, so any JSON type can
+    # arrive. Anything that is not a name matches nothing rather than raising.
+    rows = [
+        _row("fp4", "1e-06", "1e-06", "fp4"),
+        _row("fp4b", "1e-06", "1e-06", "fp4"),
+        _row("fp8", "1e-06", "1e-06", "fp8"),
+        _row("fp8b", "1e-06", "1e-06", "fp8"),
+    ]
+    for bad in ([], {}, ["fp4"], 5, True, None):
+        junk = {**_row("junk", "1e-06", "1e-06", "fp8"), "quantization": bad}
+        eligible, _floor = derive_constraints(rows + [junk], PerformanceRouting(), {})
+        assert "junk" not in [row["tag"] for row in eligible], bad
+        # A static list takes the same path.
+        eligible, _floor = derive_constraints(
+            [_row("fp8", "1e-06", "1e-06", "fp8"), junk], PerformanceRouting(), {"quantizations": ["fp8"]},
+        )
+        assert [row["tag"] for row in eligible] == ["fp8"], bad
+
+
 def test_static_quantizations_long_form_is_not_a_short_form():
     # The reverse does not hold: the selector reads `mxfp4` as itself, so a
     # plain-fp4 row must not satisfy it (verified live against OpenRouter).

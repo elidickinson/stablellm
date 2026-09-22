@@ -90,14 +90,17 @@ def row_bits(row: dict[str, Any]) -> int | None:
     return _QUANT_BITS.get(quantization) if isinstance(quantization, str) else None
 
 
-def quant_family(value: object) -> object:
+def quant_family(value: str) -> str:
     """Fold a reported quantization into the short form the selector accepts."""
-    return _QUANT_FAMILY.get(value, value) if isinstance(value, str) else value
+    return _QUANT_FAMILY.get(value, value)
 
 
 def quant_allowed(reported: object, allowed: frozenset[str]) -> bool:
     """Whether a row's reported quantization satisfies the selector's list: an
-    exact name, or the short form that covers it."""
+    exact name, or the short form that covers it. A value of another type is not
+    a name, so it matches nothing."""
+    if not isinstance(reported, str):
+        return False
     return reported in allowed or quant_family(reported) in allowed
 
 
