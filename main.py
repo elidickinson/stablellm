@@ -542,9 +542,7 @@ def _has_openai_sse_event(content: bytes) -> bool:
         except json.JSONDecodeError:
             continue
         if isinstance(event, dict):
-            if _sse_error_detail(event) is not None:
-                return False
-            return True
+            return _sse_error_detail(event) is None
     return False
 
 
@@ -716,11 +714,10 @@ async def _proxy_buffered(ep: Endpoint, path: str, headers: dict, body: bytes, m
 
     # A 200 JSON body can still be an upstream failure (top-level "error").
     # This path is pre-commit, so it fails over like any other rejection.
-    if isinstance(data, dict):
-        if body_err := _body_error_detail(data):
-            reason = f"error body: {body_err}"
-            log.warning("upstream returned 200 with error body from %s (%s): %s", ep.base_url, request_context, reason)
-            return None, reason
+    if isinstance(data, dict) and (body_err := _body_error_detail(data)):
+        reason = f"error body: {body_err}"
+        log.warning("upstream returned 200 with error body from %s (%s): %s", ep.base_url, request_context, reason)
+        return None, reason
 
     metrics.elapsed_ms = elapsed * 1000
     usage = data.get("usage")
@@ -1299,9 +1296,8 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                                 raise ValueError("no valid data event")
                         else:
                             parsed = json.loads(candidate_body)
-                            if isinstance(parsed, dict):
-                                if body_err := _body_error_detail(parsed):
-                                    raise ValueError(f"error body: {body_err}")
+                            if isinstance(parsed, dict) and (body_err := _body_error_detail(parsed)):
+                                raise ValueError(f"error body: {body_err}")
                     except Exception as exc:  # noqa: BLE001 - malformed output must not win
                         kind = "SSE" if is_streaming else "JSON"
                         detail = f"invalid {kind}: {_exception_detail(exc)}"
@@ -2210,8 +2206,8 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         )
 
         release = _slot_releaser(ep, model_name)
-        mark_failed = lambda r: _mark_down(idx, r, request_context)  # noqa: E731 - bound endpoint idx
-        count_success = lambda: _count_success(idx)  # noqa: E731 - bound endpoint idx
+        mark_failed = lambda r, idx=idx, request_context=request_context: _mark_down(idx, r, request_context)
+        count_success = lambda idx=idx: _count_success(idx)
         owns_release = True
         try:
             if is_streaming:
