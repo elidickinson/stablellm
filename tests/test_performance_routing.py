@@ -95,6 +95,15 @@ def test_quantization_floor_off_disables_derivation():
     assert [row["tag"] for row in eligible] == ["a", "b", "c"]
 
 
+def test_static_quantizations_report_their_own_floor():
+    # The log line's quant= field is the effective floor bit width: the minimum
+    # of the author's own list, not a None that prints as "Nonebit".
+    rows = [_row("a", "1e-06", "1e-06", "fp8"), _row("b", "1e-06", "1e-06", "bf16")]
+    _caps, quants, _eligible, floor = derive_constraints(rows, PerformanceRouting(), {"quantizations": ["fp8", "bf16"]})
+    assert quants == ["fp8", "bf16"]
+    assert floor == 8
+
+
 def test_ranking_runs_inside_the_constraints():
     # The 4-bit endpoint is fastest overall; the floor must remove it before
     # ranking so it cannot anchor the speed window.
@@ -115,6 +124,17 @@ def test_static_constraints_govern_filtering_and_are_emitted_verbatim():
     )
     assert derived == {"prompt": 2}
     assert quants == ["fp8", "unknown"]
+    assert [row["tag"] for row in eligible] == ["cheap"]
+
+
+def test_static_constraints_govern_filtering_with_derived_rules_off():
+    # The derived rule being off must not stop a static cap from filtering:
+    # emitting it while sending the rows it forbids gets the request 404'd.
+    rows = [_row("cheap", "1e-06", "2e-06", "fp8"), _row("dear", "9e-05", "9e-05", "fp8")]
+    derived, _quants, eligible, _floor = derive_constraints(
+        rows, PerformanceRouting(price_cap_tolerance=None), {"max_price": {"prompt": 2.0, "completion": 2.0}},
+    )
+    assert derived == {"prompt": 2.0, "completion": 2.0}
     assert [row["tag"] for row in eligible] == ["cheap"]
 
 
@@ -183,11 +203,69 @@ async def _post(app):
         })
 
 
-def _priced(tag, latency, throughput):
+@pytest.mark.asyncio
+async def test_static_only_disjoint_from_ranked_tags_is_dropped(performance_app):
+    # The constraint is hard, the speed optimization is not: a static `only`
+    # naming no rankable tag sends no `only` at all rather than a 404.
+    rows = [_priced("fast", 400, 100), _priced("slow", 100, 60)]
+
+    def handler(request, _body):
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": {"endpoints": rows}})
+        return httpx.Response(200, json={"choices": [], "usage": {"completion_tokens": 1}})
+
+    app, calls = performance_app(handler, _test_config([{
+        "provider": "openrouter",
+        "model": "author/model",
+        "performance_routing": {},
+        "routing": {"only": ["nomatch"]},
+    }]))
+    assert (await _post(app)).status_code == 200
+    provider = calls[1][2]["provider"]
+    assert "only" not in provider
+    # The constraints reached OpenRouter without the dropped allowlist.
+    assert provider["max_price"] == {"prompt": 2.3, "completion": 4.6}
+    assert provider["allow_fallbacks"] is True
+
+
+@pytest.mark.asyncio
+async def test_quantization_floor_spellings_route_differently(performance_app):
+    # off / auto / explicit tier are three different routing outcomes on the
+    # same catalog: the modal fp8 floor is what drops the 4-bit endpoint.
+    rows_side_by_side = [_priced("four", 100, 100, "fp4"), _priced("eight1", 100, 100, "fp8"), _priced("eight2", 100, 100, "fp8")]
+
+    def handler(request, _body):
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": {"endpoints": rows_side_by_side}})
+        return httpx.Response(200, json={"choices": [], "usage": {"completion_tokens": 1}})
+
+    async def _only_for(floor):
+        app, calls = performance_app(handler, _test_config([{
+            "provider": "openrouter",
+            "model": "author/model",
+            "performance_routing": {"quantization_floor": floor},
+        }]))
+        assert (await _post(app)).status_code == 200
+        return calls[1][2]["provider"]
+
+    off = await _only_for("none")
+    assert off["only"] == ["four", "eight1", "eight2"]
+    assert "quantizations" not in off
+    # auto derives the mode from the catalog (the fp8 mode over one fp4 row).
+    auto = await _only_for("auto")
+    assert auto["only"] == ["eight1", "eight2"]
+    assert auto["quantizations"] == ["int8", "fp8", "mxfp8", "fp16", "bf16", "fp32", "unknown"]
+    # An explicit tier states the same requirement by name.
+    tier = await _only_for(8)
+    assert tier["only"] == ["eight1", "eight2"]
+    assert tier["quantizations"] == ["int8", "fp8", "mxfp8", "fp16", "bf16", "fp32", "unknown"]
+
+
+def _priced(tag, latency, throughput, quantization="fp8"):
     return {
         **_endpoint(tag, latency, throughput),
         "pricing": {"prompt": "2e-06", "completion": "4e-06"},
-        "quantization": "fp8",
+        "quantization": quantization,
     }
 
 
@@ -198,6 +276,81 @@ def _catalog(rows):
         return httpx.Response(200, json={"choices": [], "usage": {"completion_tokens": 1}})
 
     return handler
+
+
+@pytest.mark.asyncio
+async def test_static_max_price_filters_when_derivation_is_off(performance_app):
+    # The derived rule being off must not stop a static cap from filtering:
+    # emitting it while sending the rows it forbids gets the request 404'd.
+    rows = [
+        {**_priced("dear", 100, 100), "pricing": {"prompt": "1e-4", "completion": "1e-4"}},
+        {**_priced("cheap", 100, 100), "pricing": {"prompt": "2e-6", "completion": "2e-6"}},
+    ]
+
+    def handler(request, _body):
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": {"endpoints": rows}})
+        return httpx.Response(200, json={"provider": "cheap", "choices": [], "usage": {"completion_tokens": 1}})
+
+    app, calls = performance_app(handler, _test_config([{
+        "provider": "openrouter",
+        "model": "author/model",
+        "performance_routing": {"price_cap_tolerance": "none"},
+        "routing": {"max_price": {"prompt": 2.0, "completion": 2.0}},
+    }]))
+    assert (await _post(app)).status_code == 200
+    provider = calls[1][2]["provider"]
+    assert provider["only"] == ["cheap"]
+    assert provider["max_price"] == {"prompt": 2.0, "completion": 2.0}
+
+
+@pytest.mark.asyncio
+async def test_static_quantizations_log_reports_effective_floor(performance_app, capsys):
+    # The static list states its own floor; the log line must report that
+    # tier, never a bogus None-bit width.
+    rows = [_priced("eight", 100, 100, "fp8"), _priced("wide", 100, 100, "bf16")]
+
+    def handler(request, _body):
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": {"endpoints": rows}})
+        return httpx.Response(200, json={"provider": "eight", "choices": [], "usage": {"completion_tokens": 1}})
+
+    app, _calls = performance_app(handler, _test_config([{
+        "provider": "openrouter",
+        "model": "author/model",
+        "performance_routing": {},
+        "routing": {"quantizations": ["fp8", "bf16"]},
+    }]))
+    assert (await _post(app)).status_code == 200
+    logged = capsys.readouterr().err
+    assert "quant=8bit" in logged
+    assert "Nonebit" not in logged
+
+
+@pytest.mark.asyncio
+async def test_stale_only_rejection_retries_without_marking_down(performance_app):
+    # A stale generated allowlist (catalog cached, provider stopped serving the
+    # model) is our own selection being rejected, not an endpoint failure: the
+    # request retries with the raw routing and nothing is cooled off.
+    post_calls = 0
+
+    def handler(request, _body):
+        nonlocal post_calls
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": {"endpoints": [_priced("stale", 400, 100)]}})
+        post_calls += 1
+        if post_calls == 1:
+            return httpx.Response(404, json={"error": {"message": "No allowed providers are available for the selected model. Providers serving author/model: fast; but your request's provider.only preference permits only: stale.", "code": 404}})
+        return httpx.Response(200, json={"provider": "stale", "choices": [], "usage": {"completion_tokens": 1}})
+
+    app, calls = performance_app(handler)
+    assert (await _post(app)).status_code == 200
+    assert calls[1][2]["provider"]["only"] == ["stale"]
+    assert "only" not in calls[2][2]["provider"]
+    main = sys.modules["main"]
+    assert main._stats["successes"][0] == 1
+    assert main._stats["failures"][0] == 0
+    assert main._cooloff_until.get(0, 0) == 0
 
 
 @pytest.mark.asyncio

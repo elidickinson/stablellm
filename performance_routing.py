@@ -31,7 +31,7 @@ class PerformanceRouting:
     include_unknown_quantization: bool = True
 
 
-def price_cap(row_price: float, tolerance: float) -> int:
+def price_cap(row_price: float, tolerance: float) -> float:
     """OpenRouter max_price value for a per-token catalog price: the price
     converted to dollars per million tokens and padded by the tolerance."""
     return round(row_price * 1e6 * (1 + tolerance), 6)
@@ -83,7 +83,7 @@ def quantization_floor(rows: list[object]) -> int | None:
 def quantization_values(floor: int, include_unknown: bool = True) -> list[str]:
     """Vocabulary entries at or above the floor, in OpenRouter's short form,
     plus `unknown` unless excluded."""
-    values = [q for q, bits in _QUANT_BITS.items() if bits >= floor and "/" not in q]
+    values = [q for q, bits in _QUANT_BITS.items() if bits >= floor]
     values.sort(key=_QUANT_BITS.__getitem__)
     if include_unknown:
         values.append("unknown")
@@ -145,26 +145,28 @@ def derive_constraints(rows: list[object], policy: PerformanceRouting, provider:
     author-set static values, and filter the rows to the eligible population.
 
     Writes the emitted provider keys in place and returns (max_price emitted or
-    None, quantizations emitted or None, eligible rows, floor bit width or
-    None); returns None when the constraints exclude every row."""
+    None, quantizations emitted or None, eligible rows, effective floor bit
+    width or None); returns None when the constraints exclude every row."""
     static_quant = provider.get("quantizations")
     quant_values = frozenset(static_quant) if isinstance(static_quant, list) and static_quant else None
     floor = None
-    caps = None
-    if policy.price_cap_tolerance is not None:
-        emitted = provider.get("max_price") if isinstance(provider.get("max_price"), dict) else None
-        if emitted is None:
-            medians = price_caps(rows)
-            if medians is not None:
-                emitted = {
-                    "prompt": price_cap(medians[0], policy.price_cap_tolerance),
-                    "completion": price_cap(medians[1], policy.price_cap_tolerance),
-                }
-                provider["max_price"] = emitted
-        if emitted is not None:
-            # max_price is dollars per million tokens; rows are priced per
-            # token, so enforce the sent values on the per-token scale.
-            caps = {field: value / 1e6 for field, value in emitted.items()}
+    static_price = provider.get("max_price") if isinstance(provider.get("max_price"), dict) else None
+    if policy.price_cap_tolerance is not None and static_price is None:
+        medians = price_caps(rows)
+        if medians is not None:
+            static_price = {
+                "prompt": price_cap(medians[0], policy.price_cap_tolerance),
+                "completion": price_cap(medians[1], policy.price_cap_tolerance),
+            }
+            provider["max_price"] = static_price
+    # max_price is dollars per million tokens; rows are priced per token, so
+    # enforce the sent values on the per-token scale. A static cap governs
+    # filtering even when the derived rule is off.
+    caps = (
+        {field: value / 1e6 for field, value in static_price.items()}
+        if static_price is not None
+        else None
+    )
     if quant_values is None:
         requested = policy.quantization_floor
         floor = quantization_floor(rows) if requested == _QUANT_FLOOR_AUTO else requested
@@ -176,6 +178,9 @@ def derive_constraints(rows: list[object], policy: PerformanceRouting, provider:
                 emitted = quantization_values(floor, policy.include_unknown_quantization)
                 quant_values = frozenset(emitted)
                 provider["quantizations"] = emitted
+    else:
+        # A static list states its own floor, so the log can report it.
+        floor = min((bits for row in rows if row.get("quantization") in quant_values and (bits := row_bits(row)) is not None), default=None)
     eligible = [row for row in rows if isinstance(row, dict) and row_passes(row, caps, quant_values)]
     applied_floor = floor if quant_values is not None else None
     return (provider.get("max_price"), provider.get("quantizations"), eligible, applied_floor) if eligible else None

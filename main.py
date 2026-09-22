@@ -439,7 +439,7 @@ def _no_compatible_provider(reason: str) -> bool:
     """Whether OpenRouter rejected the derived allowlist, price cap, or
     quantization floor because no provider satisfied them."""
     lowered = reason.lower()
-    return "no providers" in lowered or "no compatible provider" in lowered or "no endpoints found" in lowered
+    return any(s in lowered for s in ("no providers", "no compatible provider", "no endpoints found", "no allowed providers"))
 
 
 def _request_context(body: dict, group: str = "", req_id: str = "") -> str:
@@ -843,8 +843,12 @@ async def _apply_performance_routing(body: dict, ep: Endpoint, group: str, sessi
         provider["max_price"] = caps
     if quants:
         provider["quantizations"] = quants
+    # The constraint is hard, the speed optimization is not: a static `only`
+    # disjoint from the ranked tags is dropped, never sent.
     if tags:
         provider["only"] = tags
+    else:
+        provider.pop("only", None)
     if "allow_fallbacks" not in provider:
         provider["allow_fallbacks"] = True
     derivation_line = ""
@@ -852,7 +856,7 @@ async def _apply_performance_routing(body: dict, ep: Endpoint, group: str, sessi
         detail = []
         if caps:
             detail.append(f"caps=p:{caps['prompt']:g},c:{caps['completion']:g}")
-        if quants:
+        if quants and floor_bits is not None:
             detail.append(f"quant={floor_bits}bit")
         detail.append(f"rows={len(eligible)}/{len(rows)}")
         derivation_line = " " + " ".join(detail)
