@@ -87,10 +87,10 @@ class RequestMetrics:
 def _summary_line(m: RequestMetrics) -> str:
     parts = [f"req={m.req_id or '-'}", m.status or "?"]
     parts.append(f"model={m.model_requested}")
-    if m.model_served and m.model_served != m.model_requested:
-        parts.append(f"served={m.model_served}")
     if m.provider_served:
         parts.append(f"provider={m.provider_served}")
+    if m.model_served and m.model_served != m.model_requested:
+        parts.append(f"served={m.model_served}")
     if m.via:
         parts.append(f"via={m.via}")
     if m.mode:

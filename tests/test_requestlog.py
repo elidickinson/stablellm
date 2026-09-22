@@ -120,7 +120,7 @@ def test_summary_line(fresh_requestlog, caplog):
 
     success, failure = caplog.records
     assert success.levelname == "INFO"
-    assert "req=a1b2c3d4e5f6a7b8 200 model=llama-3.3 served=llama-3.3-70b provider=cerebras mode=race stream=yes" in success.getMessage()
+    assert "req=a1b2c3d4e5f6a7b8 200 model=llama-3.3 provider=cerebras served=llama-3.3-70b mode=race stream=yes" in success.getMessage()
     assert "ttfb=181ms ttft=220ms tokens=245 tok/s=78 keyname=alice" in success.getMessage()
     assert failure.levelname == "ERROR"
     assert failure.getMessage().startswith(f"req={'f' * 16} 502 model=llama-3.3")
