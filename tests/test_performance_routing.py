@@ -42,6 +42,16 @@ def test_fast_tags_use_projected_completion_time():
     assert tags == ["fast", "near"]
 
 
+def test_fast_tags_skip_rows_with_malformed_metrics():
+    # A catalog row whose metric field is not a mapping is unusable, not fatal.
+    tags = fast_tags([
+        {"tag": "broken", "latency_last_30m": "oops", "throughput_last_30m": 5},
+        {"tag": "half", "latency_last_30m": {"p50": 100}},
+        _endpoint("good", 100, 100),
+    ], PerformanceRouting())
+    assert tags == ["good"]
+
+
 def test_price_cap_converts_per_token_to_per_million():
     assert price_cap(5e-06, 0.15) == 5.75
 

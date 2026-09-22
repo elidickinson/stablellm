@@ -147,11 +147,11 @@ def fast_tags(endpoints: Iterable[dict[str, Any]], config: PerformanceRouting) -
     scored: list[tuple[str, float]] = []
     for endpoint in endpoints:
         tag = endpoint.get("tag")
-        latency = (endpoint.get("latency_last_30m") or {}).get("p50")
-        throughput = (endpoint.get("throughput_last_30m") or {}).get("p50")
+        latency = _row_number(endpoint, "latency_last_30m", "p50")
+        throughput = _row_number(endpoint, "throughput_last_30m", "p50")
         if not isinstance(tag, str) or not tag:
             continue
-        if not isinstance(latency, (int, float)) or not isinstance(throughput, (int, float)):
+        if latency is None or throughput is None:
             continue
         if latency < 0 or throughput <= 0:
             continue
