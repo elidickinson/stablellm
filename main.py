@@ -852,7 +852,7 @@ async def _apply_performance_routing(body: dict, ep: Endpoint, group: str, sessi
     if caps or quants:
         detail = []
         if caps:
-            detail.append(f"caps=p:{caps['prompt']:g},c:{caps['completion']:g}")
+            detail.append("caps=" + ",".join(f"{field}:{value:g}" for field, value in caps.items()))
         if quants and floor_bits is not None:
             detail.append(f"quant={floor_bits}bit")
         detail.append(f"rows={len(eligible)}/{len(rows)}")

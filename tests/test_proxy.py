@@ -2180,8 +2180,12 @@ async def test_race_cancel_after_racer_completes_releases_slot(proxy_app, monkey
 async def test_cancelled_race_publishes_no_order(proxy_app):
     """A cancelled race measured nothing, so it must not overwrite the order a
     previous race learned with the config order."""
-    async def slow_handler(_req):
-        await asyncio.sleep(0.05)
+    # The racers cannot complete until this gate opens, so whenever the cancel
+    # lands the race is still unfinished -- no timing dependence.
+    gate = asyncio.Event()
+
+    async def gated_handler(_req):
+        await gate.wait()
         return _ok_response()
 
     _app, _calls, main = proxy_app(
@@ -2195,7 +2199,7 @@ async def test_cancelled_race_publishes_no_order(proxy_app):
                 {"provider": "b", "model": "mb"},
             ]}},
         },
-        slow_handler,
+        gated_handler,
     )
     learned = [("mb", "https://b.test"), ("ma", "https://a.test")]
     main._group_preferred_providers["fast"] = list(learned)

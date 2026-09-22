@@ -120,6 +120,14 @@ def test_static_quantizations_short_form_admits_long_form_rows():
     assert floor == 4
 
 
+def test_static_quantizations_long_form_is_not_a_short_form():
+    # The reverse does not hold: the selector reads `mxfp4` as itself, so a
+    # plain-fp4 row must not satisfy it (verified live against OpenRouter).
+    rows = [_row("short", "1e-06", "1e-06", "fp4"), _row("exact", "1e-06", "1e-06", "mxfp4")]
+    _caps, _quants, eligible, _floor = derive_constraints(rows, PerformanceRouting(), {"quantizations": ["mxfp4"]})
+    assert [row["tag"] for row in eligible] == ["exact"]
+
+
 def test_static_max_price_ignores_fields_the_catalog_cannot_express():
     # A static cap keeps keys for fields rows do not price per token; they are
     # sent to OpenRouter but cannot take part in local filtering.
@@ -131,6 +139,17 @@ def test_static_max_price_ignores_fields_the_catalog_cannot_express():
     )
     assert caps == {"prompt": 3.0, "completion": 5.0, "image": 0.03}
     assert [row["tag"] for row in eligible] == ["a"]
+
+
+def test_partial_static_max_price_filters_on_the_fields_it_names():
+    # A cap naming only one price field is a real config, not a crash.
+    rows = [_row("cheap", "1e-06", "9e-06", "fp8"), _row("dear", "9e-06", "1e-06", "fp8")]
+    for cap in ({"prompt": 2.0}, {"completion": 2.0}, {"image": 0.03}):
+        _caps, _quants, eligible, _floor = derive_constraints(
+            rows, PerformanceRouting(price_cap_tolerance=None), {"max_price": cap},
+        )
+        expected = ["cheap", "dear"] if "image" in cap else (["cheap"] if "prompt" in cap else ["dear"])
+        assert [row["tag"] for row in eligible] == expected, cap
 
 
 def test_static_max_price_still_excludes_rows_over_the_cap():
