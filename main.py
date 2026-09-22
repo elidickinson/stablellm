@@ -827,7 +827,7 @@ async def _apply_performance_routing(body: dict, ep: Endpoint, group: str, sessi
     if derivation is None:
         log.info("performance routing model=%s reason=empty-derivation", body["model"])
         raise EligibleEmpty("derived price/quantization caps exclude every catalog row")
-    caps, quants, eligible, floor_bits = derivation
+    eligible, floor_bits = derivation
     tags = fast_tags(eligible, ep.performance_routing)
     via = _pinned_via(group, session_key)
     if tags and via and via not in tags:
@@ -836,10 +836,6 @@ async def _apply_performance_routing(body: dict, ep: Endpoint, group: str, sessi
     tags = _provider_tags(provider.get("only"), tags)
     provider.pop("order", None)
     provider.pop("sort", None)
-    if caps:
-        provider["max_price"] = caps
-    if quants:
-        provider["quantizations"] = quants
     # The constraint is hard, the speed optimization is not: a static `only`
     # disjoint from the ranked tags is dropped, never sent.
     if tags:
@@ -848,6 +844,10 @@ async def _apply_performance_routing(body: dict, ep: Endpoint, group: str, sessi
         provider.pop("only", None)
     if "allow_fallbacks" not in provider:
         provider["allow_fallbacks"] = True
+    # Only a mapping cap is a constraint we applied; a non-mapping one is
+    # forwarded to OpenRouter untouched and is not ours to report.
+    caps = provider.get("max_price") if isinstance(provider.get("max_price"), dict) else None
+    quants = provider.get("quantizations")
     derivation_line = ""
     if caps or quants:
         detail = []

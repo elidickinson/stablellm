@@ -158,13 +158,13 @@ def fast_tags(endpoints: Iterable[object], config: PerformanceRouting) -> list[s
     return [tag for tag, score in scored if score <= limit]
 
 
-def derive_constraints(rows: list[object], policy: PerformanceRouting, provider: dict) -> tuple[dict | None, list[str] | None, list[object], int | None] | None:
+def derive_constraints(rows: list[object], policy: PerformanceRouting, provider: dict) -> tuple[list[object], int | None] | None:
     """Derive the price cap and quantization floor from catalog rows, honoring
     author-set static values, and filter the rows to the eligible population.
 
-    Writes the emitted provider keys in place and returns (max_price emitted or
-    None, quantizations emitted or None, eligible rows, effective floor bit
-    width or None); returns None when the constraints exclude every row."""
+    The emitted constraints are written into `provider` in place; returns
+    (eligible rows, effective floor bit width or None), or None when the
+    constraints exclude every row."""
     static_quant = provider.get("quantizations")
     # The author's list is literal: a short form covers its long variants and a
     # long form covers only itself, which is how the selector reads it too. Rows
@@ -204,4 +204,4 @@ def derive_constraints(rows: list[object], policy: PerformanceRouting, provider:
         floor = min((bits for row in rows if (bits := row_bits(row)) is not None and quant_allowed(row.get("quantization"), quant_values)), default=None)
     eligible = [row for row in rows if isinstance(row, dict) and row_passes(row, caps, quant_values)]
     applied_floor = floor if quant_values is not None else None
-    return (provider.get("max_price"), provider.get("quantizations"), eligible, applied_floor) if eligible else None
+    return (eligible, applied_floor) if eligible else None

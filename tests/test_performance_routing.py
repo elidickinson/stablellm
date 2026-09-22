@@ -52,7 +52,9 @@ def test_price_medians_exclude_nonpositive_rows():
         _row("free", "0", "5e-06", "fp8"),  # :free variant drags nothing: it earns no vote
         _row("b", "3e-06", "3e-06", "fp8"),
     ]
-    assert derive_constraints(rows, PerformanceRouting(), {})[0] == {"prompt": 2.3, "completion": 3.45}
+    provider: dict = {}
+    derive_constraints(rows, PerformanceRouting(), provider)
+    assert provider["max_price"] == {"prompt": 2.3, "completion": 3.45}
 
 
 def test_free_rows_pass_the_price_cap():
@@ -61,7 +63,7 @@ def test_free_rows_pass_the_price_cap():
         _row("a", "1e-06", "3e-06", "fp8"),
         _row("b", "3e-06", "3e-06", "fp8"),
     ]
-    _caps, _quants, eligible, _floor = derive_constraints(rows, PerformanceRouting(), {})
+    eligible, _floor = derive_constraints(rows, PerformanceRouting(), {})
     # free passes the cap; b exceeds the median-derived prompt cap
     assert [row["tag"] for row in eligible] == ["free", "a"]
 
@@ -80,8 +82,9 @@ def test_quantization_floor_is_median_width_rounded_up():
 
 def test_derived_floor_excluding_nothing_is_not_emitted():
     rows = [_row("a", "1e-06", "1e-06", "fp8"), _row("b", "1e-06", "1e-06", "fp8")]
-    _derived, quants, eligible, _floor = derive_constraints(rows, PerformanceRouting(), {})
-    assert quants is None
+    provider: dict = {}
+    eligible, _floor = derive_constraints(rows, PerformanceRouting(), provider)
+    assert provider.get("quantizations") is None
     assert {row["quantization"] for row in eligible} == {"fp8"}
 
 
@@ -92,8 +95,9 @@ def test_quantization_floor_off_disables_derivation():
         _row("b", "1e-06", "1e-06", "fp8"),
         _row("c", "1e-06", "1e-06", "fp4"),
     ]
-    _derived, quants, eligible, floor = derive_constraints(rows, PerformanceRouting(quantization_floor=None), {})
-    assert quants is None
+    provider: dict = {}
+    eligible, floor = derive_constraints(rows, PerformanceRouting(quantization_floor=None), provider)
+    assert provider.get("quantizations") is None
     assert floor is None
     assert [row["tag"] for row in eligible] == ["a", "b", "c"]
 
@@ -102,8 +106,9 @@ def test_static_quantizations_report_their_own_floor():
     # The log line's quant= field is the effective floor bit width: the minimum
     # of the author's own list, not a None that prints as "Nonebit".
     rows = [_row("a", "1e-06", "1e-06", "fp8"), _row("b", "1e-06", "1e-06", "bf16")]
-    _caps, quants, _eligible, floor = derive_constraints(rows, PerformanceRouting(), {"quantizations": ["fp8", "bf16"]})
-    assert quants == ["fp8", "bf16"]
+    provider = {"quantizations": ["fp8", "bf16"]}
+    _eligible, floor = derive_constraints(rows, PerformanceRouting(), provider)
+    assert provider["quantizations"] == ["fp8", "bf16"]
     assert floor == 8
 
 
@@ -115,7 +120,7 @@ def test_static_quantizations_short_form_admits_long_form_rows():
         _row("int", "1e-06", "1e-06", "int4"),
         _row("other", "1e-06", "1e-06", "fp8"),
     ]
-    _caps, _quants, eligible, floor = derive_constraints(rows, PerformanceRouting(), {"quantizations": ["fp4"]})
+    eligible, floor = derive_constraints(rows, PerformanceRouting(), {"quantizations": ["fp4"]})
     assert [row["tag"] for row in eligible] == ["long"]
     assert floor == 4
 
@@ -124,7 +129,7 @@ def test_static_quantizations_long_form_is_not_a_short_form():
     # The reverse does not hold: the selector reads `mxfp4` as itself, so a
     # plain-fp4 row must not satisfy it (verified live against OpenRouter).
     rows = [_row("short", "1e-06", "1e-06", "fp4"), _row("exact", "1e-06", "1e-06", "mxfp4")]
-    _caps, _quants, eligible, _floor = derive_constraints(rows, PerformanceRouting(), {"quantizations": ["mxfp4"]})
+    eligible, _floor = derive_constraints(rows, PerformanceRouting(), {"quantizations": ["mxfp4"]})
     assert [row["tag"] for row in eligible] == ["exact"]
 
 
@@ -132,12 +137,9 @@ def test_static_max_price_ignores_fields_the_catalog_cannot_express():
     # A static cap keeps keys for fields rows do not price per token; they are
     # sent to OpenRouter but cannot take part in local filtering.
     rows = [_row("a", "2e-06", "4e-06", "fp8")]
-    caps, _quants, eligible, _floor = derive_constraints(
-        rows,
-        PerformanceRouting(price_cap_tolerance=None),
-        {"max_price": {"prompt": 3.0, "completion": 5.0, "image": 0.03}},
-    )
-    assert caps == {"prompt": 3.0, "completion": 5.0, "image": 0.03}
+    provider = {"max_price": {"prompt": 3.0, "completion": 5.0, "image": 0.03}}
+    eligible, _floor = derive_constraints(rows, PerformanceRouting(price_cap_tolerance=None), provider)
+    assert provider["max_price"] == {"prompt": 3.0, "completion": 5.0, "image": 0.03}
     assert [row["tag"] for row in eligible] == ["a"]
 
 
@@ -145,7 +147,7 @@ def test_partial_static_max_price_filters_on_the_fields_it_names():
     # A cap naming only one price field is a real config, not a crash.
     rows = [_row("cheap", "1e-06", "9e-06", "fp8"), _row("dear", "9e-06", "1e-06", "fp8")]
     for cap in ({"prompt": 2.0}, {"completion": 2.0}, {"image": 0.03}):
-        _caps, _quants, eligible, _floor = derive_constraints(
+        eligible, _floor = derive_constraints(
             rows, PerformanceRouting(price_cap_tolerance=None), {"max_price": cap},
         )
         expected = ["cheap", "dear"] if "image" in cap else (["cheap"] if "prompt" in cap else ["dear"])
@@ -154,7 +156,7 @@ def test_partial_static_max_price_filters_on_the_fields_it_names():
 
 def test_static_max_price_still_excludes_rows_over_the_cap():
     rows = [_row("cheap", "1e-06", "1e-06", "fp8"), _row("dear", "9e-06", "1e-06", "fp8")]
-    _caps, _quants, eligible, _floor = derive_constraints(
+    eligible, _floor = derive_constraints(
         rows, PerformanceRouting(price_cap_tolerance=None), {"max_price": {"prompt": 2.0}},
     )
     assert [row["tag"] for row in eligible] == ["cheap"]
@@ -168,18 +170,18 @@ def test_ranking_runs_inside_the_constraints():
         {**_row("eight", "1e-06", "1e-06", "fp8"), "latency_last_30m": {"p50": 100}, "throughput_last_30m": {"p50": 100}},
         {**_row("out", "1e-06", "1e-06", "fp8"), "latency_last_30m": {"p50": 100}, "throughput_last_30m": {"p50": 50}},
     ]
-    _derived, quants, eligible, _floor = derive_constraints(rows, PerformanceRouting(), {})
-    assert quants == ["int8", "fp8", "mxfp8", "fp16", "bf16", "fp32", "unknown"]
+    provider: dict = {}
+    eligible, _floor = derive_constraints(rows, PerformanceRouting(), provider)
+    assert provider["quantizations"] == ["int8", "fp8", "mxfp8", "fp16", "bf16", "fp32", "unknown"]
     assert fast_tags(eligible, PerformanceRouting()) == ["eight"]
 
 
 def test_static_constraints_govern_filtering_and_are_emitted_verbatim():
     rows = [_row("cheap", "1e-06", "2e-06", "fp8"), _row("dear", "5e-06", "9e-06", "fp8")]
-    derived, quants, eligible, _floor = derive_constraints(
-        rows, PerformanceRouting(), {"max_price": {"prompt": 2}, "quantizations": ["fp8", "unknown"]},
-    )
-    assert derived == {"prompt": 2}
-    assert quants == ["fp8", "unknown"]
+    provider = {"max_price": {"prompt": 2}, "quantizations": ["fp8", "unknown"]}
+    eligible, _floor = derive_constraints(rows, PerformanceRouting(), provider)
+    assert provider["max_price"] == {"prompt": 2}
+    assert provider["quantizations"] == ["fp8", "unknown"]
     assert [row["tag"] for row in eligible] == ["cheap"]
 
 
@@ -187,10 +189,9 @@ def test_static_constraints_govern_filtering_with_derived_rules_off():
     # The derived rule being off must not stop a static cap from filtering:
     # emitting it while sending the rows it forbids gets the request 404'd.
     rows = [_row("cheap", "1e-06", "2e-06", "fp8"), _row("dear", "9e-05", "9e-05", "fp8")]
-    derived, _quants, eligible, _floor = derive_constraints(
-        rows, PerformanceRouting(price_cap_tolerance=None), {"max_price": {"prompt": 2.0, "completion": 2.0}},
-    )
-    assert derived == {"prompt": 2.0, "completion": 2.0}
+    provider = {"max_price": {"prompt": 2.0, "completion": 2.0}}
+    eligible, _floor = derive_constraints(rows, PerformanceRouting(price_cap_tolerance=None), provider)
+    assert provider["max_price"] == {"prompt": 2.0, "completion": 2.0}
     assert [row["tag"] for row in eligible] == ["cheap"]
 
 
@@ -201,8 +202,9 @@ def test_derivation_is_none_when_every_row_is_excluded():
 
 
 def test_unmeasured_eligible_rows_rank_to_no_tags():
-    _derived, quants, eligible, _floor = derive_constraints([_row("u", "1e-06", "2e-06", "fp8")], PerformanceRouting(), {})
-    assert quants is None
+    provider: dict = {}
+    eligible, _floor = derive_constraints([_row("u", "1e-06", "2e-06", "fp8")], PerformanceRouting(), provider)
+    assert provider.get("quantizations") is None
     assert eligible
     assert fast_tags(eligible, PerformanceRouting()) == []
 
