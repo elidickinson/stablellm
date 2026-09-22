@@ -187,7 +187,6 @@ def _parse_provider(name: str, entry: object, defaults: Provider | None = None) 
         ttfb_deadline_default = defaults.ttfb_deadline_secs
 
     routing = _opt_mapping(entry.get("routing"), "routing")
-    _routing_constraints(routing, f"provider '{name}'")
     _require_openrouter(routing, "routing", name, f"provider '{name}'")
     return Provider(
         base_url=base_url,
@@ -309,27 +308,6 @@ def _opt_performance_routing(value: object) -> PerformanceRouting | None:
         quantization_floor=floor,
         include_unknown_quantization=include_unknown,
     )
-
-
-def _routing_constraints(routing: dict | None, where: str) -> None:
-    """Validate the keys performance routing filters on. A malformed value is not
-    read as absent: the endpoint would either skip every request or quietly route
-    as if the author had written nothing."""
-    if routing is None:
-        return
-    quantizations = routing.get("quantizations")
-    if quantizations is not None and (
-        not isinstance(quantizations, list) or not quantizations or not all(isinstance(q, str) for q in quantizations)
-    ):
-        raise ConfigError(f"{where}: 'quantizations' must be a non-empty list of quantization names")
-    max_price = routing.get("max_price")
-    if max_price is None:
-        return
-    if not isinstance(max_price, dict) or not max_price:
-        raise ConfigError(f"{where}: 'max_price' must be a mapping of price fields to numbers")
-    for field, amount in max_price.items():
-        if isinstance(amount, bool) or not isinstance(amount, (int, float)) or amount < 0:
-            raise ConfigError(f"{where}: 'max_price.{field}' must be a non-negative number")
 
 
 def _meta_str(value: object, key: str) -> str:
@@ -464,7 +442,6 @@ def _parse_groups(raw: object, providers: dict[str, Provider]) -> tuple[dict[str
             routing = _opt_mapping(entry.get("routing"), "routing")
             performance_routing = _opt_performance_routing(entry.get("performance_routing"))
             where = f"group '{group_name}' entry {i}"
-            _routing_constraints(routing, where)
             _require_openrouter(routing, "routing", prov_lower, where)
             _require_openrouter(performance_routing, "performance_routing", prov_lower, where)
             if routing is None:

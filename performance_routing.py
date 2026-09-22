@@ -18,7 +18,7 @@ _QUANT_BITS = {
     "fp32": 32,
 }
 _QUANT_TIERS = frozenset({4, 8, 16, 32})
-_QUANT_TIER_LABELS = "auto (derived), 4, 8, 16, 32, none"
+_QUANT_TIER_LABELS = "auto (derived), 4, 8, 16, 32, or an explicit null for off"
 _QUANT_FLOOR_AUTO: Literal["auto"] = "auto"
 # The selector's short forms cover their long-form variants, so `fp4` admits a
 # row reporting `mxfp4`. int4 is a separate family from fp4.
@@ -173,12 +173,14 @@ def derive_constraints(rows: list[dict[str, Any]], policy: PerformanceRouting, p
     (eligible rows, effective floor bit width or None), or None when the
     constraints exclude every row."""
     static_quant = provider.get("quantizations")
+    # `routing` is a passthrough, so a value that is not a list is not a
+    # constraint: it is ignored and the derived rule applies instead.
     # The author's list is literal: a short form covers its long variants and a
     # long form covers only itself, which is how the selector reads it too. Rows
     # are folded to their short form before matching.
-    quant_values = None if static_quant is None else frozenset(static_quant)
+    quant_values = frozenset(static_quant) if isinstance(static_quant, list) and static_quant else None
     floor = None
-    static_price = provider.get("max_price")
+    static_price = provider.get("max_price") if isinstance(provider.get("max_price"), dict) else None
     if static_price is None and policy.price_cap_tolerance is not None:
         medians = price_caps(rows)
         if medians is not None:
