@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from decimal import Decimal
 from itertools import count
 from pathlib import Path
-from typing import ClassVar, Final, NamedTuple
+from typing import Any, ClassVar, Final, NamedTuple
 from urllib.parse import unquote, urlencode
 
 import httpx
@@ -135,7 +135,7 @@ _race_ids = count(1)  # process-wide monotonic: never reused, even across reload
 
 # Effective OpenRouter model -> (endpoint rows, fetched monotonic timestamp).
 # Each endpoint policy applies its own TTL to the shared model snapshot.
-_performance_catalogs: dict[str, tuple[list[object], float]] = {}
+_performance_catalogs: dict[str, tuple[list[dict[str, Any]], float]] = {}
 
 
 def _build_provider_groups():
@@ -772,7 +772,7 @@ def _catalog_model(model: str) -> str:
     return model.split(":", 1)[0]
 
 
-async def _openrouter_catalog(ep: Endpoint, model: str) -> tuple[list[object] | None, str]:
+async def _openrouter_catalog(ep: Endpoint, model: str) -> tuple[list[dict[str, Any]] | None, str]:
     """Return fresh or valid-cached endpoint rows; never return expired data."""
     policy = ep.performance_routing
     assert policy is not None
@@ -788,7 +788,7 @@ async def _openrouter_catalog(ep: Endpoint, model: str) -> tuple[list[object] | 
             response.raise_for_status()
             data = response.json()
             rows = data.get("data", {}).get("endpoints") if isinstance(data, dict) else None
-            if not isinstance(rows, list):
+            if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
                 raise TypeError("response has no endpoint list")
             _performance_catalogs[catalog_model] = (rows, time.monotonic())
             return rows, "fresh"

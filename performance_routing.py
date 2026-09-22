@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from typing import Any, Literal
 
 # Bit width of each quantization value OpenRouter's catalog reports. The
 # quantizations vocabulary is the short forms; long forms fold into their short
@@ -18,7 +19,7 @@ _QUANT_BITS = {
 }
 _QUANT_TIERS = frozenset({4, 8, 16, 32})
 _QUANT_TIER_LABELS = "auto (derived), 4, 8, 16, 32, none"
-_QUANT_FLOOR_AUTO = "auto"
+_QUANT_FLOOR_AUTO: Literal["auto"] = "auto"
 # The selector's short forms cover their long-form variants, so `fp4` admits a
 # row reporting `mxfp4`. int4 is a separate family from fp4.
 _QUANT_FAMILY = {"mxfp4": "fp4", "nvfp4": "fp4", "mxfp8": "fp8"}
@@ -34,7 +35,7 @@ class PerformanceRouting:
     speed_tolerance: float = 0.15
     cache_ttl_seconds: float = 900.0
     price_cap_tolerance: float | None = 0.15  # None = no price constraint
-    quantization_floor: int | str | None = _QUANT_FLOOR_AUTO  # None = off, _QUANT_FLOOR_AUTO = derived from rows
+    quantization_floor: int | Literal["auto"] | None = _QUANT_FLOOR_AUTO  # None = off, "auto" = derived from rows
     include_unknown_quantization: bool = True
 
 
@@ -44,7 +45,7 @@ def price_cap(row_price: float, tolerance: float) -> float:
     return round(row_price * 1e6 * (1 + tolerance), 6)
 
 
-def _median(values: list[float]) -> float:
+def _median(values: Sequence[float]) -> float:
     ordered = sorted(values)
     mid = len(ordered) // 2
     if len(ordered) % 2:
@@ -52,34 +53,46 @@ def _median(values: list[float]) -> float:
     return (ordered[mid - 1] + ordered[mid]) / 2
 
 
-def _row_price(row: dict, field: str) -> float | None:
-    """Row's positive per-token price for the field, or None."""
+def _row_number(row: dict[str, Any], *path: str) -> float | None:
+    """Numeric value at a nested path in a row, or None when it is absent or
+    not a number."""
+    value: Any = row
+    for key in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
     try:
-        price = float((row.get("pricing") or {}).get(field))
+        return float(value)
     except (TypeError, ValueError):
         return None
-    return price if price > 0 else None
 
 
-def price_caps(rows: list[object]) -> tuple[float, float] | None:
+def _row_price(row: dict[str, Any], field: str) -> float | None:
+    """Row's positive per-token price for the field, or None."""
+    price = _row_number(row, "pricing", field)
+    return price if price and price > 0 else None
+
+
+def price_caps(rows: list[dict[str, Any]]) -> tuple[float, float] | None:
     """Unpadded per-token (prompt, completion) price medians over every
     positively-priced row, measured or not: the cap describes the market for
     the model. None when a field has no positive-priced row."""
-    prompt = [p for row in rows if isinstance(row, dict) and (p := _row_price(row, "prompt")) is not None]
-    completion = [p for row in rows if isinstance(row, dict) and (p := _row_price(row, "completion")) is not None]
+    prompt = [p for row in rows if (p := _row_price(row, "prompt")) is not None]
+    completion = [p for row in rows if (p := _row_price(row, "completion")) is not None]
     if not prompt or not completion:
         return None
     return _median(prompt), _median(completion)
 
 
-def row_bits(row: dict) -> int | None:
+def row_bits(row: dict[str, Any]) -> int | None:
     """Bit width of a row's reported quantization, or None when unrecognized."""
-    return _QUANT_BITS.get(row.get("quantization"))
+    quantization = row.get("quantization")
+    return _QUANT_BITS.get(quantization) if isinstance(quantization, str) else None
 
 
 def quant_family(value: object) -> object:
     """Fold a reported quantization into the short form the selector accepts."""
-    return _QUANT_FAMILY.get(value, value)
+    return _QUANT_FAMILY.get(value, value) if isinstance(value, str) else value
 
 
 def quant_allowed(reported: object, allowed: frozenset[str]) -> bool:
@@ -88,10 +101,10 @@ def quant_allowed(reported: object, allowed: frozenset[str]) -> bool:
     return reported in allowed or quant_family(reported) in allowed
 
 
-def quantization_floor(rows: list[object]) -> int | None:
+def quantization_floor(rows: list[dict[str, Any]]) -> int | None:
     """Median observed bit width, rounded up to the next tier. None when no row
     reports a recognized width."""
-    widths = [bits for row in rows if isinstance(row, dict) and (bits := row_bits(row)) is not None]
+    widths = [bits for row in rows if (bits := row_bits(row)) is not None]
     if not widths:
         return None
     median = _median(widths)
@@ -108,18 +121,14 @@ def quantization_values(floor: int, include_unknown: bool = True) -> list[str]:
     return values
 
 
-def row_passes(row: dict, caps: dict[str, float] | None, quant_values: frozenset[str] | None) -> bool:
+def row_passes(row: dict[str, Any], caps: dict[str, float] | None, quant_values: frozenset[str] | None) -> bool:
     """Whether a row meets the per-token price caps (every listed field must
     pass) and the quantization allowlist."""
     if caps is not None:
-        pricing = row.get("pricing") or {}
         for field, cap in caps.items():
-            try:
-                price = float(pricing.get(field))
-            except (TypeError, ValueError):
-                return False
+            price = _row_number(row, "pricing", field)
             # A free row's zero price satisfies the cap.
-            if not 0 <= price <= cap:
+            if price is None or not 0 <= price <= cap:
                 return False
     return quant_values is None or quant_allowed(row.get("quantization"), quant_values)
 
@@ -129,7 +138,7 @@ def matches_provider_tag(tag: str, allowed: str) -> bool:
     return tag == allowed or tag.startswith(f"{allowed}/")
 
 
-def fast_tags(endpoints: Iterable[object], config: PerformanceRouting) -> list[str]:
+def fast_tags(endpoints: Iterable[dict[str, Any]], config: PerformanceRouting) -> list[str]:
     """Return endpoint tags within the configured projected-time tolerance.
 
     OpenRouter reports latency in milliseconds and throughput in tokens/second.
@@ -137,8 +146,6 @@ def fast_tags(endpoints: Iterable[object], config: PerformanceRouting) -> list[s
     """
     scored: list[tuple[str, float]] = []
     for endpoint in endpoints:
-        if not isinstance(endpoint, dict):
-            continue
         tag = endpoint.get("tag")
         latency = (endpoint.get("latency_last_30m") or {}).get("p50")
         throughput = (endpoint.get("throughput_last_30m") or {}).get("p50")
@@ -158,7 +165,7 @@ def fast_tags(endpoints: Iterable[object], config: PerformanceRouting) -> list[s
     return [tag for tag, score in scored if score <= limit]
 
 
-def derive_constraints(rows: list[object], policy: PerformanceRouting, provider: dict) -> tuple[list[object], int | None] | None:
+def derive_constraints(rows: list[dict[str, Any]], policy: PerformanceRouting, provider: dict[str, Any]) -> tuple[list[dict[str, Any]], int | None] | None:
     """Derive the price cap and quantization floor from catalog rows, honoring
     author-set static values, and filter the rows to the eligible population.
 
@@ -169,10 +176,10 @@ def derive_constraints(rows: list[object], policy: PerformanceRouting, provider:
     # The author's list is literal: a short form covers its long variants and a
     # long form covers only itself, which is how the selector reads it too. Rows
     # are folded to their short form before matching.
-    quant_values = frozenset(static_quant) if isinstance(static_quant, list) and static_quant else None
+    quant_values = None if static_quant is None else frozenset(static_quant)
     floor = None
-    static_price = provider.get("max_price") if isinstance(provider.get("max_price"), dict) else None
-    if policy.price_cap_tolerance is not None and static_price is None:
+    static_price = provider.get("max_price")
+    if static_price is None and policy.price_cap_tolerance is not None:
         medians = price_caps(rows)
         if medians is not None:
             static_price = {
@@ -184,24 +191,27 @@ def derive_constraints(rows: list[object], policy: PerformanceRouting, provider:
     # enforce the sent values on the per-token scale. A static cap governs
     # filtering even when the derived rule is off.
     caps = (
-        {field: value / 1e6 for field, value in static_price.items() if field in _PRICE_FIELDS}
+        {field: amount / 1e6 for field, amount in static_price.items() if field in _PRICE_FIELDS}
         if static_price is not None
         else None
     )
     if quant_values is None:
         requested = policy.quantization_floor
         floor = quantization_floor(rows) if requested == _QUANT_FLOOR_AUTO else requested
+        if floor is not None and requested == _QUANT_FLOOR_AUTO:
+            lowest = min(bits for row in rows if (bits := row_bits(row)) is not None)
+            # A derived floor equal to the lowest observed width excludes nothing,
+            # so it is skipped rather than emitted as a no-op key. An explicit
+            # tier is always emitted.
+            if floor <= lowest:
+                floor = None
         if floor is not None:
-            lowest = min((bits for row in rows if (bits := row_bits(row)) is not None), default=None)
-            # An explicit tier is always emitted; a derived floor equal to the
-            # lowest observed width excludes nothing and is skipped.
-            if requested != _QUANT_FLOOR_AUTO or floor > lowest:
-                emitted = quantization_values(floor, policy.include_unknown_quantization)
-                quant_values = frozenset(emitted)
-                provider["quantizations"] = emitted
+            emitted = quantization_values(floor, policy.include_unknown_quantization)
+            quant_values = frozenset(emitted)
+            provider["quantizations"] = emitted
     else:
         # A static list states its own floor, so the log can report it.
         floor = min((bits for row in rows if (bits := row_bits(row)) is not None and quant_allowed(row.get("quantization"), quant_values)), default=None)
-    eligible = [row for row in rows if isinstance(row, dict) and row_passes(row, caps, quant_values)]
+    eligible = [row for row in rows if row_passes(row, caps, quant_values)]
     applied_floor = floor if quant_values is not None else None
     return (eligible, applied_floor) if eligible else None

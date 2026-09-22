@@ -306,10 +306,10 @@ async def test_quantization_floor_spellings_route_differently(performance_app):
         assert (await _post(app)).status_code == 200
         return calls[1][2]["provider"]
 
-    off = await _only_for("none")
+    off = await _only_for(None)
     assert off["only"] == ["four", "eight1", "eight2"]
     assert "quantizations" not in off
-    # auto derives the mode from the catalog (the fp8 mode over one fp4 row).
+    # auto derives the median from the catalog (8 bits over the fp8/fp4 mix).
     auto = await _only_for("auto")
     assert auto["only"] == ["eight1", "eight2"]
     assert auto["quantizations"] == ["int8", "fp8", "mxfp8", "fp16", "bf16", "fp32", "unknown"]
@@ -353,7 +353,7 @@ async def test_static_max_price_filters_when_derivation_is_off(performance_app):
     app, calls = performance_app(handler, _test_config([{
         "provider": "openrouter",
         "model": "author/model",
-        "performance_routing": {"price_cap_tolerance": "none"},
+        "performance_routing": {"price_cap_tolerance": None},
         "routing": {"max_price": {"prompt": 2.0, "completion": 2.0}},
     }]))
     assert (await _post(app)).status_code == 200

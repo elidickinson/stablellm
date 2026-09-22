@@ -545,10 +545,15 @@ def test_performance_routing_defaults_are_on():
     assert (policy.price_cap_tolerance, policy.quantization_floor, policy.include_unknown_quantization) == (0.15, _QUANT_FLOOR_AUTO, True)
 
 
-@pytest.mark.parametrize("spelling", [None, "none", "None"])
-def test_price_cap_off_spellings(spelling):
-    endpoints, _, _ = parse_config(_perf_cfg(price_cap_tolerance=spelling))
+def test_price_cap_off_is_an_explicit_null():
+    endpoints, _, _ = parse_config(_perf_cfg(price_cap_tolerance=None))
     assert endpoints[0].performance_routing.price_cap_tolerance is None
+
+
+def test_price_cap_rejects_a_non_numeric_spelling():
+    # `none` is a string, not null; it must fail loudly rather than read as off.
+    with pytest.raises(ConfigError, match="price_cap_tolerance"):
+        parse_config(_perf_cfg(price_cap_tolerance="none"))
 
 
 def test_price_cap_zero_is_not_a_sentinel():
@@ -557,12 +562,19 @@ def test_price_cap_zero_is_not_a_sentinel():
 
 
 def test_quantization_floor_off_auto_and_tiers():
-    for spelling, expected in [(None, None), ("none", None), ("auto", _QUANT_FLOOR_AUTO), (8, 8), (32, 32)]:
-        endpoints, _, _ = parse_config(_perf_cfg(quantization_floor=spelling))
-        assert endpoints[0].performance_routing.quantization_floor == expected, spelling
+    for floor, expected in [(None, None), ("auto", _QUANT_FLOOR_AUTO), (8, 8), (32, 32)]:
+        endpoints, _, _ = parse_config(_perf_cfg(quantization_floor=floor))
+        assert endpoints[0].performance_routing.quantization_floor == expected, floor
     # The absent key means auto (derived), not off.
     endpoints, _, _ = parse_config(_perf_cfg())
     assert endpoints[0].performance_routing.quantization_floor == _QUANT_FLOOR_AUTO
+
+
+def test_quantization_floor_rejects_an_unknown_value():
+    # An unhashable value must be a config error, not a TypeError from a lookup.
+    for bad in ("none", [], {}):
+        with pytest.raises(ConfigError, match="quantization_floor"):
+            parse_config(_perf_cfg(quantization_floor=bad))
 
 
 def test_quantization_floor_invalid_tier_is_config_error():

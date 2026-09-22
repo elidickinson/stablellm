@@ -187,6 +187,7 @@ def _parse_provider(name: str, entry: object, defaults: Provider | None = None) 
         ttfb_deadline_default = defaults.ttfb_deadline_secs
 
     routing = _opt_mapping(entry.get("routing"), "routing")
+    _routing_constraints(routing, f"provider '{name}'")
     _require_openrouter(routing, "routing", name, f"provider '{name}'")
     return Provider(
         base_url=base_url,
@@ -252,9 +253,6 @@ def _opt_secs(value: object, key: str, default: float) -> float:
     return float(value)
 
 
-_OFF_SPELLINGS = frozenset({None, "none", "None", "NONE"})
-
-
 def _opt_performance_routing(value: object) -> PerformanceRouting | None:
     if value is None:
         return None
@@ -279,18 +277,19 @@ def _opt_performance_routing(value: object) -> PerformanceRouting | None:
     price_cap_tolerance = defaults.price_cap_tolerance
     if "price_cap_tolerance" in value:
         raw = value["price_cap_tolerance"]
-        if raw in _OFF_SPELLINGS:
+        # An explicit null is off; an absent key takes the default.
+        if raw is None:
             price_cap_tolerance = None
         else:
-            # 0 is meaningful (cap at the median); only the off spellings disable.
+            # 0 is meaningful (cap at the median); only an explicit null disables.
             if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw) or raw < 0:
-                raise ConfigError("'performance_routing.price_cap_tolerance' must be a non-negative number (none = off)")
+                raise ConfigError("'performance_routing.price_cap_tolerance' must be a non-negative number (null = off)")
             price_cap_tolerance = float(raw)
     floor = _QUANT_FLOOR_AUTO
     if "quantization_floor" in value:
         raw_floor = value["quantization_floor"]
-        # The off spellings disable the floor; auto (the default) derives it.
-        if raw_floor in _OFF_SPELLINGS:
+        # An explicit null is off; auto (the default) derives the floor.
+        if raw_floor is None:
             floor = None
         elif raw_floor != _QUANT_FLOOR_AUTO:
             if isinstance(raw_floor, bool) or not isinstance(raw_floor, int) or raw_floor not in _QUANT_TIERS:
@@ -310,6 +309,27 @@ def _opt_performance_routing(value: object) -> PerformanceRouting | None:
         quantization_floor=floor,
         include_unknown_quantization=include_unknown,
     )
+
+
+def _routing_constraints(routing: dict | None, where: str) -> None:
+    """Validate the keys performance routing filters on. A malformed value is not
+    read as absent: the endpoint would either skip every request or quietly route
+    as if the author had written nothing."""
+    if routing is None:
+        return
+    quantizations = routing.get("quantizations")
+    if quantizations is not None and (
+        not isinstance(quantizations, list) or not quantizations or not all(isinstance(q, str) for q in quantizations)
+    ):
+        raise ConfigError(f"{where}: 'quantizations' must be a non-empty list of quantization names")
+    max_price = routing.get("max_price")
+    if max_price is None:
+        return
+    if not isinstance(max_price, dict) or not max_price:
+        raise ConfigError(f"{where}: 'max_price' must be a mapping of price fields to numbers")
+    for field, amount in max_price.items():
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)) or amount < 0:
+            raise ConfigError(f"{where}: 'max_price.{field}' must be a non-negative number")
 
 
 def _meta_str(value: object, key: str) -> str:
@@ -444,6 +464,7 @@ def _parse_groups(raw: object, providers: dict[str, Provider]) -> tuple[dict[str
             routing = _opt_mapping(entry.get("routing"), "routing")
             performance_routing = _opt_performance_routing(entry.get("performance_routing"))
             where = f"group '{group_name}' entry {i}"
+            _routing_constraints(routing, where)
             _require_openrouter(routing, "routing", prov_lower, where)
             _require_openrouter(performance_routing, "performance_routing", prov_lower, where)
             if routing is None:

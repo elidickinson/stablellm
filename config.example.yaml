@@ -97,8 +97,8 @@ groups:
         #   target_tokens: 10000               # tokens used to score projected time
         #   speed_tolerance: 0.15              # allowlist window around the fastest endpoint
         #   cache_ttl_seconds: 900             # endpoint-catalog cache lifetime
-        #   price_cap_tolerance: 0.15          # prompt AND completion <= median * 1.15 (none = off)
-        #   quantization_floor: auto           # auto = derived median bit width (rounded up); 4/8/16/32 = requirement; none = off
+        #   price_cap_tolerance: 0.15          # prompt AND completion <= median * 1.15 (null = off)
+        #   quantization_floor: auto           # auto = derived median bit width (rounded up); 4/8/16/32 = requirement; null = off
         #   include_unknown_quantization: true # whether unknown-width rows pass the floor
         # Per-endpoint overrides of provider-level settings:
         # max_concurrency: 1

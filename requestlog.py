@@ -32,17 +32,17 @@ _NEW_COLUMNS = {
 WINDOWS = (("15m", 900), ("1h", 3600), ("24h", 86400))
 
 
-def _connect():
+def _connect(path: Path):
     # timeout = busy_timeout for concurrent writers/readers (log_request runs
     # in a worker thread while the dashboard reads on the event loop's threads).
-    return sqlite3.connect(DB_PATH, timeout=5)
+    return sqlite3.connect(path, timeout=5)
 
 
 def init():
     if DB_PATH is None:
         return
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = _connect()
+    conn = _connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS requests (
@@ -126,7 +126,7 @@ def log_request(m: RequestMetrics):
 
     if DB_PATH is None:
         return
-    conn = _connect()
+    conn = _connect(DB_PATH)
     conn.execute(
         "INSERT INTO requests (timestamp, api_key_id, req_id, status, reason, model_requested, "
         "provider_served, model_served, mode, ttfb_ms, ttft_ms, elapsed_ms, tokens, tokens_per_sec) "
@@ -157,7 +157,7 @@ def recent_requests(limit: int = 50) -> list[dict]:
     if DB_PATH is None:
         return []
     try:
-        conn = _connect()
+        conn = _connect(DB_PATH)
         try:
             rows = conn.execute(
                 "SELECT id, timestamp, api_key_id, req_id, status, reason, model_requested, "
@@ -200,7 +200,7 @@ def window_summary() -> dict[str, dict]:
         "GROUP BY provider_served, model_served"
     )
     try:
-        conn = _connect()
+        conn = _connect(DB_PATH)
         try:
             rows = conn.execute(sql, params).fetchall()
         finally:

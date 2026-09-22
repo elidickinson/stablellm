@@ -19,7 +19,7 @@ dev = [
 ]
 
 [tool.pyright]
-include = ["main.py"]
+include = ["main.py", "config.py", "performance_routing.py", "requestlog.py"]
 typeCheckingMode = "basic"
 reportAssignmentType = "error"
 
