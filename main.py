@@ -1126,9 +1126,14 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
     race_loop = asyncio.get_running_loop()
     race_deadline = race_loop.time() + config.SETTINGS.race_settle_timeout_secs
     race_timeouts: set[asyncio.Timeout] = set()
-    race_failures = 0
+    # Every candidate that will never contribute a time, whether it failed or
+    # was merely skipped. Each task adds its own key in a finally block, so
+    # accounting cannot be forgotten on a new exit path and cannot be counted
+    # twice; a candidate absent from this set is still running.
+    resolved: set[tuple[str, str]] = set()
     race_grace: float | None = None
     race_finished = False
+    race_aborted = False
     # Per-candidate body buffers plus when their headers/first byte arrived.
     # Loser buffers are cleared as soon as the winner is known.
     buffers: dict[int, list[bytes]] = {candidate.idx: [] for candidate in candidates}
@@ -1158,11 +1163,9 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         )
 
     def _accounting() -> str:
-        return f"{len(race_times) + race_failures}/{len(candidates)}"
+        return f"{len(resolved)}/{len(candidates)}"
 
     def _record_race_timeout(pk: tuple[str, str]):
-        nonlocal race_failures
-        race_failures += 1
         log.debug(
             "req=%s race: candidate %s model=%s exceeded drain budget at %.1fs accounted=%s",
             req_id,
@@ -1187,8 +1190,8 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                 current_generation if current_generation is not None else "-",
             )
             return
-        accounted = len(race_times) + race_failures
-        if race_finished or accounted < len(candidates):
+        accounted = len(resolved)
+        if race_finished or race_aborted or accounted < len(candidates):
             return
         race_finished = True
         _finish_race(
@@ -1205,8 +1208,6 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         task.add_done_callback(_background_tasks.discard)
 
     def _note_failure(pk: tuple[str, str], idx: int, detail: str):
-        nonlocal race_failures
-        race_failures += 1
         _mark_down(idx, detail, _request_context(body_dict, group, req_id))
         log.debug(
             "req=%s race: candidate %s model=%s failed accounted=%s: %s",
@@ -1255,7 +1256,6 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
 
     async def _race_one(candidate: _RaceCandidate):
         """Consume one candidate to completion, owning its response and slot."""
-        nonlocal race_failures
         pk, idx = candidate
         deadline = asyncio.timeout_at(race_deadline)
         resp: httpx.Response | None = None
@@ -1268,7 +1268,6 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                     resp, release = await _open(pk, idx)
                 except CapReached as exc:
                     # Healthy endpoint, merely full: skip the mark-down.
-                    race_failures += 1
                     log.debug("req=%s race: %s accounted=%s", req_id, exc, _accounting())
                     return None
                 except EligibleEmpty as exc:
@@ -1317,6 +1316,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
             return None
         finally:
             race_timeouts.discard(deadline)
+            resolved.add(pk)
             if completed:
                 race_times[pk] = completion
                 _note_success(completion)
@@ -1359,6 +1359,7 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                 # Compare timestamps when several racers land in one loop turn.
                 winner = min(outcomes, key=lambda outcome: outcome.completion)
     except BaseException:
+        race_aborted = True
         keep_chunks = False
         for task in racetasks:
             task.cancel()

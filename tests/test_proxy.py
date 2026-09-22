@@ -957,6 +957,56 @@ async def test_race_applies_performance_routing(proxy_app):
 
 
 @pytest.mark.asyncio
+async def test_race_skipping_candidate_still_publishes_an_order(proxy_app, monkeypatch):
+    """A candidate whose constraints exclude every provider is skipped, not
+    failed -- but it must still be accounted, or the race never publishes the
+    order it measured."""
+    # Opposite price shapes: no row is within the cap on both fields.
+    rows = [
+        {"tag": "a", "pricing": {"prompt": "1e-06", "completion": "9e-06"}, "quantization": "fp8"},
+        {"tag": "b", "pricing": {"prompt": "5e-06", "completion": "1e-06"}, "quantization": "fp8"},
+    ]
+    delays = {"other1.test": 0.04, "other2.test": 0.01}
+
+    async def handler(req):
+        if req.url.host == "openrouter.ai":
+            return httpx.Response(200, json={"data": {"endpoints": rows}})
+        await asyncio.sleep(delays[req.url.host])
+        return _ok_response({"who": req.url.host})
+
+    cfg = {
+        "providers": {
+            "openrouter": {"base_url": "https://openrouter.ai/api/v1", "api_key": "k"},
+            "other1": {"base_url": "https://other1.test", "api_key": "k"},
+            "other2": {"base_url": "https://other2.test", "api_key": "k"},
+        },
+        "groups": {"fast": {"mode": "race", "endpoints": [
+            {"provider": "openrouter", "model": "author/model", "performance_routing": {}},
+            {"provider": "other1", "model": "m1"},
+            {"provider": "other2", "model": "m2"},
+        ]}},
+    }
+    app, _calls, main = proxy_app(cfg, handler)
+    finish_calls = []
+    real_finish_race = main._finish_race
+
+    def finish_race(*args, **kwargs):
+        finish_calls.append((args, kwargs))
+        return real_finish_race(*args, **kwargs)
+
+    monkeypatch.setattr(main, "_finish_race", finish_race)
+    resp = await _post(app, {"model": "fast", "messages": []})
+    assert resp.status_code == 200
+    assert resp.json()["who"] == "other2.test"
+    await asyncio.gather(*tuple(main._background_tasks), return_exceptions=True)
+
+    assert len(finish_calls) == 1
+    assert finish_calls[0][1]["accounted"] == 3
+    # The skipped provider never raced, so it ranks last; the measured order wins.
+    assert [main._pk_label("fast", key) for key in main._group_preferred_providers["fast"]] == ["other2", "other1", "openrouter"]
+
+
+@pytest.mark.asyncio
 async def test_fastest_is_an_alias_for_race(proxy_app):
     app, calls, _ = proxy_app(_TWO_PROVIDER_RACE_CFG, _race_winner_handler)
     resp = await _post(app, {"model": "fast:fastest", "messages": []})
@@ -2124,6 +2174,44 @@ async def test_race_cancel_after_racer_completes_releases_slot(proxy_app, monkey
     assert all(r.closed for _host, r in responses)
     assert main._inflight[("https://a.test", "ma")] == 0
     assert main._inflight[("https://b.test", "mb")] == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_race_publishes_no_order(proxy_app):
+    """A cancelled race measured nothing, so it must not overwrite the order a
+    previous race learned with the config order."""
+    async def slow_handler(_req):
+        await asyncio.sleep(0.05)
+        return _ok_response()
+
+    _app, _calls, main = proxy_app(
+        {
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k"},
+                "b": {"base_url": "https://b.test", "api_key": "k"},
+            },
+            "groups": {"fast": {"mode": "race", "endpoints": [
+                {"provider": "a", "model": "ma"},
+                {"provider": "b", "model": "mb"},
+            ]}},
+        },
+        slow_handler,
+    )
+    learned = [("mb", "https://b.test"), ("ma", "https://a.test")]
+    main._group_preferred_providers["fast"] = list(learned)
+
+    task = asyncio.create_task(main._race_request(
+        "chat/completions", {"model": "fast", "messages": []}, False,
+        "fast", "", "req-test", "test", "",
+        main._race_candidates("fast", {"model": "fast", "messages": []}),
+    ))
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.gather(*tuple(main._background_tasks), return_exceptions=True)
+
+    assert main._group_preferred_providers["fast"] == learned
 
 
 @pytest.mark.asyncio
