@@ -158,6 +158,7 @@ def test_settings_loaded_from_yaml(make_config):
             "cooloff_seconds": 5,
             "race_interval_requests": 100,
             "race_settle_timeout_secs": 7.5,
+            "race_max_prompt_bytes": 40000,
             "log_level": "debug",
         },
         "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
@@ -166,6 +167,7 @@ def test_settings_loaded_from_yaml(make_config):
     assert cfg.SETTINGS.cooloff_seconds == 5
     assert cfg.SETTINGS.race_interval_requests == 100
     assert cfg.SETTINGS.race_settle_timeout_secs == 7.5
+    assert cfg.SETTINGS.race_max_prompt_bytes == 40000
     assert cfg.SETTINGS.log_level == "DEBUG"
 
 
@@ -486,6 +488,13 @@ def test_race_settle_timeout_must_be_positive():
     raw = make_minimal()
     raw["settings"] = {"race_settle_timeout_secs": 0}
     with pytest.raises(ConfigError, match="race_settle_timeout_secs"):
+        parse_config(raw)
+
+
+def test_race_max_prompt_bytes_must_be_non_negative():
+    raw = make_minimal()
+    raw["settings"] = {"race_max_prompt_bytes": -1}
+    with pytest.raises(ConfigError, match="race_max_prompt_bytes"):
         parse_config(raw)
 
 

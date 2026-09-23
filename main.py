@@ -1000,6 +1000,16 @@ def _should_race(group: str, is_pinned: bool) -> tuple[bool, str]:
     return False, ""
 
 
+def _race_prompt_oversize(prompt_bytes: int) -> bool:
+    """Whether a prompt is too big to race (race_max_prompt_bytes, 0 = no cap).
+
+    A race pays for the prompt once per candidate, so an oversized prompt (a
+    session whose pin has expired, say) uses the order already learned instead,
+    leaving the cadence ripe for the next request that fits."""
+    limit = config.SETTINGS.race_max_prompt_bytes
+    return limit > 0 and prompt_bytes > limit
+
+
 def _endpoint_label(ep: Endpoint) -> str:
     return ep.provider or ep.base_url
 
@@ -2095,6 +2105,14 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             _group_race_request_count[group_name] += 1
 
         should_race, trigger = _should_race(group_name, pinned is not None)
+        if should_race and _race_prompt_oversize(len(raw_body)):
+            should_race = False
+            log.info(
+                "req=%s race: skipped; prompt %d bytes over race_max_prompt_bytes=%d, using preferred order",
+                req_id,
+                len(raw_body),
+                config.SETTINGS.race_max_prompt_bytes,
+            )
         candidates = _race_candidates(group_name, body_dict) if should_race else []
         if should_race and len(candidates) <= 1:
             should_race = False

@@ -91,6 +91,7 @@ class Settings:
     race_interval_secs: int = 6 * 3600
     race_interval_requests: int = 25
     race_settle_timeout_secs: float = 120.0
+    race_max_prompt_bytes: int = 0  # 0 = no cap on the prompt a race will pay for
     session_pin_ttl_secs: float = 15 * 60
     log_level: str = "INFO"
 
@@ -513,6 +514,9 @@ def _parse_settings(raw: object) -> Settings:
     )
     if race_settle_timeout == 0:
         raise ConfigError("'race_settle_timeout_secs' must be greater than 0")
+    race_max_prompt = _opt_count(
+        raw.get("race_max_prompt_bytes"), "race_max_prompt_bytes", defaults.race_max_prompt_bytes
+    )
     pin_ttl = float(raw.get("session_pin_ttl_secs", defaults.session_pin_ttl_secs))
     if not math.isfinite(pin_ttl) or pin_ttl < 0:
         raise ConfigError("'session_pin_ttl_secs' must be a non-negative number of seconds")
@@ -521,6 +525,7 @@ def _parse_settings(raw: object) -> Settings:
         race_interval_secs=int(raw.get("race_interval_secs", defaults.race_interval_secs)),
         race_interval_requests=int(raw.get("race_interval_requests", defaults.race_interval_requests)),
         race_settle_timeout_secs=race_settle_timeout,
+        race_max_prompt_bytes=race_max_prompt,
         session_pin_ttl_secs=pin_ttl,
         log_level=str(raw.get("log_level", defaults.log_level)).upper(),
     )

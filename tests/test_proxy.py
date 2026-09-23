@@ -597,6 +597,45 @@ async def test_race_redirect_handshake_shape(proxy_app):
 
 
 @pytest.mark.asyncio
+async def test_oversized_prompt_skips_the_race_without_consuming_cadence(proxy_app):
+    """A prompt over race_max_prompt_bytes routes in preferred order with no
+    handshake, and the cadence stays ripe for the next request that fits."""
+    cfg = {**_TWO_PROVIDER_RACE_CFG, "settings": {"race_max_prompt_bytes": 200}}
+    app, calls, main = proxy_app(cfg, _race_winner_handler)
+    raced_at = time.monotonic()
+    main._group_last_race_time["fast"] = raced_at
+    main._group_race_request_count["fast"] = 9999
+
+    big = {"model": "fast:race", "messages": [{"role": "user", "content": "x" * 400}]}
+    resp = await _post_once(app, big)
+    assert resp.status_code == 200
+    assert [c[0] for c in calls] == ["https://a.test"]  # preferred order, no fan-out
+    assert resp.headers["x-stablellm-mode"] == "race"
+    # Skipping is not a race attempt: only the logical-request count moved, so
+    # the cadence is still ripe.
+    assert main._group_last_race_time["fast"] == raced_at
+    assert main._group_race_request_count["fast"] == 10000
+
+    small = {"model": "fast:race", "messages": []}
+    assert (await _post_once(app, small)).status_code == 307
+
+
+@pytest.mark.asyncio
+async def test_oversized_marked_followup_does_not_fan_out(proxy_app):
+    """A follow-up whose body no longer fits (it grew between the handshake and
+    the marked request) routes in preferred order instead of fanning out."""
+    cfg = {**_TWO_PROVIDER_RACE_CFG, "settings": {"race_max_prompt_bytes": 200}}
+    app, calls, _ = proxy_app(cfg, _race_winner_handler)
+    small = {"model": "fast:race", "messages": [{"role": "user", "content": "hi"}]}
+    assert (await _post_once(app, small)).status_code == 307
+
+    big = {"model": "fast:race", "messages": [{"role": "user", "content": "x" * 400}]}
+    resp = await _post_once(app, big, path="/v1/chat/completions?stablellm_race_redirect=1")
+    assert resp.status_code == 200
+    assert [c[0] for c in calls] == ["https://a.test"]  # one upstream POST
+
+
+@pytest.mark.asyncio
 async def test_marked_request_does_not_count_or_redirect_again(proxy_app):
     """The marked follow-up races without incrementing the logical count again."""
     app, calls, main = proxy_app(_TWO_PROVIDER_RACE_CFG, _race_winner_handler)

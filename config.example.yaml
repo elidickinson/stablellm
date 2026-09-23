@@ -7,6 +7,7 @@ settings:
   race_interval_secs: 21600  # 6h
   race_interval_requests: 25
   race_settle_timeout_secs: 120  # hard cap for race completion/drain accounting; must be > 0
+  race_max_prompt_bytes: 0  # skip races whose request body is bigger than this; 0 = no cap
   log_level: INFO
 
 # Provider registry — optional. The predefined openrouter provider is always
