@@ -9,7 +9,11 @@ RUN adduser --disabled-password --no-create-home app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-cache-dir
 
-COPY --chown=app:app config.py main.py requestlog.py ./
+COPY --chown=app:app *.py ./
+
+# Fail the build on a missing or broken module instead of at container start.
+# Not `import main`: it calls load_or_exit() and config.yaml is mounted, not baked.
+RUN .venv/bin/python -c "import config, requestlog, performance_routing"
 
 # config.yaml must be mounted at /app/config.yaml (not baked into image).
 # Dokploy: use a File Mount (see README). Docker: -v ./config.yaml:/app/config.yaml
