@@ -534,9 +534,41 @@ def test_performance_routing_requires_openrouter_name():
     with pytest.raises(ConfigError, match="entry 0: 'performance_routing' is only valid on the 'openrouter' provider"):
         parse_config(raw)
 
-
 def _perf_cfg(**endpoint_extra) -> dict:
     return make_minimal(groups={"default": _group([{"provider": "openrouter", "performance_routing": {**endpoint_extra}}])})
+
+
+def _routing_cfg(routing: object) -> dict:
+    return make_minimal(groups={"default": _group([{"provider": "openrouter", "routing": routing}])})
+
+
+@pytest.mark.parametrize("amount", ["0.5", True, -1, float("nan"), float("inf")])
+def test_routing_max_price_values_must_be_amounts(amount):
+    with pytest.raises(ConfigError, match="'max_price' must be a non-empty mapping of non-negative numbers"):
+        parse_config(_routing_cfg({"max_price": {"prompt": amount}}))
+
+
+def test_routing_max_price_must_be_a_non_empty_mapping():
+    for bad in ({}, "author", 5, [1.0], None):
+        if bad is None:
+            parse_config(_routing_cfg({"max_price": None}))  # null is absent, not malformed
+            continue
+        with pytest.raises(ConfigError, match="'max_price'"):
+            parse_config(_routing_cfg({"max_price": bad}))
+
+
+@pytest.mark.parametrize("names", [[], "fp8", [1, 2], ["fp8", 2], None])
+def test_routing_quantizations_must_be_names(names):
+    if names is None:
+        parse_config(_routing_cfg({"quantizations": None}))  # null is absent
+        return
+    with pytest.raises(ConfigError, match="'quantizations' must be a non-empty list of quantization names"):
+        parse_config(_routing_cfg({"quantizations": names}))
+
+
+def test_routing_accepts_well_formed_constraints():
+    endpoints, _, _ = parse_config(_routing_cfg({"quantizations": ["fp8", "bf16"], "max_price": {"prompt": 1.0, "image": 0.0}}))
+    assert endpoints[0].routing == {"quantizations": ["fp8", "bf16"], "max_price": {"prompt": 1.0, "image": 0.0}}
 
 
 def test_performance_routing_defaults_are_on():

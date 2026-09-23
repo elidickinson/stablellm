@@ -844,9 +844,7 @@ async def _apply_performance_routing(body: dict, ep: Endpoint, group: str, sessi
         provider.pop("only", None)
     if "allow_fallbacks" not in provider:
         provider["allow_fallbacks"] = True
-    # Only a mapping cap is a constraint we applied; a non-mapping one is
-    # forwarded to OpenRouter untouched and is not ours to report.
-    caps = provider.get("max_price") if isinstance(provider.get("max_price"), dict) else None
+    caps = provider.get("max_price")
     quants = provider.get("quantizations")
     derivation_line = ""
     if caps or quants:

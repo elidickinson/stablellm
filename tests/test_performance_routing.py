@@ -52,6 +52,16 @@ def test_fast_tags_skip_rows_with_malformed_metrics():
     assert tags == ["good"]
 
 
+def test_fast_tags_ignore_non_finite_metrics():
+    # Infinity looks fastest and NaN can wipe every tag, so both are unusable
+    # rather than rankable. Order must not matter.
+    for junk in (float("inf"), float("nan"), True):
+        bad = {"tag": "bad", "latency_last_30m": {"p50": junk}, "throughput_last_30m": {"p50": junk}}
+        good = [_endpoint("slow", 500, 50), _endpoint("fast", 100, 100)]
+        assert fast_tags([bad, *good], PerformanceRouting()) == ["fast"], junk
+        assert fast_tags([*good, bad], PerformanceRouting()) == ["fast"], junk
+
+
 def test_price_cap_converts_per_token_to_per_million():
     assert price_cap(5e-06, 0.15) == 5.75
 

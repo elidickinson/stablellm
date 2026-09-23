@@ -1,4 +1,5 @@
 #!/bin/sh
 set -eu
 
-exec uv run --frozen ruff check .
+uv run --frozen ruff check .
+exec uv run --frozen pyright

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -54,17 +55,21 @@ def _median(values: Sequence[float]) -> float:
 
 
 def _row_number(row: dict[str, Any], *path: str) -> float | None:
-    """Numeric value at a nested path in a row, or None when it is absent or
-    not a number."""
+    """Numeric value at a nested path in a row, or None when it is absent or not
+    a usable number. Catalog data is upstream input: a wrong type or a non-finite
+    value is unusable, never fatal."""
     value: Any = row
     for key in path:
         if not isinstance(value, dict):
             return None
         value = value.get(key)
+    if isinstance(value, bool):
+        return None
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
+    return number if math.isfinite(number) else None
 
 
 def _row_price(row: dict[str, Any], field: str) -> float | None:
@@ -176,14 +181,12 @@ def derive_constraints(rows: list[dict[str, Any]], policy: PerformanceRouting, p
     (eligible rows, effective floor bit width or None), or None when the
     constraints exclude every row."""
     static_quant = provider.get("quantizations")
-    # `routing` is a passthrough, so a value that is not a list is not a
-    # constraint: it is ignored and the derived rule applies instead.
     # The author's list is literal: a short form covers its long variants and a
     # long form covers only itself, which is how the selector reads it too. Rows
     # are folded to their short form before matching.
-    quant_values = frozenset(static_quant) if isinstance(static_quant, list) and static_quant else None
+    quant_values = None if static_quant is None else frozenset(static_quant)
     floor = None
-    static_price = provider.get("max_price") if isinstance(provider.get("max_price"), dict) else None
+    static_price = provider.get("max_price")
     if static_price is None and policy.price_cap_tolerance is not None:
         medians = price_caps(rows)
         if medians is not None:

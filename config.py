@@ -187,6 +187,7 @@ def _parse_provider(name: str, entry: object, defaults: Provider | None = None) 
         ttfb_deadline_default = defaults.ttfb_deadline_secs
 
     routing = _opt_mapping(entry.get("routing"), "routing")
+    _check_routing(routing, f"provider '{name}'")
     _require_openrouter(routing, "routing", name, f"provider '{name}'")
     return Provider(
         base_url=base_url,
@@ -308,6 +309,23 @@ def _opt_performance_routing(value: object) -> PerformanceRouting | None:
         quantization_floor=floor,
         include_unknown_quantization=include_unknown,
     )
+
+
+def _amount(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+
+
+def _check_routing(routing: dict | None, where: str) -> None:
+    """The two keys performance routing reads must be well formed. At request time
+    a malformed one silently skips the endpoint or marks a healthy one down."""
+    if not routing:
+        return
+    names = routing.get("quantizations")
+    if names is not None and not (isinstance(names, list) and names and all(isinstance(n, str) for n in names)):
+        raise ConfigError(f"{where}: 'quantizations' must be a non-empty list of quantization names")
+    prices = routing.get("max_price")
+    if prices is not None and not (isinstance(prices, dict) and prices and all(_amount(amount) for amount in prices.values())):
+        raise ConfigError(f"{where}: 'max_price' must be a non-empty mapping of non-negative numbers")
 
 
 def _meta_str(value: object, key: str) -> str:
@@ -442,6 +460,7 @@ def _parse_groups(raw: object, providers: dict[str, Provider]) -> tuple[dict[str
             routing = _opt_mapping(entry.get("routing"), "routing")
             performance_routing = _opt_performance_routing(entry.get("performance_routing"))
             where = f"group '{group_name}' entry {i}"
+            _check_routing(routing, where)
             _require_openrouter(routing, "routing", prov_lower, where)
             _require_openrouter(performance_routing, "performance_routing", prov_lower, where)
             if routing is None:
