@@ -101,6 +101,8 @@ groups:
         #   price_cap_tolerance: 0.15          # prompt AND completion <= median * 1.15 (null = off)
         #   quantization_floor: auto           # auto = derived median bit width (rounded up); 4/8/16/32 = requirement; null = off
         #   include_unknown_quantization: true # whether unknown-width rows pass the floor
+        # `true` alone (i.e. `performance_routing: true`) is shorthand for {}
+        # — all rules at these defaults. Bare/null `performance_routing:` means off.
         # Per-endpoint overrides of provider-level settings:
         # max_concurrency: 1
         # ttfb_deadline_secs: 10

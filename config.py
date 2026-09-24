@@ -255,8 +255,11 @@ def _opt_secs(value: object, key: str, default: float) -> float:
 
 
 def _opt_performance_routing(value: object) -> PerformanceRouting | None:
-    if value is None:
+    if value is None or value is False:
         return None
+    # Bare `true` is shorthand for an empty mapping: all derived rules at defaults.
+    if value is True:
+        return PerformanceRouting()
     if not isinstance(value, dict):
         raise ConfigError("'performance_routing' must be a mapping")
     unknown = set(value) - {
