@@ -512,6 +512,85 @@ async def test_no_compatible_generated_only_retries_raw_routing(performance_app)
 
 
 @pytest.mark.asyncio
+async def test_rate_limited_derived_only_retries_as_ignore(performance_app):
+    # A rate-limited fast set leaves OpenRouter nothing to fall back to: the
+    # derived `only` widens into `ignore` once, keeping the price cap and
+    # quantization floor, and the retry is counted against our own selection
+    # rather than the endpoint.
+    post_calls = 0
+
+    def handler(request, _body):
+        nonlocal post_calls
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": {"endpoints": [_priced("fast", 400, 100)]}})
+        post_calls += 1
+        if post_calls == 1:
+            return httpx.Response(429, json={"error": {"message": "Rate limit exceeded", "code": 429}})
+        return httpx.Response(200, json={"provider": "slow", "choices": [], "usage": {"completion_tokens": 1}})
+
+    app, calls = performance_app(handler)
+    assert (await _post(app)).status_code == 200
+    assert calls[1][2]["provider"]["only"] == ["fast"]
+    retried = calls[2][2]["provider"]
+    assert retried["ignore"] == ["fast"]
+    assert "only" not in retried
+    assert retried["max_price"] == {"prompt": 2.3, "completion": 4.6}
+    assert "quantizations" not in retried  # fp8-only catalog: the floor would be a no-op
+    main = sys.modules["main"]
+    assert main._stats["successes"][0] == 1
+    assert main._stats["failures"][0] == 0
+    assert main._cooloff_until.get(0, 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_retry_keeps_static_only_and_ignore(performance_app):
+    # Static routing stays hard on the retry: its `only` still limits who may
+    # serve, and the failed fast set joins its `ignore`.
+    rows = [_priced("fast", 400, 100), _priced("slow", 100, 60)]
+
+    def handler(request, _body):
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": {"endpoints": rows}})
+        if len(calls) == 2:
+            return httpx.Response(429, json={"error": {"message": "Rate limit exceeded", "code": 429}})
+        return httpx.Response(200, json={"choices": [], "usage": {"completion_tokens": 1}})
+
+    app, calls = performance_app(handler, _test_config([{
+        "provider": "openrouter",
+        "model": "author/model",
+        "performance_routing": {},
+        "routing": {"only": ["fast", "slow"], "ignore": ["other"]},
+    }]))
+    assert (await _post(app)).status_code == 200
+    assert calls[1][2]["provider"]["only"] == ["fast"]
+    retried = calls[2][2]["provider"]
+    assert retried["only"] == ["fast", "slow"]
+    assert retried["ignore"] == ["other", "fast"]
+
+
+@pytest.mark.asyncio
+async def test_second_rate_limit_fails_without_third_send(performance_app):
+    # A 429 on the ignore retry is a genuine endpoint failure: it is marked
+    # down rather than retried again.
+    post_calls = 0
+
+    def handler(request, _body):
+        nonlocal post_calls
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": {"endpoints": [_priced("fast", 400, 100)]}})
+        post_calls += 1
+        return httpx.Response(429, json={"error": {"message": "Rate limit exceeded", "code": 429}})
+
+    app, calls = performance_app(handler)
+    assert (await _post(app)).status_code == 502
+    assert post_calls == 2
+    assert calls[2][2]["provider"]["ignore"] == ["fast"]
+    main = sys.modules["main"]
+    assert main._stats["failures"][0] == 1
+    assert main._cooloff_until.get(0, 0) > 0
+
+
+@pytest.mark.asyncio
 async def test_empty_derivation_skips_to_next_endpoint(performance_app):
     def handler(request, _body):
         if request.method == "GET":

@@ -1847,7 +1847,7 @@ async def test_streaming_request_holds_slot_until_stream_ends(proxy_app):
         req_id="t", keyname="", model_requested="m", model_served="m", provider_served="a", mode="seq", stream=True,
     )
 
-    result, reason = await main._proxy_stream(ep, "/v1/chat/completions", {}, b"{}", metrics, "ctx", on_done=release)
+    result, reason, _status = await main._proxy_stream(ep, "/v1/chat/completions", {}, b"{}", metrics, "ctx", on_done=release)
     assert result is not None and reason is None
     # Slot is held after the response is returned, not just until headers arrive.
     assert main._inflight[("https://a.test", "m")] == 1
@@ -1986,7 +1986,7 @@ async def test_stream_slot_released_when_client_never_iterates(proxy_app):
         req_id="t", keyname="", model_requested="m", model_served="m", provider_served="a", mode="seq", stream=True,
     )
 
-    result, _reason = await main._proxy_stream(ep, "/v1/chat/completions", {}, b"{}", metrics, "ctx", on_done=release)
+    result, _reason, _status = await main._proxy_stream(ep, "/v1/chat/completions", {}, b"{}", metrics, "ctx", on_done=release)
     assert result is not None
     await result.body_iterator.aclose()  # starlette drops it without iterating
     assert main._inflight[("https://a.test", "m")] == 0

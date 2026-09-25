@@ -442,6 +442,32 @@ def _no_compatible_provider(reason: str) -> bool:
     return any(s in lowered for s in ("no providers", "no compatible provider", "no endpoints found", "no allowed providers"))
 
 
+def _performance_retry(sent: bytes, raw_body: bytes, performance_selected: bool, status: int | None, reason: str) -> bytes | None:
+    """Next body to send to the same endpoint after a failed attempt, or None
+    when the endpoint attempt is over. At most two retries: a derived `only`
+    answered with 429 widens once into `ignore` (the price cap and quantization
+    floor are kept) so OpenRouter has other providers to try, and a text
+    rejection of our own constraints retries with raw routing. A body that is
+    already unconstrained is not retried."""
+    if not performance_selected or sent == raw_body:
+        return None
+    body = json.loads(sent)
+    provider = body.get("provider") or {}
+    if status == 429 and provider.get("only"):
+        # The failed fast set joins any static `ignore`; a static `only` stays
+        # a hard limit on who may serve the retry.
+        provider["ignore"] = provider.get("ignore", []) + provider.pop("only")
+        static_only = (json.loads(raw_body).get("provider") or {}).get("only")
+        if static_only is not None:
+            provider["only"] = static_only
+        log.info("performance routing model=%s reason=rate-limited-retry-ignore", body["model"])
+        return json.dumps(body).encode()
+    if _no_compatible_provider(reason):
+        log.info("performance routing model=%s reason=bypassed-compatible-provider", body["model"])
+        return raw_body
+    return None
+
+
 def _request_context(body: dict, group: str = "", req_id: str = "") -> str:
     """Slim per-request context for warnings: correlation id + routing shape."""
     parts = [f"req={req_id or '-'}"]
@@ -547,7 +573,7 @@ def _has_openai_sse_event(content: bytes) -> bool:
 
 
 async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, metrics, request_context: str, on_done=None, on_failure=None, on_success=None):
-    """Stream response from upstream. Returns (StreamingResponse, None) or (None, reason).
+    """Stream response from upstream. Returns (StreamingResponse, None, None) or (None, reason, status).
 
     The terminal outcome isn't known until the stream finishes, so the lifecycle
     hooks fire from the generator's finally: on_success() only when the stream
@@ -562,7 +588,7 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
     except UpstreamError as exc:
         reason = _exception_detail(exc)
         log.warning("upstream rejected streaming request to %s (%s): %s", ep.base_url, request_context, reason)
-        return None, reason
+        return None, reason, None
     ttfb = time.monotonic() - t0
     metrics.ttfb_ms = ttfb * 1000
 
@@ -571,7 +597,7 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
             reason = await _http_error_reason(resp)
             await resp.aclose()
             log.warning("upstream rejected streaming request to %s (%s): %s", ep.base_url, request_context, reason)
-            return None, reason
+            return None, reason, resp.status_code
 
         # Prime upstream chunks until we see the serving sub-provider (OpenRouter
         # tags every data chunk with top-level `provider`, but may first send
@@ -674,14 +700,14 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
         result = _streaming_response(resp, response_generator)
         if via:
             result.headers["X-StableLLM-Via"] = via
-        return result, None
+        return result, None, None
     except BaseException:
         await _close_quietly(resp)
         raise
 
 
 async def _proxy_buffered(ep: Endpoint, path: str, headers: dict, body: bytes, metrics, request_context: str):
-    """Non-streaming: send request, return full response or (None, reason)."""
+    """Non-streaming: send request, return full response or (None, reason, status)."""
     url = f"{ep.base_url}/{path}"
     t0 = time.monotonic()
     req = http_client.build_request("POST", url, headers=headers, content=body)
@@ -690,13 +716,13 @@ async def _proxy_buffered(ep: Endpoint, path: str, headers: dict, body: bytes, m
     except UpstreamError as exc:
         reason = _exception_detail(exc)
         log.warning("upstream rejected buffered request to %s (%s): %s", ep.base_url, request_context, reason)
-        return None, reason
+        return None, reason, None
     metrics.ttfb_ms = (time.monotonic() - t0) * 1000
     try:
         if resp.status_code != 200:
             reason = await _http_error_reason(resp)
             log.warning("upstream rejected buffered request to %s (%s): %s", ep.base_url, request_context, reason)
-            return None, reason
+            return None, reason, resp.status_code
         content = await resp.aread()
     finally:
         await _close_quietly(resp)
@@ -710,14 +736,14 @@ async def _proxy_buffered(ep: Endpoint, path: str, headers: dict, body: bytes, m
         if detail:
             reason = f"{reason}: {detail}"
         log.warning("upstream returned invalid JSON from %s (%s): %s", ep.base_url, request_context, reason)
-        return None, reason
+        return None, reason, None
 
     # A 200 JSON body can still be an upstream failure (top-level "error").
     # This path is pre-commit, so it fails over like any other rejection.
     if isinstance(data, dict) and (body_err := _body_error_detail(data)):
         reason = f"error body: {body_err}"
         log.warning("upstream returned 200 with error body from %s (%s): %s", ep.base_url, request_context, reason)
-        return None, reason
+        return None, reason, None
 
     metrics.elapsed_ms = elapsed * 1000
     usage = data.get("usage")
@@ -739,7 +765,7 @@ async def _proxy_buffered(ep: Endpoint, path: str, headers: dict, body: bytes, m
         result.headers["X-StableLLM-Via"] = via
 
     await asyncio.to_thread(requestlog.log_request, metrics)
-    return result, None
+    return result, None, None
 
 
 def _build_upstream_headers(ep: Endpoint) -> dict:
@@ -1240,22 +1266,21 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
             headers = _build_upstream_headers(ep)
             stripped = _strip_unsupported(body_dict, ep)
             stripped, performance_selected = await _apply_performance_routing(stripped, ep, group, session_key)
-            send_body = json.dumps(stripped).encode()
             url = f"{ep.base_url}/{path}"
-            req = http_client.build_request("POST", url, headers=headers, content=send_body)
-            resp = await _send_upstream(req, ep, stream=True)
-            if resp.status_code != 200:
-                reason = await _http_error_reason(resp)
-                if not performance_selected or not _no_compatible_provider(reason):
-                    raise UpstreamError(reason)
-                log.info("performance routing model=%s reason=bypassed-compatible-provider", model_name)
-                await _close_quietly(resp)
-                stripped = _strip_unsupported(body_dict, ep)
-                req = http_client.build_request("POST", url, headers=headers, content=json.dumps(stripped).encode())
+            send_body = json.dumps(stripped).encode()
+            raw_body = json.dumps(_strip_unsupported(body_dict, ep)).encode()
+            while True:
+                req = http_client.build_request("POST", url, headers=headers, content=send_body)
                 resp = await _send_upstream(req, ep, stream=True)
-                if resp.status_code != 200:
-                    raise UpstreamError(await _http_error_reason(resp))
-            return resp, release
+                if resp.status_code == 200:
+                    return resp, release
+                status = resp.status_code
+                reason = await _http_error_reason(resp)
+                await _close_quietly(resp)
+                resp = None
+                send_body = _performance_retry(send_body, raw_body, performance_selected, status, reason)
+                if send_body is None:
+                    raise UpstreamError(reason)
         except BaseException:
             release()
             if resp is not None:
@@ -2204,6 +2229,9 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         _stats["requests"][idx] += 1
 
         send_body = json.dumps(stripped).encode()
+        # The raw routing body is what the performance-routing retries fall back
+        # to; a plain endpoint has no alternate routing to try.
+        raw_body = send_body if not performance_selected else json.dumps(_strip_unsupported(body_dict, ep)).encode()
 
         log.debug(
             "req=%s attempt %d/%d -> %s model=%s body_keys=%s bytes=%d",
@@ -2227,26 +2255,18 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         count_success = lambda idx=idx: _count_success(idx)
         owns_release = True
         try:
-            if is_streaming:
-                result, reason = await _proxy_stream(ep, path, headers, send_body, metrics, request_context, on_done=release, on_failure=mark_failed, on_success=count_success)
-                if result is not None:
-                    # Ownership moved to the response generator: the slot is
-                    # held until the client has consumed the whole stream.
-                    owns_release = False
-            else:
-                result, reason = await _proxy_buffered(ep, path, headers, send_body, metrics, request_context)
-
-            if result is None and performance_selected and _no_compatible_provider(reason or ""):
-                log.info("performance routing model=%s reason=bypassed-compatible-provider", model_name)
-                stripped = _strip_unsupported(body_dict, ep)
-                send_body = json.dumps(stripped).encode()
+            while send_body is not None:
                 if is_streaming:
-                    result, reason = await _proxy_stream(ep, path, headers, send_body, metrics, request_context, on_done=release, on_failure=mark_failed, on_success=count_success)
+                    result, reason, status = await _proxy_stream(ep, path, headers, send_body, metrics, request_context, on_done=release, on_failure=mark_failed, on_success=count_success)
                     if result is not None:
+                        # Ownership moved to the response generator: the slot is
+                        # held until the client has consumed the whole stream.
                         owns_release = False
                 else:
-                    result, reason = await _proxy_buffered(ep, path, headers, send_body, metrics, request_context)
-
+                    result, reason, status = await _proxy_buffered(ep, path, headers, send_body, metrics, request_context)
+                if result is not None:
+                    break
+                send_body = _performance_retry(send_body, raw_body, performance_selected, status, reason or "")
             if result is not None:
                 # Success = a genuinely healthy completion. Streaming's terminal
                 # outcome isn't known yet here, so it counts via on_success when
