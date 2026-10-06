@@ -40,8 +40,8 @@ from config import (
 )
 from performance_routing import (
     derive_constraints,
-    fast_tags,
     matches_provider_tag,
+    rank_tags,
 )
 
 config.load_or_exit()
@@ -442,29 +442,20 @@ def _no_compatible_provider(reason: str) -> bool:
     return any(s in lowered for s in ("no providers", "no compatible provider", "no endpoints found", "no allowed providers"))
 
 
-def _performance_retry(sent: bytes, raw_body: bytes, performance_selected: bool, status: int | None, reason: str) -> bytes | None:
+def _performance_retry(sent: dict, raw: dict, rate_limited: dict | None, status: int | None, reason: str) -> dict | None:
     """Next body to send to the same endpoint after a failed attempt, or None
     when the endpoint attempt is over. At most two retries: a derived `only`
-    answered with 429 widens once into `ignore` (the price cap and quantization
-    floor are kept) so OpenRouter has other providers to try, and a text
-    rejection of our own constraints retries with raw routing. A body that is
-    already unconstrained is not retried."""
-    if not performance_selected or sent == raw_body:
-        return None
-    body = json.loads(sent)
-    provider = body.get("provider") or {}
-    if status == 429 and provider.get("only"):
-        # The failed fast set joins any static `ignore`; a static `only` stays
-        # a hard limit on who may serve the retry.
-        provider["ignore"] = provider.get("ignore", []) + provider.pop("only")
-        static_only = (json.loads(raw_body).get("provider") or {}).get("only")
-        if static_only is not None:
-            provider["only"] = static_only
-        log.info("performance routing model=%s reason=rate-limited-retry-ignore", body["model"])
-        return json.dumps(body).encode()
-    if _no_compatible_provider(reason):
-        log.info("performance routing model=%s reason=bypassed-compatible-provider", body["model"])
-        return raw_body
+    answered with 429 retries once as `rate_limited` (the price cap and
+    quantization floor are kept) so OpenRouter has other providers to try, and
+    a text rejection of our own constraints retries with raw routing. A body
+    that is already unconstrained is not retried. Each retry only loosens
+    routing, so the 429 retry is taken from the routed body alone."""
+    if status == 429 and rate_limited is not None and sent not in (rate_limited, raw):
+        log.info("performance routing model=%s reason=rate-limited-retry-order", sent["model"])
+        return rate_limited
+    if sent != raw and _no_compatible_provider(reason):
+        log.info("performance routing model=%s reason=bypassed-compatible-provider", sent["model"])
+        return raw
     return None
 
 
@@ -513,6 +504,42 @@ def _sse_error_detail(obj: dict) -> str | None:
     else:
         detail = str(err)
     return _clip(detail)
+
+
+def _sse_error_status(obj: dict) -> int | None:
+    """HTTP-style status carried in an error event's ``code`` (OpenRouter sends
+    e.g. 429), or None when the code is absent or not numeric."""
+    err = obj.get("error")
+    code = err.get("code") if isinstance(err, dict) else None
+    if isinstance(code, str) and code.isdigit():
+        return int(code)
+    return code if isinstance(code, int) and not isinstance(code, bool) else None
+
+
+def _first_sse_event(buffer: bytearray, chunk: bytes) -> dict | None:
+    """The first complete data event in the stream so far, or None while there
+    is none yet. Comments and `[DONE]` are not events; a payload that is not a
+    JSON object counts as an empty event. Call with each chunk in turn until it
+    returns an event."""
+    buffer.extend(chunk)
+    # SSE allows CRLF line endings; a CR split from its LF across chunks is
+    # normalized once the LF arrives.
+    buffer[:] = buffer.replace(b"\r\n", b"\n")
+    while b"\n\n" in buffer:
+        event, _, rest = buffer.partition(b"\n\n")
+        buffer[:] = rest
+        for line in event.split(b"\n"):
+            if not line.startswith(b"data:"):
+                continue
+            data = line[5:].strip()
+            if data == b"[DONE]":
+                continue
+            try:
+                obj = json.loads(data)
+            except json.JSONDecodeError:
+                return {}
+            return obj if isinstance(obj, dict) else {}
+    return None
 
 
 def _body_error_detail(data: dict) -> str | None:
@@ -599,30 +626,31 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
             log.warning("upstream rejected streaming request to %s (%s): %s", ep.base_url, request_context, reason)
             return None, reason, resp.status_code
 
-        # Prime upstream chunks until we see the serving sub-provider (OpenRouter
-        # tags every data chunk with top-level `provider`, but may first send
-        # `: OPENROUTER PROCESSING` keepalive comments) so we can set the
-        # X-StableLLM-Via header before response headers are committed.
-        want_via = _openrouter_via(ep)
+        # Hold the response until the first data event (OpenRouter may first
+        # send `: OPENROUTER PROCESSING` keepalive comments). The client has seen
+        # nothing yet, so an error event there is a failed attempt the caller
+        # can retry or fail over. OpenRouter tags every data event with the
+        # serving sub-provider, which sets X-StableLLM-Via before the response
+        # headers are committed.
         byte_iter = resp.aiter_bytes()
         primed: list[bytes] = []
-        via = None
-        # OpenRouter tags every chunk with the serving sub-provider; prime up
-        # to 8 chunks to find it. (The placeholder yield + __anext__ below arms
-        # the generator's finally without any priming for other providers.)
-        if want_via:
-            try:
-                while len(primed) < 8:
-                    chunk = await byte_iter.__anext__()
-                    if metrics.ttft_ms is None:
-                        metrics.ttft_ms = (time.monotonic() - t0) * 1000
-                        log.debug("req=%s %s TTFT %.0fms (TTFB %.0fms)", metrics.req_id, ep.provider, metrics.ttft_ms, ttfb * 1000)
-                    primed.append(chunk)
-                    via = _provider_from_sse(chunk)
-                    if via:
-                        break
-            except StopAsyncIteration:
-                pass
+        prime_buf = bytearray()
+        first_event = None
+        try:
+            while first_event is None:
+                chunk = await byte_iter.__anext__()
+                if metrics.ttft_ms is None:
+                    metrics.ttft_ms = (time.monotonic() - t0) * 1000
+                    log.debug("req=%s %s TTFT %.0fms (TTFB %.0fms)", metrics.req_id, ep.provider, metrics.ttft_ms, ttfb * 1000)
+                primed.append(chunk)
+                first_event = _first_sse_event(prime_buf, chunk)
+        except StopAsyncIteration:
+            pass
+        if first_event is not None and (reason := _sse_error_detail(first_event)):
+            await resp.aclose()
+            log.warning("upstream streamed an error before any content from %s (%s): %s", ep.base_url, request_context, reason)
+            return None, reason, _sse_error_status(first_event)
+        via = _openrouter_served_provider(first_event) if first_event is not None and _openrouter_via(ep) else None
         metrics.via = via or ""
 
         # Mid-stream upstream error events (e.g. a chunk carrying a top-level
@@ -743,7 +771,7 @@ async def _proxy_buffered(ep: Endpoint, path: str, headers: dict, body: bytes, m
     if isinstance(data, dict) and (body_err := _body_error_detail(data)):
         reason = f"error body: {body_err}"
         log.warning("upstream returned 200 with error body from %s (%s): %s", ep.base_url, request_context, reason)
-        return None, reason, None
+        return None, reason, _sse_error_status(data)
 
     metrics.elapsed_ms = elapsed * 1000
     usage = data.get("usage")
@@ -836,30 +864,43 @@ def _provider_tags(raw_only: object, tags: list[str]) -> list[str]:
     return [tag for tag in tags if any(matches_provider_tag(tag, allowed) for allowed in raw_only)]
 
 
-async def _apply_performance_routing(body: dict, ep: Endpoint, group: str, session_key: str) -> tuple[dict, bool]:
+async def _apply_performance_routing(body: dict, ep: Endpoint, group: str, session_key: str) -> tuple[dict, dict | None]:
     """Apply derived OpenRouter routing constraints and a locally-ranked
     allowlist when fresh metrics are usable.
+
+    Returns (routed body, body to retry with if the derived `only` is rate
+    limited, or None when no `only` was derived). The body passes through
+    unmodified when performance routing does not apply.
 
     Raises EligibleEmpty when the constraints exclude every catalog row; the
     caller skips the endpoint and rolls to the next."""
     if ep.performance_routing is None or not _openrouter_via(ep):
-        return body, False
+        return body, None
 
     rows, source = await _openrouter_catalog(ep, body["model"])
     if rows is None:
-        return body, False  # no catalog, no rows: the body passes through unmodified
+        return body, None  # no catalog, no rows: the body passes through unmodified
     provider = {**body.get("provider", {})}
+    static_only = provider.get("only")
     derivation = derive_constraints(rows, ep.performance_routing, provider)
     if derivation is None:
         log.info("performance routing model=%s reason=empty-derivation", body["model"])
         raise EligibleEmpty("derived price/quantization caps exclude every catalog row")
     eligible, floor_bits = derivation
-    tags = fast_tags(eligible, ep.performance_routing)
+    tags, slower = rank_tags(eligible, ep.performance_routing)
+    # The pin names OpenRouter's display name for the provider; the selector
+    # takes the catalog tags of that provider's eligible rows.
     via = _pinned_via(group, session_key)
-    if tags and via and via not in tags:
-        tags.append(via)
+    pinned = [
+        tag for row in eligible
+        if via and row.get("provider_name") == via and isinstance(tag := row.get("tag"), str) and tag not in tags
+    ]
+    if tags and pinned:
+        tags.extend(pinned)
+        slower = [tag for tag in slower if tag not in pinned]
         source = f"{source}+pinned"
-    tags = _provider_tags(provider.get("only"), tags)
+    tags = _provider_tags(static_only, tags)
+    slower = _provider_tags(static_only, slower)
     provider.pop("order", None)
     provider.pop("sort", None)
     # The constraint is hard, the speed optimization is not: a static `only`
@@ -870,6 +911,18 @@ async def _apply_performance_routing(body: dict, ep: Endpoint, group: str, sessi
         provider.pop("only", None)
     if "allow_fallbacks" not in provider:
         provider["allow_fallbacks"] = True
+    rate_limited = None
+    if tags:
+        # A rate-limited fast set leaves OpenRouter nothing to fall back to.
+        # The retry tries the slower ranked providers first, then (fallbacks
+        # allowed) every other eligible one, the failed fast set included; a
+        # static `only` stays a hard limit.
+        retry_provider = {k: v for k, v in provider.items() if k != "only"}
+        if static_only is not None:
+            retry_provider["only"] = static_only
+        if slower:
+            retry_provider["order"] = slower
+        rate_limited = {**body, "provider": retry_provider}
     caps = provider.get("max_price")
     quants = provider.get("quantizations")
     derivation_line = ""
@@ -885,7 +938,7 @@ async def _apply_performance_routing(body: dict, ep: Endpoint, group: str, sessi
         "performance routing model=%s tags=%s reason=%s%s",
         body["model"], ",".join(tags) or "-", source, derivation_line,
     )
-    return {**body, "provider": provider}, True
+    return {**body, "provider": provider}, rate_limited
 
 
 def _provider_from_sse(bytes_data: bytes) -> str | None:
@@ -1264,13 +1317,11 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
         resp: httpx.Response | None = None
         try:
             headers = _build_upstream_headers(ep)
-            stripped = _strip_unsupported(body_dict, ep)
-            stripped, performance_selected = await _apply_performance_routing(stripped, ep, group, session_key)
+            raw = _strip_unsupported(body_dict, ep)
+            send, rate_limited = await _apply_performance_routing(raw, ep, group, session_key)
             url = f"{ep.base_url}/{path}"
-            send_body = json.dumps(stripped).encode()
-            raw_body = json.dumps(_strip_unsupported(body_dict, ep)).encode()
             while True:
-                req = http_client.build_request("POST", url, headers=headers, content=send_body)
+                req = http_client.build_request("POST", url, headers=headers, content=json.dumps(send).encode())
                 resp = await _send_upstream(req, ep, stream=True)
                 if resp.status_code == 200:
                     return resp, release
@@ -1278,8 +1329,8 @@ async def _race_request(path: str, body_dict: dict, is_streaming: bool, group: s
                 reason = await _http_error_reason(resp)
                 await _close_quietly(resp)
                 resp = None
-                send_body = _performance_retry(send_body, raw_body, performance_selected, status, reason)
-                if send_body is None:
+                send = _performance_retry(send, raw, rate_limited, status, reason)
+                if send is None:
                     raise UpstreamError(reason)
         except BaseException:
             release()
@@ -2213,8 +2264,8 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
             # Derive the OpenRouter constraints and allowlist before taking a
             # slot: an endpoint whose constraints exclude every provider is
             # skipped without consuming concurrency or being marked down.
-            stripped = _strip_unsupported(body_dict, ep)
-            stripped, performance_selected = await _apply_performance_routing(stripped, ep, group_name, session_key)
+            raw = _strip_unsupported(body_dict, ep)
+            send, rate_limited = await _apply_performance_routing(raw, ep, group_name, session_key)
         except EligibleEmpty as exc:
             # Per-request skip, not a mark-down: there is nothing to recover
             # from, and the 502 must name this rather than the generic skip.
@@ -2228,14 +2279,11 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
 
         _stats["requests"][idx] += 1
 
-        send_body = json.dumps(stripped).encode()
-        # The raw routing body is what the performance-routing retries fall back
-        # to; a plain endpoint has no alternate routing to try.
-        raw_body = send_body if not performance_selected else json.dumps(_strip_unsupported(body_dict, ep)).encode()
+        send_body = json.dumps(send).encode()
 
         log.debug(
             "req=%s attempt %d/%d -> %s model=%s body_keys=%s bytes=%d",
-            req_id, attempt, total, ep.provider or ep.base_url, model_name, list(stripped.keys()), len(send_body),
+            req_id, attempt, total, ep.provider or ep.base_url, model_name, list(send.keys()), len(send_body),
         )
 
         headers = _build_upstream_headers(ep)
@@ -2255,7 +2303,7 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
         count_success = lambda idx=idx: _count_success(idx)
         owns_release = True
         try:
-            while send_body is not None:
+            while True:
                 if is_streaming:
                     result, reason, status = await _proxy_stream(ep, path, headers, send_body, metrics, request_context, on_done=release, on_failure=mark_failed, on_success=count_success)
                     if result is not None:
@@ -2266,7 +2314,10 @@ async def proxy(request: Request, path: str, authorization: str | None = Header(
                     result, reason, status = await _proxy_buffered(ep, path, headers, send_body, metrics, request_context)
                 if result is not None:
                     break
-                send_body = _performance_retry(send_body, raw_body, performance_selected, status, reason or "")
+                send = _performance_retry(send, raw, rate_limited, status, reason or "")
+                if send is None:
+                    break
+                send_body = json.dumps(send).encode()
             if result is not None:
                 # Success = a genuinely healthy completion. Streaming's terminal
                 # outcome isn't known yet here, so it counts via on_success when

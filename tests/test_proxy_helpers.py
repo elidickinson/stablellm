@@ -20,6 +20,15 @@ def main_module(monkeypatch, tmp_path):
     return main
 
 
+# --- _first_sse_event ---
+
+def test_first_sse_event_skips_comments_and_handles_split_crlf(main_module):
+    buf = bytearray()
+    assert main_module._first_sse_event(buf, b": OPENROUTER PROCESSING\r\n\r") is None
+    assert main_module._first_sse_event(buf, b'\ndata: {"provider": "X"}\r') is None
+    assert main_module._first_sse_event(buf, b"\n\r\n") == {"provider": "X"}
+
+
 # --- _scan_sse_events ---
 
 def test_sse_extracts_completion_tokens_from_finished_event(main_module):

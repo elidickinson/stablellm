@@ -9,9 +9,9 @@ from conftest import fresh_config
 from performance_routing import (
     PerformanceRouting,
     derive_constraints,
-    fast_tags,
     price_cap,
     quantization_floor,
+    rank_tags,
 )
 
 
@@ -32,34 +32,36 @@ def _row(tag, prompt, completion, quantization):
     }
 
 
-def test_fast_tags_use_projected_completion_time():
-    tags = fast_tags([
-        _endpoint("fast", 500, 100),
+def test_rank_tags_split_by_projected_completion_time():
+    fast, slower = rank_tags([
+        _endpoint("slowest", 100, 50),
         _endpoint("near", 100, 90),
+        _endpoint("fast", 500, 100),
         _endpoint("slow", 100, 70),
         _endpoint("unknown", None, None),
     ], PerformanceRouting(target_tokens=10_000, speed_tolerance=0.15))
-    assert tags == ["fast", "near"]
+    assert fast == ["fast", "near"]
+    assert slower == ["slow", "slowest"]
 
 
-def test_fast_tags_skip_rows_with_malformed_metrics():
+def test_rank_tags_skip_rows_with_malformed_metrics():
     # A catalog row whose metric field is not a mapping is unusable, not fatal.
-    tags = fast_tags([
+    fast, slower = rank_tags([
         {"tag": "broken", "latency_last_30m": "oops", "throughput_last_30m": 5},
         {"tag": "half", "latency_last_30m": {"p50": 100}},
         _endpoint("good", 100, 100),
     ], PerformanceRouting())
-    assert tags == ["good"]
+    assert (fast, slower) == (["good"], [])
 
 
-def test_fast_tags_ignore_non_finite_metrics():
+def test_rank_tags_ignore_non_finite_metrics():
     # Infinity looks fastest and NaN can wipe every tag, so both are unusable
     # rather than rankable. Order must not matter.
     for junk in (float("inf"), float("nan"), True):
         bad = {"tag": "bad", "latency_last_30m": {"p50": junk}, "throughput_last_30m": {"p50": junk}}
         good = [_endpoint("slow", 500, 50), _endpoint("fast", 100, 100)]
-        assert fast_tags([bad, *good], PerformanceRouting()) == ["fast"], junk
-        assert fast_tags([*good, bad], PerformanceRouting()) == ["fast"], junk
+        assert rank_tags([bad, *good], PerformanceRouting()) == (["fast"], ["slow"]), junk
+        assert rank_tags([*good, bad], PerformanceRouting()) == (["fast"], ["slow"]), junk
 
 
 def test_price_cap_converts_per_token_to_per_million():
@@ -213,7 +215,7 @@ def test_ranking_runs_inside_the_constraints():
     provider: dict = {}
     eligible, _floor = derive_constraints(rows, PerformanceRouting(), provider)
     assert provider["quantizations"] == ["int8", "fp8", "mxfp8", "fp16", "bf16", "fp32", "unknown"]
-    assert fast_tags(eligible, PerformanceRouting()) == ["eight"]
+    assert rank_tags(eligible, PerformanceRouting()) == (["eight"], ["out"])
 
 
 def test_static_constraints_govern_filtering_and_are_emitted_verbatim():
@@ -246,7 +248,7 @@ def test_unmeasured_eligible_rows_rank_to_no_tags():
     eligible, _floor = derive_constraints([_row("u", "1e-06", "2e-06", "fp8")], PerformanceRouting(), provider)
     assert provider.get("quantizations") is None
     assert eligible
-    assert fast_tags(eligible, PerformanceRouting()) == []
+    assert rank_tags(eligible, PerformanceRouting()) == ([], [])
 
 
 def _test_config(endpoints):
@@ -477,17 +479,18 @@ async def test_performance_routing_emits_derived_constraints_and_caches_catalog(
 
 @pytest.mark.asyncio
 async def test_pinned_via_stays_in_generated_only(performance_app):
-    rows = [_priced("fast", 400, 100), _priced("slow", 100, 60)]
+    # The pin is OpenRouter's display name; `only` carries that provider's tag.
+    rows = [_priced("fast", 400, 100), {**_priced("slow/fp8", 100, 60), "provider_name": "Slow Co"}]
 
     def handler(request, _body):
         if request.method == "GET":
             return httpx.Response(200, json={"data": {"endpoints": rows}})
-        return httpx.Response(200, json={"provider": "cached-provider", "choices": [], "usage": {"completion_tokens": 1}})
+        return httpx.Response(200, json={"provider": "Slow Co", "choices": [], "usage": {"completion_tokens": 1}})
 
     app, calls = performance_app(handler)
     assert (await _post(app)).status_code == 200
     assert (await _post(app)).status_code == 200
-    assert calls[2][2]["provider"]["only"] == ["fast", "cached-provider"]
+    assert calls[2][2]["provider"]["only"] == ["fast", "slow/fp8"]
 
 
 @pytest.mark.asyncio
@@ -512,17 +515,17 @@ async def test_no_compatible_generated_only_retries_raw_routing(performance_app)
 
 
 @pytest.mark.asyncio
-async def test_rate_limited_derived_only_retries_as_ignore(performance_app):
+async def test_rate_limited_derived_only_retries_as_order(performance_app):
     # A rate-limited fast set leaves OpenRouter nothing to fall back to: the
-    # derived `only` widens into `ignore` once, keeping the price cap and
-    # quantization floor, and the retry is counted against our own selection
-    # rather than the endpoint.
+    # retry drops the derived `only` and orders the slower ranked providers
+    # first, keeping the price cap and quantization floor, and is counted
+    # against our own selection rather than the endpoint.
     post_calls = 0
 
     def handler(request, _body):
         nonlocal post_calls
         if request.method == "GET":
-            return httpx.Response(200, json={"data": {"endpoints": [_priced("fast", 400, 100)]}})
+            return httpx.Response(200, json={"data": {"endpoints": [_priced("fast", 400, 100), _priced("slow", 100, 60)]}})
         post_calls += 1
         if post_calls == 1:
             return httpx.Response(429, json={"error": {"message": "Rate limit exceeded", "code": 429}})
@@ -532,8 +535,10 @@ async def test_rate_limited_derived_only_retries_as_ignore(performance_app):
     assert (await _post(app)).status_code == 200
     assert calls[1][2]["provider"]["only"] == ["fast"]
     retried = calls[2][2]["provider"]
-    assert retried["ignore"] == ["fast"]
+    assert retried["order"] == ["slow"]
+    assert retried["allow_fallbacks"] is True
     assert "only" not in retried
+    assert "ignore" not in retried
     assert retried["max_price"] == {"prompt": 2.3, "completion": 4.6}
     assert "quantizations" not in retried  # fp8-only catalog: the floor would be a no-op
     main = sys.modules["main"]
@@ -543,9 +548,40 @@ async def test_rate_limited_derived_only_retries_as_ignore(performance_app):
 
 
 @pytest.mark.asyncio
+async def test_streamed_rate_limit_before_content_retries_as_order(performance_app):
+    # OpenRouter answers 200 and reports the fast set's rate limit as the first
+    # data event. The client has seen nothing yet, so it retries like an HTTP 429.
+    post_calls = 0
+
+    def handler(request, _body):
+        nonlocal post_calls
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": {"endpoints": [_priced("fast", 400, 100), _priced("slow", 100, 60)]}})
+        post_calls += 1
+        if post_calls == 1:
+            sse = b': OPENROUTER PROCESSING\n\ndata: {"error":{"message":"Provider returned error","code":429}}\n\n'
+        else:
+            sse = b'data: {"choices":[{"delta":{"content":"ok"}}],"provider":"Slow Co"}\n\ndata: [DONE]\n\n'
+        return httpx.Response(200, content=sse, headers={"content-type": "text/event-stream"})
+
+    app, calls = performance_app(handler)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post("/v1/chat/completions", json={
+            "model": "default", "stream": True, "messages": [{"role": "user", "content": "hello"}],
+        })
+    assert resp.status_code == 200
+    assert b"Provider returned error" not in resp.content
+    assert resp.headers["x-stablellm-via"] == "Slow Co"
+    assert calls[1][2]["provider"]["only"] == ["fast"]
+    assert calls[2][2]["provider"]["order"] == ["slow"]
+    main = sys.modules["main"]
+    assert main._cooloff_until.get(0, 0) == 0
+
+
+@pytest.mark.asyncio
 async def test_rate_limited_retry_keeps_static_only_and_ignore(performance_app):
     # Static routing stays hard on the retry: its `only` still limits who may
-    # serve, and the failed fast set joins its `ignore`.
+    # serve and its `ignore` passes through.
     rows = [_priced("fast", 400, 100), _priced("slow", 100, 60)]
 
     def handler(request, _body):
@@ -565,13 +601,14 @@ async def test_rate_limited_retry_keeps_static_only_and_ignore(performance_app):
     assert calls[1][2]["provider"]["only"] == ["fast"]
     retried = calls[2][2]["provider"]
     assert retried["only"] == ["fast", "slow"]
-    assert retried["ignore"] == ["other", "fast"]
+    assert retried["ignore"] == ["other"]
+    assert retried["order"] == ["slow"]
 
 
 @pytest.mark.asyncio
 async def test_second_rate_limit_fails_without_third_send(performance_app):
-    # A 429 on the ignore retry is a genuine endpoint failure: it is marked
-    # down rather than retried again.
+    # A 429 on the rate-limit retry is a genuine endpoint failure: it is
+    # marked down rather than retried again.
     post_calls = 0
 
     def handler(request, _body):
@@ -584,10 +621,30 @@ async def test_second_rate_limit_fails_without_third_send(performance_app):
     app, calls = performance_app(handler)
     assert (await _post(app)).status_code == 502
     assert post_calls == 2
-    assert calls[2][2]["provider"]["ignore"] == ["fast"]
+    assert "only" not in calls[2][2]["provider"]
     main = sys.modules["main"]
     assert main._stats["failures"][0] == 1
     assert main._cooloff_until.get(0, 0) > 0
+
+
+@pytest.mark.asyncio
+async def test_retries_only_loosen_routing(performance_app):
+    # 429 on the routed body, a constraint rejection on the rate-limit retry,
+    # then 429 on raw routing: three sends, never back to a tighter body.
+    post_calls = 0
+
+    def handler(request, _body):
+        nonlocal post_calls
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": {"endpoints": [_priced("fast", 400, 100), _priced("slow", 100, 60)]}})
+        post_calls += 1
+        if post_calls == 2:
+            return httpx.Response(404, json={"error": {"message": "No endpoints found matching your data policy"}})
+        return httpx.Response(429, json={"error": {"message": "Rate limit exceeded", "code": 429}})
+
+    app, _calls = performance_app(handler)
+    assert (await _post(app)).status_code == 502
+    assert post_calls == 3
 
 
 @pytest.mark.asyncio

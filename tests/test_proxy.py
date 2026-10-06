@@ -353,6 +353,35 @@ async def test_streaming_failover_emits_single_terminal_row(proxy_app, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_error_as_first_stream_event_fails_over(proxy_app):
+    """An error before any content reaches the client is a failed attempt: the
+    endpoint cools off and the next one serves, with the error never sent."""
+    def handler(req):
+        if req.url.host == "a.test":
+            sse = b'data: {"error":{"message":"overloaded","code":503}}\n\n'
+        else:
+            sse = b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+        return httpx.Response(200, content=sse, headers={"content-type": "text/event-stream"})
+
+    app, _calls, main = proxy_app(
+        {
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k"},
+                "b": {"base_url": "https://b.test", "api_key": "k"},
+            },
+            "groups": {"default": {"endpoints": [{"provider": "a"}, {"provider": "b"}]}},
+        },
+        handler,
+    )
+    resp = await _post(app, {"model": "default", "messages": [], "stream": True})
+    assert resp.status_code == 200
+    assert b"overloaded" not in resp.content
+    assert b"ok" in resp.content
+    assert main._last_failure[0] == "overloaded; 503"
+    assert main._cooloff_until.get(0, 0) > time.monotonic()
+
+
+@pytest.mark.asyncio
 async def test_midstream_error_event_is_failure_and_marks_down(proxy_app, monkeypatch):
     """Regression: a 200 SSE stream carrying a top-level {"error": ...} chunk must
     not be counted a success. The client receives the chunks verbatim (it renders

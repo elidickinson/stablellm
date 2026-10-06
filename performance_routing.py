@@ -146,8 +146,9 @@ def matches_provider_tag(tag: str, allowed: str) -> bool:
     return tag == allowed or tag.startswith(f"{allowed}/")
 
 
-def fast_tags(endpoints: Iterable[dict[str, Any]], config: PerformanceRouting) -> list[str]:
-    """Return endpoint tags within the configured projected-time tolerance.
+def rank_tags(endpoints: Iterable[dict[str, Any]], config: PerformanceRouting) -> tuple[list[str], list[str]]:
+    """Split measured endpoint tags, fastest first, into those within the
+    configured projected-time tolerance and the slower rest.
 
     OpenRouter reports latency in milliseconds and throughput in tokens/second.
     Rows without usable measurements cannot be ranked.
@@ -167,10 +168,10 @@ def fast_tags(endpoints: Iterable[dict[str, Any]], config: PerformanceRouting) -
         scored.append((tag, projected_seconds))
 
     if not scored:
-        return []
-    fastest = min(score for _, score in scored)
-    limit = fastest * (1 + config.speed_tolerance)
-    return [tag for tag, score in scored if score <= limit]
+        return [], []
+    scored.sort(key=lambda item: item[1])
+    limit = scored[0][1] * (1 + config.speed_tolerance)
+    return [tag for tag, score in scored if score <= limit], [tag for tag, score in scored if score > limit]
 
 
 def derive_constraints(rows: list[dict[str, Any]], policy: PerformanceRouting, provider: dict[str, Any]) -> tuple[list[dict[str, Any]], int | None] | None:
