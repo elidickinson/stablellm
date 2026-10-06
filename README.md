@@ -42,6 +42,7 @@ settings:
   race_settle_timeout_secs: 120  # hard cap for race completion/drain accounting from race start; must be > 0
   race_max_prompt_bytes: 0     # skip the race (not the request) when the request body exceeds this; 0 = no cap
   session_pin_ttl_secs: 900    # 15m — how long an idle session stays pinned to its endpoint
+  first_event_timeout_secs: 45 # hold a stream this long (from send) for its first data event, so an error there fails over instead of reaching the client; 0 = don't hold
   log_level: INFO
 
 providers:

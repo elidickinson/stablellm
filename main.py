@@ -554,6 +554,7 @@ def _scan_sse_events(buffer: bytearray, chunk: bytes) -> tuple[int | None, str |
     tokens: int | None = None
     error: str | None = None
     buffer.extend(chunk)
+    buffer[:] = buffer.replace(b"\r\n", b"\n")  # see _first_sse_event
     while b"\n\n" in buffer:
         event, _, rest = buffer.partition(b"\n\n")
         buffer[:] = rest
@@ -627,25 +628,53 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
             return None, reason, resp.status_code
 
         # Hold the response until the first data event (OpenRouter may first
-        # send `: OPENROUTER PROCESSING` keepalive comments). The client has seen
-        # nothing yet, so an error event there is a failed attempt the caller
-        # can retry or fail over. OpenRouter tags every data event with the
-        # serving sub-provider, which sets X-StableLLM-Via before the response
-        # headers are committed.
+        # send `: OPENROUTER PROCESSING` keepalive comments), for at most
+        # first_event_timeout_secs from the send. The client has seen nothing
+        # yet, so an error event there is a failed attempt the caller can retry
+        # or fail over. OpenRouter tags every data event with the serving
+        # sub-provider, which sets X-StableLLM-Via before the response headers
+        # are committed. A read still pending at the deadline is handed to the
+        # stream rather than cancelled, which would close the upstream stream.
         byte_iter = resp.aiter_bytes()
         primed: list[bytes] = []
         prime_buf = bytearray()
         first_event = None
+        pending: asyncio.Future[bytes | None] | None = None
+        deadline = t0 + config.SETTINGS.first_event_timeout_secs
         try:
-            while first_event is None:
-                chunk = await byte_iter.__anext__()
+            # The deadline is checked before each read: reads that complete
+            # immediately (buffered keepalives) must not extend the hold.
+            while first_event is None and (remaining := deadline - time.monotonic()) > 0:
+                pending = asyncio.ensure_future(anext(byte_iter, None))
+                done, _ = await asyncio.wait({pending}, timeout=remaining)
+                if not done:
+                    log.debug("req=%s %s no data event within %gs; streaming without holding", metrics.req_id, ep.provider, config.SETTINGS.first_event_timeout_secs)
+                    break
+                chunk = pending.result()
+                pending = None
+                if chunk is None:
+                    break
                 if metrics.ttft_ms is None:
                     metrics.ttft_ms = (time.monotonic() - t0) * 1000
                     log.debug("req=%s %s TTFT %.0fms (TTFB %.0fms)", metrics.req_id, ep.provider, metrics.ttft_ms, ttfb * 1000)
                 primed.append(chunk)
                 first_event = _first_sse_event(prime_buf, chunk)
-        except StopAsyncIteration:
-            pass
+        except BaseException:
+            # Cancelled before the handoff: the read would outlive this attempt.
+            if pending is not None:
+                pending.cancel()
+                await asyncio.wait({pending})
+            raise
+
+        async def rest():
+            if pending is not None:
+                chunk = await pending
+                if chunk is None:
+                    return
+                yield chunk
+            async for chunk in byte_iter:
+                yield chunk
+
         if first_event is not None and (reason := _sse_error_detail(first_event)):
             await resp.aclose()
             log.warning("upstream streamed an error before any content from %s (%s): %s", ep.base_url, request_context, reason)
@@ -682,7 +711,7 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
                     if upstream_failed:
                         break
                 if not upstream_failed:
-                    async for chunk in byte_iter:
+                    async for chunk in rest():
                         if t_first is None:
                             t_first = time.monotonic()
                             metrics.ttft_ms = (t_first - t0) * 1000
@@ -718,6 +747,8 @@ async def _proxy_stream(ep: Endpoint, path: str, headers: dict, body: bytes, met
                     on_success()
                 if on_done:
                     on_done()
+                if pending is not None:
+                    pending.cancel()
                 await asyncio.to_thread(requestlog.log_request, metrics)
                 await _close_quietly(resp)
 

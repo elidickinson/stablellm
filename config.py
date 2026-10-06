@@ -93,6 +93,7 @@ class Settings:
     race_settle_timeout_secs: float = 120.0
     race_max_prompt_bytes: int = 0  # 0 = no cap on the prompt a race will pay for
     session_pin_ttl_secs: float = 15 * 60
+    first_event_timeout_secs: float = 45.0  # 0 = stream without holding for the first data event
     log_level: str = "INFO"
 
 
@@ -530,6 +531,9 @@ def _parse_settings(raw: object) -> Settings:
         race_settle_timeout_secs=race_settle_timeout,
         race_max_prompt_bytes=race_max_prompt,
         session_pin_ttl_secs=pin_ttl,
+        first_event_timeout_secs=_opt_secs(
+            raw.get("first_event_timeout_secs"), "first_event_timeout_secs", defaults.first_event_timeout_secs
+        ),
         log_level=str(raw.get("log_level", defaults.log_level)).upper(),
     )
 

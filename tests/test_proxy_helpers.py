@@ -89,6 +89,12 @@ def test_sse_error_split_across_chunks(main_module):
     assert err == "boom; 502"
 
 
+def test_sse_error_with_crlf_line_endings(main_module):
+    buf = bytearray()
+    chunk = b'data: {"choices": []}\r\n\r\ndata: {"error": {"message": "boom"}}\r\n\r\n'
+    assert main_module._scan_sse_events(buf, chunk) == (None, "boom")
+
+
 def test_body_error_detail_variants(main_module):
     err = main_module._body_error_detail({"error": {"message": "bad", "code": 503}})
     assert err == "bad; 503"

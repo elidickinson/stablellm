@@ -159,6 +159,7 @@ def test_settings_loaded_from_yaml(make_config):
             "race_interval_requests": 100,
             "race_settle_timeout_secs": 7.5,
             "race_max_prompt_bytes": 40000,
+            "first_event_timeout_secs": 10,
             "log_level": "debug",
         },
         "providers": {"a": {"base_url": "https://a", "api_key": "k"}},
@@ -168,6 +169,7 @@ def test_settings_loaded_from_yaml(make_config):
     assert cfg.SETTINGS.race_interval_requests == 100
     assert cfg.SETTINGS.race_settle_timeout_secs == 7.5
     assert cfg.SETTINGS.race_max_prompt_bytes == 40000
+    assert cfg.SETTINGS.first_event_timeout_secs == 10
     assert cfg.SETTINGS.log_level == "DEBUG"
 
 

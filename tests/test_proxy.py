@@ -382,6 +382,61 @@ async def test_error_as_first_stream_event_fails_over(proxy_app):
 
 
 @pytest.mark.asyncio
+async def test_slow_first_event_streams_after_timeout_intact(proxy_app, monkeypatch):
+    """Past first_event_timeout_secs the response goes out without waiting
+    further; the read still in flight at the deadline is not lost."""
+    async def slow_stream():
+        yield b": keepalive\n\n"
+        await asyncio.sleep(0.2)
+        yield b'data: {"choices":[{"delta":{"content":"late"}}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    def handler(req):
+        return httpx.Response(200, content=slow_stream(), headers={"content-type": "text/event-stream"})
+
+    app, _calls, main = proxy_app(
+        {
+            "settings": {"first_event_timeout_secs": 0.05},
+            "providers": {"a": {"base_url": "https://a.test", "api_key": "k"}},
+            "groups": {"default": {"endpoints": [{"provider": "a"}]}},
+        },
+        handler,
+    )
+    rows: list[object] = []
+    monkeypatch.setattr(main.requestlog, "log_request", rows.append)
+    resp = await _post(app, {"model": "default", "messages": [], "stream": True})
+    assert resp.status_code == 200
+    assert resp.content == b': keepalive\n\ndata: {"choices":[{"delta":{"content":"late"}}]}\n\ndata: [DONE]\n\n'
+    assert [m.status for m in rows] == ["200"]
+
+
+@pytest.mark.asyncio
+async def test_zero_first_event_timeout_does_not_hold(proxy_app):
+    """With the hold disabled, even immediately available chunks are not read
+    ahead: a first-event error is streamed to the client, not failed over."""
+    def handler(req):
+        if req.url.host == "a.test":
+            sse = b': keepalive\n\n' * 50 + b'data: {"error":{"message":"overloaded","code":503}}\n\n'
+        else:
+            sse = b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+        return httpx.Response(200, content=sse, headers={"content-type": "text/event-stream"})
+
+    app, _calls, _main = proxy_app(
+        {
+            "settings": {"first_event_timeout_secs": 0},
+            "providers": {
+                "a": {"base_url": "https://a.test", "api_key": "k"},
+                "b": {"base_url": "https://b.test", "api_key": "k"},
+            },
+            "groups": {"default": {"endpoints": [{"provider": "a"}, {"provider": "b"}]}},
+        },
+        handler,
+    )
+    resp = await _post(app, {"model": "default", "messages": [], "stream": True})
+    assert b"overloaded" in resp.content
+
+
+@pytest.mark.asyncio
 async def test_midstream_error_event_is_failure_and_marks_down(proxy_app, monkeypatch):
     """Regression: a 200 SSE stream carrying a top-level {"error": ...} chunk must
     not be counted a success. The client receives the chunks verbatim (it renders
