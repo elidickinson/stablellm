@@ -187,7 +187,10 @@ def _effective_model(ep: Endpoint, client_model: str) -> str:
 async def lifespan(_app: FastAPI):
     global http_client
     requestlog.init()
-    http_client = httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=CONNECT_TIMEOUT))
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=CONNECT_TIMEOUT),
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=29),
+    )
     _build_provider_groups()
     log.info("stablellm started with %d endpoint(s), groups: %s", len(config.ENDPOINTS), list(config.GROUPS))
     yield
@@ -388,10 +391,22 @@ async def _send_upstream(req: httpx.Request, ep: Endpoint, *, stream: bool) -> h
         raise UpstreamError(f"no response headers within {ep.ttfb_deadline_secs:g}s") from None
 
 
+_TIMEOUT_PHASES = {
+    httpx.ConnectTimeout: ("connect", "no connection within"),
+    httpx.ReadTimeout: ("read", "no data for"),
+    httpx.WriteTimeout: ("write", "send stalled for"),
+    httpx.PoolTimeout: ("pool", "no free pooled connection within"),
+}
+
+
 def _exception_detail(exc: BaseException) -> str:
     msg = str(exc)
     if isinstance(exc, UpstreamError) and msg:
         return msg
+    if isinstance(exc, httpx.TimeoutException):
+        phase, desc = _TIMEOUT_PHASES[type(exc)]
+        limit = exc.request.extensions["timeout"][phase]
+        msg = f"{desc} {limit:g}s" + (f" ({msg})" if msg else "")
     if msg:
         return f"{type(exc).__name__}: {msg}"
     return type(exc).__name__

@@ -126,7 +126,7 @@ def _parse_api_keys(raw: str) -> dict[str, str]:
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "4000"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "120"))
-CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "4"))
+CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "5"))
 API_KEYS = _parse_api_keys(os.getenv("API_KEY", ""))
 CONFIG_FILE = os.getenv("CONFIG_FILE", "config.yaml")
 CONFIG_EDITOR_PASSWORD = os.getenv("CONFIG_EDITOR_PASSWORD", "")

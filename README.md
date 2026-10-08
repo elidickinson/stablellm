@@ -13,7 +13,7 @@ Two files. Bind-time settings live in `.env` (changing them requires a restart).
 | `HOST` | `0.0.0.0` | Server bind address |
 | `PORT` | `4000` | Server port |
 | `REQUEST_TIMEOUT` | `120` | Outbound HTTP request timeout (seconds) |
-| `CONNECT_TIMEOUT` | `4` | Outbound TCP connect timeout (seconds) |
+| `CONNECT_TIMEOUT` | `5` | Outbound TCP connect timeout (seconds) |
 | `API_KEY` | *(none)* | If set, clients must send `Authorization: Bearer <key>`. Comma-separated for multiple keys (see below) |
 | `CONFIG_FILE` | `config.yaml` | Path to the YAML config |
 | `MAX_BODY_BYTES` | `52428800` (50MB) | Max inbound request body size |
