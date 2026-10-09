@@ -1946,7 +1946,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div class="bar">
   <input type="password" id="pw" placeholder="password" autofocus>
   <button id="load">Load</button>
-  <span class="hint">reloads automatically</span>
+  <button id="auto-updates" disabled>Resume auto updates</button>
   <span id="updated" class="dim"></span>
 </div>
 <div id="content" style="display:none">
@@ -1962,6 +1962,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <script>
 const $ = id => document.getElementById(id);
 let pw = '', stateData = null, historyData = null, stateTimer = null, histTimer = null, paintTimer = null;
+let paused = true;
 const pollErrors = new Map();
 
 function setStatus(text, cls) { const s = $('status'); s.textContent = text; s.className = cls || 'dim'; }
@@ -2015,9 +2016,7 @@ function renderProviders() {
   const t = $('providers'); t.textContent = '';
   const byProv = {};
   for (const g of Object.values(stateData.groups)) for (const r of g.rows) {
-    const p = byProv[r.provider] || (byProv[r.provider] = { state: 'up', secs: 0, err: '', errAt: 0 });
-    if (r.state === 'down') p.state = 'down';
-    else if (r.state === 'cooling' && p.state !== 'down') { p.state = 'cooling'; p.secs = Math.max(p.secs, r.secsLeft); }
+    const p = byProv[r.provider] || (byProv[r.provider] = { down: stateData.manual_down.includes(r.provider), err: '', errAt: 0 });
     if (r.last_error && r.last_error_at >= p.errAt) {
       p.err = r.last_error;
       p.errAt = r.last_error_at;
@@ -2028,7 +2027,7 @@ function renderProviders() {
   for (const [prov, p] of Object.entries(byProv).sort()) {
     const tr = el('tr');
     tr.appendChild(el('td', prov, 'mono'));
-    tr.appendChild(el('td')).appendChild(pill(p.state, p.secs));
+    tr.appendChild(el('td', p.down ? 'Forced Down' : '', p.down ? 'pill down' : ''));
     const errCell = el('td', p.err, 'err');
     if (p.err) {
       const age = el('div', fmtAge(stateData.now - p.errAt), 'dim');
@@ -2037,9 +2036,9 @@ function renderProviders() {
     }
     tr.appendChild(errCell);
     const act = el('td');
-    const btn = el('button', p.state === 'down' ? 'bring up' : 'mark down');
+    const btn = el('button', p.down ? 'bring up' : 'mark down');
     btn.addEventListener('click', async () => {
-      try { await api('/dashboard/api/' + (p.state === 'down' ? 'up/' : 'down/') + prov, { method: 'POST' }); await refreshState(); }
+      try { await api('/dashboard/api/' + (p.down ? 'up/' : 'down/') + prov, { method: 'POST' }); await refreshState(); paint(); }
       catch (e) { setStatus(String(e), 'err'); }
     });
     act.appendChild(btn); tr.appendChild(act);
@@ -2075,8 +2074,9 @@ function renderReqs() {
 function renderGroups() {
   if (!stateData || !historyData) return;
   const d = $('groups'); d.textContent = '';
-  const cols = [['#', ''], ['preferred', ''], ['provider', ''], ['model', ''], ['state', ''], ['groups', ''], ['inflight (curr/limit)', 'num'], ['req/success/fail (across all groups)', 'num'], ['last error', '']];
+  const cols = [['#', ''], ['preferred', ''], ['provider', ''], ['model', ''], ['state', ''], ['groups', ''], ['inflight (curr/limit)', 'num'], ['req/success/fail (across all groups)', 'num']];
   if (historyData.enabled) cols.push(['15m \u00b7 1h \u00b7 24h (reqs \u00b7 ttft \u00b7 tok/s)', '']);
+  cols.push(['last error', '']);
   for (const [name, g] of Object.entries(stateData.groups)) {
     const t = el('tbody');
     const race = g.mode === 'race';
@@ -2121,7 +2121,6 @@ function renderGroups() {
       } else {
         errCell.appendChild(el('span', '\u2013', 'dim'));
       }
-      tr.appendChild(errCell);
       if (historyData.enabled) {
         const s = historyData.summary[r.provider + '|' + r.model];
         const cell = el('td', null, 'mono');
@@ -2131,6 +2130,7 @@ function renderGroups() {
         }
         tr.appendChild(cell);
       }
+      tr.appendChild(errCell);
       t.appendChild(tr);
     }
     d.appendChild(t);
@@ -2175,7 +2175,12 @@ async function poll(feed, refresh) {
   }
 }
 
+function stopUpdates() {
+  clearInterval(stateTimer); clearInterval(histTimer); clearInterval(paintTimer);
+}
+
 async function start() {
+  stopUpdates();
   pw = $('pw').value;
   try {
     await Promise.all([refreshState(), refreshHistory()]);
@@ -2183,15 +2188,23 @@ async function start() {
   $('content').style.display = '';
   pollErrors.clear();
   setStatus('');
-  clearInterval(stateTimer); clearInterval(histTimer); clearInterval(paintTimer);
+  $('auto-updates').disabled = false;
   paint();
-  stateTimer = setInterval(() => poll('state', refreshState), 1000);
-  histTimer = setInterval(() => poll('history', refreshHistory), 3000);
-  paintTimer = setInterval(paint, 500);
+  if (!paused) {
+    stateTimer = setInterval(() => poll('state', refreshState), 1000);
+    histTimer = setInterval(() => poll('history', refreshHistory), 3000);
+    paintTimer = setInterval(paint, 500);
+  }
 }
 
 $('load').addEventListener('click', start);
 $('pw').addEventListener('keydown', e => { if (e.key === 'Enter') start(); });
+$('auto-updates').addEventListener('click', () => {
+  paused = !paused;
+  $('auto-updates').textContent = paused ? 'Resume auto updates' : 'Pause auto updates';
+  if (paused) stopUpdates();
+  else start();
+});
 </script>
 </body>
 </html>
