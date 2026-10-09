@@ -134,7 +134,7 @@ Order-based routing is sticky per conversation: the session key (a hash of the c
 
 A race would move a session off its home endpoint and throw away that warm cache, so races only run for unpinned sessions: a ripe race cadence waits for a new session (or one whose pin has expired) rather than firing at whoever asks next. A fresh session has no cache to lose, and the race winner becomes its pin. Clients whose system prompt changes every turn yield no stable session key, so they are always unpinned and race on cadence alone.
 
-Pins are visible on `/dashboard` (`session_pins`) and are cleared on config reload.
+Pins are visible on `/dashboard` (`session pins` above the group sections) and are cleared on config reload.
 
 ## Response metadata
 
@@ -159,9 +159,9 @@ Headers are present on both streaming and non-streaming responses. They are expo
 
 ## Dashboard
 
-`/dashboard` is a web UI gated by `CONFIG_EDITOR_PASSWORD` (the same password as the config editor). It shows one merged row per provider+model across groups -- state (up / cooling / manually down), in-flight vs cap, request/success/failure counters, and 15m/1h/24h request counts plus avg TTFT and tok/s computed from the request log -- along with a feed of recent requests and per-group race order. Each provider has a **mark down / bring up** button: a manual down pulls every group entry for that provider out of routing (new requests only; in-flight requests finish). Manual downs survive config reloads but not restarts.
+`/dashboard` is a web UI gated by `CONFIG_EDITOR_PASSWORD` (the same password as the config editor). The status bar shows server uptime measured from process start, which config reloads do not reset. Below it is an always-visible section per group, headed by the group's mode and -- for race groups -- how many requests have arrived since the last race: each row is one provider+model in routing order (the learned preferred order for race groups, the configured failover order for `seq` groups), with state (up / cooling / manually down), in-flight vs cap, request/success/failure counters, and the last error with its age (hover for the exact timestamp). Rows that more than one group routes to are marked `shared with other group(s): ...`, and the same counters appear in every group section that uses them. When `REQUEST_LOG_DB` is set, each row also shows 15m/1h/24h request counts plus avg TTFT and tok/s; without it, the note above the sections says so. Session pin totals sit above the sections, and below them are the per-provider **mark down / bring up** controls (a manual down pulls every group entry for that provider out of routing -- new requests only, in-flight requests finish -- and survives config reloads but not restarts) and the feed of recent requests.
 
-Backing JSON, same auth: `GET /dashboard/api/state` and `GET /dashboard/api/history`. The request-log-backed views are empty unless `REQUEST_LOG_DB` is set.
+Backing JSON, same auth: `GET /dashboard/api/state` (groups with rows in routing order, manual downs, session pin counts, server `now` / `started_at`) and `GET /dashboard/api/history` (recent requests, per-window summary, and whether `REQUEST_LOG_DB` is enabled). The request-log-backed views are empty unless `REQUEST_LOG_DB` is set.
 
 ## Deploy on Dokploy
 

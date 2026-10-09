@@ -75,6 +75,10 @@ log = logging.getLogger("stablellm")
 for noisy in ("uvicorn.access", "httpx", "httpcore", "asyncio"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
+# Wall-clock start of this process, for the dashboard uptime. Config reloads
+# intentionally do not touch it.
+_PROCESS_STARTED_AT = time.time()
+
 # endpoint index -> timestamp when it becomes available again
 _cooloff_until: dict[int, float] = {}
 
@@ -235,8 +239,9 @@ async def _limit_body_size(request: Request, call_next):
 # endpoint index) so it survives config reloads; pruned to configured names on
 # reload. Affects routing of new requests only; in-flight requests finish.
 _manual_down: set[str] = set()
-# Last failure reason per endpoint index, surfaced on the dashboard.
+# Last failure reason and wall-clock time per endpoint index, surfaced on the dashboard.
 _last_failure: dict[int, str] = {}
+_last_failure_time: dict[int, float] = {}
 
 
 def _is_available(idx: int) -> bool:
@@ -346,6 +351,7 @@ def _pinned_via(group: str, skey: str) -> str | None:
 
 def _mark_down(idx: int, reason: str, request_context: str = ""):
     _last_failure[idx] = _clip(reason)
+    _last_failure_time[idx] = time.time()
     cooloff = config.SETTINGS.cooloff_seconds
     _cooloff_until[idx] = time.monotonic() + cooloff
     _stats["failures"][idx] += 1
@@ -1672,15 +1678,17 @@ async def list_models(authorization: str | None = Header(None)):
     }
 
 
-def _merged_state_rows() -> list[dict]:
-    """Endpoint entries merged into one row per (base_url, model).
+def _merged_state_rows() -> dict[tuple[str, str], dict]:
+    """Endpoint state keyed by routing identity (base_url, model).
 
     Counters and cooloffs are per endpoint entry (summed / worst-of here);
-    inflight and max_concurrency are already per (base_url, model)."""
-    entry_groups: dict[int, str] = {}
+    inflight and max_concurrency are already per (base_url, model). A row used
+    by several groups is shared, so its payload stays identical everywhere."""
+    used_by: dict[tuple[str, str], list[str]] = {}
     for gname, g in config.GROUPS.items():
         for i in g.endpoints:
-            entry_groups.setdefault(i, gname)
+            ep = config.ENDPOINTS[i]
+            used_by.setdefault((ep.base_url, ep.model), []).append(gname)
     rows: dict[tuple[str, str], dict] = {}
     now = time.monotonic()
     for idx, ep in enumerate(config.ENDPOINTS):
@@ -1693,33 +1701,57 @@ def _merged_state_rows() -> list[dict]:
                 # Passthrough endpoints forward the client's model, so their
                 # inflight keys are (base_url, <client model>); sum the base_url.
                 inflight = sum(n for (base, _), n in _inflight.items() if base == ep.base_url)
-            row = {
+            row = rows[key] = {
                 "provider": ep.provider,
                 "base_url": ep.base_url,
                 "model": ep.model or "(passthrough)",
-                "groups": [],
+                "groups": used_by[key],
                 "state": "up",
                 "cooloff_secs_left": 0.0,
                 "last_error": "",
+                "last_error_at": 0,
                 "inflight": inflight,
                 "max_concurrency": 0,
                 "requests": 0,
                 "successes": 0,
                 "failures": 0,
             }
-            rows[key] = row
-        row["groups"].append(entry_groups.get(idx, "?"))
         row["max_concurrency"] = max(row["max_concurrency"], ep.max_concurrency)
         row["requests"] += _stats["requests"].get(idx, 0)
         row["successes"] += _stats["successes"].get(idx, 0)
         row["failures"] += _stats["failures"].get(idx, 0)
-        row["last_error"] = row["last_error"] or _last_failure.get(idx, "")
+        if _last_failure.get(idx) and _last_failure_time[idx] >= row["last_error_at"]:
+            row["last_error"] = _last_failure[idx]
+            row["last_error_at"] = _last_failure_time[idx]
         if ep.provider in _manual_down:
             row["state"] = "down"
         elif now < _cooloff_until.get(idx, 0) and row["state"] != "down":
             row["state"] = "cooling"
             row["cooloff_secs_left"] = max(row["cooloff_secs_left"], _cooloff_until[idx] - now)
-    return sorted(rows.values(), key=lambda r: (r["provider"], r["model"]))
+    return rows
+
+
+def _dashboard_groups(rows: dict[tuple[str, str], dict]) -> dict[str, dict]:
+    """One dashboard section per group, rows in routing order.
+
+    A race group lists rows in the learned preferred order; a sequential group
+    lists them in configured failover order (the same provider identity can
+    appear twice in one group, so those collapse to one row)."""
+    groups: dict[str, dict] = {}
+    for name, group in config.GROUPS.items():
+        if group.mode == config.MODE_RACE:
+            keys = _group_preferred_providers[name]
+        else:
+            keys = list(dict.fromkeys(
+                (config.ENDPOINTS[i].model, config.ENDPOINTS[i].base_url) for i in group.endpoints
+            ))
+        groups[name] = {
+            "mode": group.mode,
+            "raced": _group_last_race_time.get(name, 0.0) > 0,
+            "requests_since_last_race": _group_race_request_count.get(name, 0),
+            "rows": [rows[(base_url, model)] for model, base_url in keys],
+        }
+    return groups
 
 
 @app.get("/dashboard/api/state")
@@ -1727,20 +1759,15 @@ async def dashboard_state(x_config_password: str | None = Header(None)):
     err = await _editor_auth(x_config_password)
     if err:
         return err
-    groups = {}
-    for name, group in config.GROUPS.items():
-        groups[name] = {
-            "mode": group.mode,
-            "endpoints": [f"{config.ENDPOINTS[i].provider}/{config.ENDPOINTS[i].model or '(passthrough)'}" for i in group.endpoints],
-            "preferred_providers": [{"model": m, "base_url": u} for m, u in _group_preferred_providers.get(name, [])],
-            "requests_since_last_race": _group_race_request_count.get(name, 0),
-        }
     return {
-        "rows": _merged_state_rows(),
-        "groups": groups,
+        "groups": _dashboard_groups(_merged_state_rows()),
         "manual_down": sorted(_manual_down),
         "session_pins": len(_session_pins),
         "session_pin_hits": _pin_promotions,
+        # Server wall clock and process start, so uptime and error ages are
+        # unaffected by client clock skew or config reloads.
+        "now": time.time(),
+        "started_at": _PROCESS_STARTED_AT,
     }
 
 
@@ -1751,7 +1778,7 @@ async def dashboard_history(x_config_password: str | None = Header(None)):
         return err
     recent = await asyncio.to_thread(requestlog.recent_requests, 50)
     summary = await asyncio.to_thread(requestlog.window_summary)
-    return {"requests": recent, "summary": summary}
+    return {"requests": recent, "summary": summary, "enabled": requestlog.DB_PATH is not None}
 
 
 async def _dashboard_set_down(provider: str, down: bool, x_config_password: str | None):
@@ -1906,31 +1933,37 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   #status { margin-top: 10px; padding: 8px 12px; border-radius: 3px; min-height: 1.2em; font-family: monospace; font-size: 12px; }
   #status.err { background: #5a1d1d; color: #f5a5a5; }
   .hint { color: #666; font-size: 12px; }
-  details { margin-top: 14px; font-size: 12px; color: #888; }
-  summary { cursor: pointer; }
+  .top { display: flex; gap: 14px; align-items: baseline; margin-bottom: 12px; }
+  .group { margin-bottom: 22px; }
+  .grouphead { font-size: 12.5px; color: #888; margin-bottom: 4px; }
 </style>
 </head>
 <body>
-<h1>stablellm dashboard</h1>
+<div class="top">
+  <h1>stablellm dashboard</h1>
+  <span id="uptime" class="hint"></span>
+  <span class="hint">manual down survives config reload, not restarts</span>
+</div>
 <div class="bar">
   <input type="password" id="pw" placeholder="password" autofocus>
   <button id="load">Load</button>
+  <span class="hint">reloads automatically</span>
   <span id="updated" class="dim"></span>
-  <span class="hint">manual down survives config reload, not restarts</span>
 </div>
 <div id="content" style="display:none">
-  <h2>providers</h2>
+  <div id="session" class="hint"></div>
+  <p id="logging-note" class="hint" hidden>Enable REQUEST_LOG_DB for more granular stats and recent requests.</p>
+  <div id="groups"></div>
+  <h2>providers (down / up)</h2>
   <table id="providers"></table>
-  <h2>endpoints (provider / model)</h2>
-  <table id="endpoints"></table>
   <h2>recent requests</h2>
   <table id="reqs"></table>
-  <details><summary>groups / race state</summary><div id="groups"></div></details>
 </div>
 <div id="status" class="dim">Enter password and click Load</div>
 <script>
 const $ = id => document.getElementById(id);
 let pw = '', stateData = null, historyData = null, stateTimer = null, histTimer = null, paintTimer = null;
+const pollErrors = new Map();
 
 function setStatus(text, cls) { const s = $('status'); s.textContent = text; s.className = cls || 'dim'; }
 
@@ -1951,16 +1984,45 @@ function pill(state, secsLeft) {
 
 function fmtMs(v) { return v == null ? '\u2013' : (v / 1000).toFixed(1) + 's'; }
 function fmtTps(v) { return v == null ? '\u2013' : v.toFixed(1) + '/s'; }
+function fmtDur(secs) {
+  secs = Math.max(0, Math.floor(secs));
+  const d = Math.floor(secs / 86400), h = Math.floor(secs % 86400 / 3600), m = Math.floor(secs % 3600 / 60);
+  return d ? d + 'd ' + h + 'h' : h ? h + 'h ' + m + 'm' : m ? m + 'm ' + (secs % 60) + 's' : secs + 's';
+}
+function fmtAge(secs) {
+  if (secs < 90) return Math.max(0, Math.round(secs)) + 's ago';
+  if (secs < 5400) return Math.round(secs / 60) + 'm ago';
+  if (secs < 172800) return Math.round(secs / 3600) + 'h ago';
+  return Math.round(secs / 86400) + 'd ago';
+}
+
+function renderUptime() {
+  if (!stateData) return;
+  $('uptime').textContent = 'uptime ' + fmtDur(stateData.now - stateData.started_at);
+}
+
+// JSON gives each group its own copy of shared rows; update every copy.
+function stateRaw() {
+  return Object.values(stateData.groups).flatMap(g => g.rows);
+}
+
+function renderSession() {
+  if (!stateData) return;
+  $('session').textContent = 'session pins: ' + stateData.session_pins + ' \u00b7 pin hits: ' + stateData.session_pin_hits;
+}
 
 function renderProviders() {
   if (!stateData) return;
   const t = $('providers'); t.textContent = '';
   const byProv = {};
-  for (const r of stateData.rows) {
-    const p = byProv[r.provider] || (byProv[r.provider] = { state: 'up', secs: 0, err: '' });
+  for (const g of Object.values(stateData.groups)) for (const r of g.rows) {
+    const p = byProv[r.provider] || (byProv[r.provider] = { state: 'up', secs: 0, err: '', errAt: 0 });
     if (r.state === 'down') p.state = 'down';
     else if (r.state === 'cooling' && p.state !== 'down') { p.state = 'cooling'; p.secs = Math.max(p.secs, r.secsLeft); }
-    p.err = p.err || r.last_error;
+    if (r.last_error && r.last_error_at >= p.errAt) {
+      p.err = r.last_error;
+      p.errAt = r.last_error_at;
+    }
   }
   const head = el('tr'); for (const h of ['provider', 'state', 'last error', '']) head.appendChild(el('th', h));
   t.appendChild(head);
@@ -1968,7 +2030,13 @@ function renderProviders() {
     const tr = el('tr');
     tr.appendChild(el('td', prov, 'mono'));
     tr.appendChild(el('td')).appendChild(pill(p.state, p.secs));
-    tr.appendChild(el('td', p.err, 'err'));
+    const errCell = el('td', p.err, 'err');
+    if (p.err) {
+      const age = el('div', fmtAge(stateData.now - p.errAt), 'dim');
+      age.title = new Date(p.errAt * 1000).toLocaleString();
+      errCell.appendChild(age);
+    }
+    tr.appendChild(errCell);
     const act = el('td');
     const btn = el('button', p.state === 'down' ? 'bring up' : 'mark down');
     btn.addEventListener('click', async () => {
@@ -1976,31 +2044,6 @@ function renderProviders() {
       catch (e) { setStatus(String(e), 'err'); }
     });
     act.appendChild(btn); tr.appendChild(act);
-    t.appendChild(tr);
-  }
-}
-
-function renderEndpoints() {
-  if (!stateData || !historyData) return;
-  const t = $('endpoints'); t.textContent = '';
-  const head = el('tr');
-  for (const [h, cls] of [['provider / model'], ['groups'], ['inflight', 'num'], ['r/s/f', 'num'], ['15m \u00b7 1h \u00b7 24h (reqs \u00b7 ttft \u00b7 tok/s)']])
-    head.appendChild(Object.assign(el('th', h), cls ? { className: cls } : {}));
-  t.appendChild(head);
-  for (const r of stateData.rows) {
-    const tr = el('tr');
-    tr.appendChild(el('td', r.provider + '  ' + r.model, 'mono'));
-    tr.appendChild(el('td', [...new Set(r.groups)].join(', ')));
-    const capped = r.max_concurrency > 0 && r.inflight >= r.max_concurrency;
-    tr.appendChild(el('td', r.inflight + '/' + (r.max_concurrency > 0 ? r.max_concurrency : '\u2013'), 'num mono' + (capped ? ' hot' : '')));
-    tr.appendChild(el('td', r.requests + '/' + r.successes + '/' + r.failures, 'num mono'));
-    const s = historyData.summary[r.provider + '|' + r.model];
-    const cell = el('td', null, 'mono');
-    if (!s) { cell.appendChild(el('span', '\u2013', 'dim')); }
-    else for (const label of ['15m', '1h', '24h']) {
-      cell.appendChild(el('div', label + '  ' + (s.reqs[label] || 0) + ' \u00b7 ' + fmtMs(s.ttft_ms[label]) + ' \u00b7 ' + fmtTps(s.tok_s[label])));
-    }
-    tr.appendChild(cell);
     t.appendChild(tr);
   }
 }
@@ -2028,34 +2071,110 @@ function renderReqs() {
   }
 }
 
+// One always-visible section per group: rows in routing order, so the first row
+// is what a new session hits first. Shared rows repeat across sections by design.
 function renderGroups() {
-  if (!stateData) return;
+  if (!stateData || !historyData) return;
   const d = $('groups'); d.textContent = '';
   for (const [name, g] of Object.entries(stateData.groups)) {
-    const line = name + ' [' + g.mode + ']  ' + g.endpoints.join(' > ')
-      + '   preferred: ' + (g.preferred_providers.map(p => p.model + '@' + p.base_url.replace('https://', '')).join(', ') || '(none)')
-      + '   reqs since race: ' + g.requests_since_last_race;
-    d.appendChild(el('div', line, 'mono'));
+    const box = el('div', null, 'group');
+    const race = g.mode === 'race';
+    box.appendChild(el('h2', name + ' \u00b7 ' + g.mode + ' \u00b7 ' + (race
+      ? (g.raced ? g.requests_since_last_race + ' requests since last race' : 'no race in this process yet')
+      : g.rows.length + ' provider(s) in failover order')));
+    const rows = g.rows;
+    const t = el('table');
+    const head = el('tr');
+    const cols = [['#', '']];
+    if (race) cols.push(['preferred', '']);
+    cols.push(['provider', ''], ['model', ''], ['state', ''], ['groups', ''], ['inflight (curr/limit)', 'num'], ['req/success/fail (across all groups)', 'num'], ['last error', '']);
+    if (historyData.enabled) cols.push(['15m \u00b7 1h \u00b7 24h (reqs \u00b7 ttft \u00b7 tok/s)', '']);
+    for (const [txt, cls] of cols) head.appendChild(Object.assign(el('th', txt), cls ? { className: cls } : {}));
+    t.appendChild(head);
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      const tr = el('tr');
+      tr.appendChild(el('td', i + 1, 'num mono'));
+      if (race) {
+        const label = !g.raced ? '\u2013' : i === 0 ? 'fastest' : 'preferred';
+        tr.appendChild(el('td', label, 'mono' + (label === 'fastest' ? ' ok' : '')));
+      }
+      tr.appendChild(el('td', r.provider, 'mono'));
+      tr.appendChild(el('td', r.model, 'mono'));
+      tr.appendChild(el('td')).appendChild(pill(r.state, r.secsLeft));
+      const others = [...new Set(r.groups)].filter(x => x !== name);
+      tr.appendChild(others.length
+        ? el('td', 'shared with ' + others.length + ' other group(s): ' + others.join(', '), 'mono warn')
+        : el('td', 'not shared', 'mono dim'));
+      const capped = r.max_concurrency > 0 && r.inflight >= r.max_concurrency;
+      tr.appendChild(el('td', r.inflight + '/' + (r.max_concurrency > 0 ? r.max_concurrency : '\u2013'), 'num mono' + (capped ? ' hot' : '')));
+      tr.appendChild(el('td', r.requests + '/' + r.successes + '/' + r.failures, 'num mono'));
+      const errCell = el('td', null, 'mono');
+      if (r.last_error) {
+        const age = el('span', fmtAge(stateData.now - r.last_error_at));
+        if (r.last_error_at) {
+          age.className = 'dim';
+          age.title = new Date(r.last_error_at * 1000).toLocaleString();
+        }
+        errCell.appendChild(el('div', r.last_error, 'err'));
+        errCell.appendChild(age);
+      } else {
+        errCell.appendChild(el('span', '\u2013', 'dim'));
+      }
+      tr.appendChild(errCell);
+      if (historyData.enabled) {
+        const s = historyData.summary[r.provider + '|' + r.model];
+        const cell = el('td', null, 'mono');
+        if (!s) cell.appendChild(el('span', '\u2013', 'dim'));
+        else for (const label of ['15m', '1h', '24h']) {
+          cell.appendChild(el('div', label + '  ' + (s.reqs[label] || 0) + ' \u00b7 ' + fmtMs(s.ttft_ms[label]) + ' \u00b7 ' + fmtTps(s.tok_s[label])));
+        }
+        tr.appendChild(cell);
+      }
+      t.appendChild(tr);
+    }
+    box.appendChild(t);
+    d.appendChild(box);
   }
-  d.appendChild(el('div', 'session pins: ' + stateData.session_pins + ' \u00b7 pin hits: ' + stateData.session_pin_hits));
 }
 
 // Endpoints store wall-clock deadlines so the countdown ticks between polls.
 function captureDeadlines() {
-  for (const r of stateData.rows) r.secsLeft = r.cooloff_secs_left;
+  for (const r of stateRaw()) r.secsLeft = r.cooloff_secs_left;
   stateData.fetchedAt = Date.now();
 }
 
 function paint() {
   if (!stateData) return;
   const drift = (Date.now() - stateData.fetchedAt) / 1000;
-  for (const r of stateData.rows) if (r.state === 'cooling') r.secsLeft = Math.max(0, r.cooloff_secs_left - drift);
-  renderProviders(); renderEndpoints(); renderReqs(); renderGroups();
-  $('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
+  for (const r of stateRaw()) if (r.state === 'cooling') r.secsLeft = Math.max(0, r.cooloff_secs_left - drift);
+  renderUptime(); renderSession(); renderGroups(); renderProviders(); renderReqs();
+  const age = Math.max(Date.now() - stateData.fetchedAt, Date.now() - historyData.fetchedAt);
+  const stale = age > 10000;
+  $('updated').textContent = stale
+    ? 'data stale: last refresh ' + Math.floor(age / 1000) + 's ago'
+    : 'updated ' + new Date(Math.min(stateData.fetchedAt, historyData.fetchedAt)).toLocaleTimeString();
+  $('updated').className = stale ? 'warn' : 'dim';
 }
 
 async function refreshState() { stateData = await api('/dashboard/api/state'); captureDeadlines(); }
-async function refreshHistory() { historyData = await api('/dashboard/api/history'); }
+async function refreshHistory() {
+  historyData = await api('/dashboard/api/history');
+  historyData.fetchedAt = Date.now();
+  $('logging-note').hidden = historyData.enabled;
+}
+
+async function poll(feed, refresh) {
+  try {
+    await refresh();
+    if (pollErrors.delete(feed)) {
+      setStatus([...pollErrors.values()].join('; '), pollErrors.size ? 'err' : '');
+    }
+  } catch (e) {
+    pollErrors.set(feed, String(e));
+    setStatus([...pollErrors.values()].join('; '), 'err');
+  }
+}
 
 async function start() {
   pw = $('pw').value;
@@ -2063,11 +2182,12 @@ async function start() {
     await Promise.all([refreshState(), refreshHistory()]);
   } catch (e) { if (e.message !== 'unauthorized') setStatus(String(e), 'err'); return; }
   $('content').style.display = '';
+  pollErrors.clear();
   setStatus('');
   clearInterval(stateTimer); clearInterval(histTimer); clearInterval(paintTimer);
   paint();
-  stateTimer = setInterval(() => refreshState().catch(e => setStatus(String(e), 'err')), 1000);
-  histTimer = setInterval(() => refreshHistory().catch(e => setStatus(String(e), 'err')), 3000);
+  stateTimer = setInterval(() => poll('state', refreshState), 1000);
+  histTimer = setInterval(() => poll('history', refreshHistory), 3000);
   paintTimer = setInterval(paint, 500);
 }
 
@@ -2096,6 +2216,7 @@ def _reset_runtime_state():
     global _pin_promotions
     _pin_promotions = 0
     _last_failure.clear()  # keyed by endpoint index; stale after reload
+    _last_failure_time.clear()
     # Manual downs are name-keyed and survive reloads, but a provider that no
     # longer exists must not stay disabled invisibly.
     _manual_down.intersection_update(ep.provider for ep in config.ENDPOINTS)

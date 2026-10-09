@@ -75,24 +75,72 @@ MULTI_PROVIDER_CONFIG = {
 }
 
 
+def _rows(state, group):
+    return {r["provider"] + "|" + r["model"]: r for r in state["groups"][group]["rows"]}
+
+
 @pytest.mark.asyncio
-async def test_dashboard_state_merges_shared_endpoints(app_factory):
+async def test_dashboard_state_groups_rows_in_routing_order(app_factory):
     app, _ = app_factory(password="secret", content=MULTI_PROVIDER_CONFIG)
     m = sys.modules["main"]
     m._stats["requests"][0] = 5
     m._stats["successes"][0] = 4
     m._stats["failures"][0] = 1
-    m._last_failure[0] = "HTTP 503: upstream died"
+    m._last_failure[0] = "older error"
+    m._last_failure_time[0] = 1000.0
+    m._last_failure[2] = "HTTP 503: upstream died"
+    m._last_failure_time[2] = 1234.5
 
     resp = await _get(app, "/dashboard/api/state", {"X-Config-Password": "secret"})
     assert resp.status_code == 200
-    rows = {r["provider"]: r for r in resp.json()["rows"]}
-    # Provider a appears in two groups but is one merged row.
-    assert set(rows["a"]["groups"]) == {"one", "two"}
-    assert rows["a"]["requests"] == 5
-    assert rows["a"]["failures"] == 1
-    assert rows["a"]["last_error"] == "HTTP 503: upstream died"
-    assert rows["a"]["state"] == "up"
+    state = resp.json()
+    assert [g["mode"] for g in state["groups"].values()] == ["seq", "seq"]
+    # Sequential groups list rows in configured failover order.
+    assert list(_rows(state, "one")) == ["a|(passthrough)", "b|(passthrough)"]
+    assert list(_rows(state, "two")) == ["a|(passthrough)"]
+
+    row = _rows(state, "one")["a|(passthrough)"]
+    assert row["requests"] == 5 and row["successes"] == 4 and row["failures"] == 1
+    assert row["last_error"] == "HTTP 503: upstream died"
+    assert row["last_error_at"] == 1234.5
+    assert row["state"] == "up"
+
+    # The same routing identity appears in both group sections, with the same payload.
+    assert _rows(state, "two")["a|(passthrough)"] == row
+    assert sorted(state["manual_down"]) == []
+    assert state["now"] >= state["started_at"]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_state_race_group_uses_learned_order(app_factory):
+    app, _ = app_factory(password="secret", content={
+        "providers": {
+            "a": {"base_url": "https://a.test", "api_key": "k"},
+            "b": {"base_url": "https://b.test", "api_key": "k"},
+        },
+        "groups": {"default": {"mode": "race", "endpoints": [
+            {"provider": "a", "model": "m"}, {"provider": "b", "model": "m"}]}},
+    })
+    m = sys.modules["main"]
+    assert [r["provider"] for r in (await _get(app, "/dashboard/api/state", {"X-Config-Password": "secret"})).json()["groups"]["default"]["rows"]] == ["a", "b"]
+
+    # A race that finishes b first reorders the group's rows and clears the counter.
+    m._finish_race({("m", "https://b.test"): 1.2}, "default")
+    m._group_last_race_time["default"] = 99.0
+    m._group_race_request_count["default"] = 7
+    g = (await _get(app, "/dashboard/api/state", {"X-Config-Password": "secret"})).json()["groups"]["default"]
+    assert [r["provider"] for r in g["rows"]] == ["b", "a"]
+    assert g["raced"] is True and g["requests_since_last_race"] == 7
+
+
+@pytest.mark.asyncio
+async def test_dashboard_state_started_at_survives_config_reload(app_factory):
+    app, _cfg = app_factory(password="secret")
+    hdr = {"X-Config-Password": "secret"}
+    before = (await _get(app, "/dashboard/api/state", hdr)).json()["started_at"]
+    m = sys.modules["main"]
+    m._reset_runtime_state()
+    assert (await _get(app, "/dashboard/api/state", hdr)).json()["started_at"] == before
 
 
 @pytest.mark.asyncio
@@ -106,8 +154,7 @@ async def test_dashboard_manual_down_up_and_state(app_factory):
 
     state = (await _get(app, "/dashboard/api/state", hdr)).json()
     assert state["manual_down"] == ["a"]
-    row = next(r for r in state["rows"] if r["provider"] == "a")
-    assert row["state"] == "down"
+    assert _rows(state, "one")["a|(passthrough)"]["state"] == "down"
 
     # Unknown provider names are rejected, not silently ignored.
     resp = await _post(app, "/dashboard/api/down/nope", None, hdr)
@@ -149,6 +196,7 @@ async def test_dashboard_history_reads_request_log(app_factory, monkeypatch, tmp
     resp = await _get(app, "/dashboard/api/history", {"X-Config-Password": "secret"})
     assert resp.status_code == 200
     data = resp.json()
+    assert data["enabled"] is True
     r1 = next(r for r in data["requests"] if r["req_id"] == "r1")
     assert r1["mode"] == "seq"
 
@@ -159,6 +207,22 @@ async def test_dashboard_history_reads_request_log(app_factory, monkeypatch, tmp
     assert s["reqs"]["24h"] == 3
     assert s["ttft_ms"]["15m"] == 1000.0  # 200-only avg: 502's NULL ttft excluded
     assert s["ttft_ms"]["24h"] == 2000.0  # (1000 + 3000) / 2
+
+
+@pytest.mark.asyncio
+async def test_dashboard_history_disabled_flag(app_factory, monkeypatch):
+    app, _ = app_factory(password="secret")
+    monkeypatch.setattr(sys.modules["main"].requestlog, "DB_PATH", None)
+    data = (await _get(app, "/dashboard/api/history", {"X-Config-Password": "secret"})).json()
+    assert data == {"requests": [], "summary": {}, "enabled": False}
+
+
+@pytest.mark.asyncio
+async def test_dashboard_page_has_group_sections_and_no_endpoint_table(app_factory):
+    app, _ = app_factory(password="secret")
+    html = (await _get(app, "/dashboard")).text
+    assert 'id="groups"' in html and 'id="uptime"' in html
+    assert 'id="endpoints"' not in html and '<details' not in html
 
 
 @pytest.mark.asyncio
