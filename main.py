@@ -1934,8 +1934,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   #status.err { background: #5a1d1d; color: #f5a5a5; }
   .hint { color: #666; font-size: 12px; }
   .top { display: flex; gap: 14px; align-items: baseline; margin-bottom: 12px; }
-  .group { margin-bottom: 22px; }
-  .grouphead { font-size: 12.5px; color: #888; margin-bottom: 4px; }
+  .grouphead { border-bottom: none; padding: 0; }
 </style>
 </head>
 <body>
@@ -1951,11 +1950,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <span id="updated" class="dim"></span>
 </div>
 <div id="content" style="display:none">
-  <div id="session" class="hint"></div>
-  <p id="logging-note" class="hint" hidden>Enable REQUEST_LOG_DB for more granular stats and recent requests.</p>
-  <div id="groups"></div>
   <h2>providers (down / up)</h2>
   <table id="providers"></table>
+  <div id="session" class="hint"></div>
+  <p id="logging-note" class="hint" hidden>Enable REQUEST_LOG_DB for more granular stats and recent requests.</p>
+  <table id="groups"></table>
   <h2>recent requests</h2>
   <table id="reqs"></table>
 </div>
@@ -2071,34 +2070,35 @@ function renderReqs() {
   }
 }
 
-// One always-visible section per group: rows in routing order, so the first row
-// is what a new session hits first. Shared rows repeat across sections by design.
+// One shared table keeps columns aligned across groups. Rows stay in routing
+// order; shared rows repeat across sections by design.
 function renderGroups() {
   if (!stateData || !historyData) return;
   const d = $('groups'); d.textContent = '';
+  const cols = [['#', ''], ['preferred', ''], ['provider', ''], ['model', ''], ['state', ''], ['groups', ''], ['inflight (curr/limit)', 'num'], ['req/success/fail (across all groups)', 'num'], ['last error', '']];
+  if (historyData.enabled) cols.push(['15m \u00b7 1h \u00b7 24h (reqs \u00b7 ttft \u00b7 tok/s)', '']);
   for (const [name, g] of Object.entries(stateData.groups)) {
-    const box = el('div', null, 'group');
+    const t = el('tbody');
     const race = g.mode === 'race';
-    box.appendChild(el('h2', name + ' \u00b7 ' + g.mode + ' \u00b7 ' + (race
+    const heading = el('tr');
+    const title = el('th', null, 'grouphead');
+    title.colSpan = cols.length;
+    title.scope = 'rowgroup';
+    title.appendChild(el('h2', name + ' \u00b7 ' + g.mode + ' \u00b7 ' + (race
       ? (g.raced ? g.requests_since_last_race + ' requests since last race' : 'no race in this process yet')
       : g.rows.length + ' provider(s) in failover order')));
+    heading.appendChild(title);
+    t.appendChild(heading);
     const rows = g.rows;
-    const t = el('table');
     const head = el('tr');
-    const cols = [['#', '']];
-    if (race) cols.push(['preferred', '']);
-    cols.push(['provider', ''], ['model', ''], ['state', ''], ['groups', ''], ['inflight (curr/limit)', 'num'], ['req/success/fail (across all groups)', 'num'], ['last error', '']);
-    if (historyData.enabled) cols.push(['15m \u00b7 1h \u00b7 24h (reqs \u00b7 ttft \u00b7 tok/s)', '']);
     for (const [txt, cls] of cols) head.appendChild(Object.assign(el('th', txt), cls ? { className: cls } : {}));
     t.appendChild(head);
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i];
       const tr = el('tr');
       tr.appendChild(el('td', i + 1, 'num mono'));
-      if (race) {
-        const label = !g.raced ? '\u2013' : i === 0 ? 'fastest' : 'preferred';
-        tr.appendChild(el('td', label, 'mono' + (label === 'fastest' ? ' ok' : '')));
-      }
+      const label = !race ? '' : !g.raced ? '\u2013' : i === 0 ? 'fastest' : 'preferred';
+      tr.appendChild(el('td', label, 'mono' + (label === 'fastest' ? ' ok' : '')));
       tr.appendChild(el('td', r.provider, 'mono'));
       tr.appendChild(el('td', r.model, 'mono'));
       tr.appendChild(el('td')).appendChild(pill(r.state, r.secsLeft));
@@ -2133,8 +2133,7 @@ function renderGroups() {
       }
       t.appendChild(tr);
     }
-    box.appendChild(t);
-    d.appendChild(box);
+    d.appendChild(t);
   }
 }
 

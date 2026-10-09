@@ -221,7 +221,8 @@ async def test_dashboard_history_disabled_flag(app_factory, monkeypatch):
 async def test_dashboard_page_has_group_sections_and_no_endpoint_table(app_factory):
     app, _ = app_factory(password="secret")
     html = (await _get(app, "/dashboard")).text
-    assert 'id="groups"' in html and 'id="uptime"' in html
+    assert '<table id="groups"></table>' in html and 'id="uptime"' in html
+    assert html.index('id="providers"') < html.index('id="groups"')
     assert 'id="endpoints"' not in html and '<details' not in html
 
 
